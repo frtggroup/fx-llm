@@ -68,6 +68,8 @@ def parse_args():
     p.add_argument('--total_trials',type=int,   default=1)
     p.add_argument('--best_pf',     type=float, default=0.0)
     p.add_argument('--start_time',  type=float, default=0.0)
+    p.add_argument('--out_dir',     type=str,   default='',
+                   help='出力ディレクトリ (並列モード用; 省略時は ai_ea/ 直下)')
     return p.parse_args()
 
 
@@ -327,19 +329,28 @@ def train(args, X_tr, y_tr, X_te, y_te, mean, std, n_feat=None):
                   f"tr={t_loss:.4f}  va={v_loss:.4f}  "
                   f"gap={gap:+.4f}  acc={acc:.3f}  lr={lr_now:.2e}")
 
-        # ダッシュボード更新 (3エポックごと)
+        # 進捗更新 (3エポックごと)
         if epoch % 3 == 0 or epoch <= 5:
             _dash['epoch']       = epoch
             _dash['total_epochs']= args.epochs
             _dash['train_loss']  = round(t_loss, 5)
             _dash['val_loss']    = round(v_loss, 5)
             _dash['accuracy']    = round(acc, 4)
-            # trial_results は _dash に既に入っているので上書きしない
             _dash.setdefault('epoch_log', []).append(
                 {'epoch': epoch, 'train_loss': round(t_loss,6),
                  'val_loss': round(v_loss,6), 'acc': round(acc,4)})
-            try: update_dashboard(_dash)
-            except Exception: pass
+            # 並列モード: trial_progress.json に書く
+            _write_trial_progress(OUT_DIR, {
+                'trial': args.trial, 'arch': getattr(args, 'arch', '?'),
+                'hidden': getattr(args, 'hidden', 0),
+                'epoch': epoch, 'total_epochs': args.epochs,
+                'train_loss': round(t_loss, 5), 'val_loss': round(v_loss, 5),
+                'accuracy': round(acc, 4), 'phase': 'training',
+            })
+            # シングルモード: HTML ダッシュボードも更新
+            if not getattr(args, 'out_dir', ''):
+                try: update_dashboard(_dash)
+                except Exception: pass
 
         # ── val_loss 改善チェック ──────────────────────────────────────────
         if v_loss < best_loss - 1e-5:
@@ -414,7 +425,88 @@ def _train_step(model, xb, yb, opt, crit, sched,
 
 
 # ─── バックテスト ─────────────────────────────────────────────────────────
-def backtest(onnx_path, X_te, df_te, threshold, tp_mult, sl_mult, seq_len=20):
+def _generate_report(trades: list, equity: np.ndarray, dd: np.ndarray,
+                     result: dict, out_dir: Path, trial_no: int) -> None:
+    """資産曲線・DDチャートのスタンドアロン HTML を生成"""
+    eq_data = [round(float(v), 5) for v in equity]
+    dd_data = [round(float(v), 5) for v in dd]
+    # 日別損益 (分布バーチャート)
+    daily: dict = {}
+    for t in trades:
+        d = t.get('date', '?')
+        daily[d] = round(daily.get(d, 0.0) + t['pnl'], 5)
+    dl   = list(daily.keys())
+    dv   = [round(daily[k], 5) for k in dl]
+    dclr = [('rgba(63,185,80,.6)' if v >= 0 else 'rgba(248,81,73,.6)') for v in dv]
+    pf_c = '#f0883e' if result['pf'] >= 2 else '#3fb950' if result['pf'] >= 1.5 else '#ffa657' if result['pf'] >= 1.2 else '#f85149'
+
+    html = f"""<!DOCTYPE html>
+<html lang="ja"><head><meta charset="UTF-8">
+<title>Trial #{trial_no} Backtest</title>
+<script src="https://cdn.jsdelivr.net/npm/chart.js@4/dist/chart.umd.min.js"></script>
+<style>
+*{{box-sizing:border-box;margin:0;padding:0}}
+body{{background:#0d1117;color:#e6edf3;font-family:'Segoe UI',sans-serif;padding:20px}}
+h1{{color:#58a6ff;font-size:1.15em;margin-bottom:16px}}
+.stats{{display:flex;gap:12px;margin-bottom:16px;flex-wrap:wrap}}
+.s{{background:#161b22;border:1px solid #30363d;border-radius:8px;padding:12px 18px;text-align:center;min-width:110px}}
+.sv{{font-size:1.5em;font-weight:700}}
+.sl{{font-size:.72em;color:#8b949e;margin-top:4px}}
+.cw{{background:#161b22;border:1px solid #30363d;border-radius:8px;padding:16px;margin-bottom:14px}}
+.ct{{font-size:.72em;color:#8b949e;text-transform:uppercase;letter-spacing:.8px;margin-bottom:10px}}
+canvas{{max-height:260px}}
+</style></head><body>
+<h1>Trial #{trial_no} バックテストレポート</h1>
+<div class="stats">
+  <div class="s"><div class="sv" style="color:{pf_c}">{result['pf']:.4f}</div><div class="sl">Profit Factor</div></div>
+  <div class="s"><div class="sv" style="color:{'#3fb950' if result['net_pnl']>=0 else '#f85149'}">{result['net_pnl']:.3f}</div><div class="sl">純利益 (円)</div></div>
+  <div class="s"><div class="sv" style="color:#79c0ff">{result.get('sr',0):.3f}</div><div class="sl">Sharpe Ratio</div></div>
+  <div class="s"><div class="sv" style="color:#f85149">{result.get('max_dd',0):.4f}</div><div class="sl">最大 DD</div></div>
+  <div class="s"><div class="sv">{result['trades']}</div><div class="sl">取引数</div></div>
+  <div class="s"><div class="sv" style="color:#3fb950">{result['win_rate']*100:.1f}%</div><div class="sl">勝率</div></div>
+  <div class="s"><div class="sv" style="color:#ffa657">{result['gross_profit']:.3f}</div><div class="sl">総利益</div></div>
+  <div class="s"><div class="sv" style="color:#f85149">{result['gross_loss']:.3f}</div><div class="sl">総損失</div></div>
+</div>
+<div class="cw"><div class="ct">資産曲線 (累積損益)</div>
+  <canvas id="eq"></canvas></div>
+<div class="cw"><div class="ct">ドローダウン</div>
+  <canvas id="dd"></canvas></div>
+<div class="cw"><div class="ct">日別損益</div>
+  <canvas id="dl"></canvas></div>
+<script>
+const eq={json.dumps(eq_data)};
+const ddv={json.dumps(dd_data)};
+const dlv={json.dumps(dv)};
+const dll={json.dumps(dl)};
+const dlc={json.dumps(dclr)};
+function mc(id,lbl,data,color,fill,type='line'){{
+  new Chart(document.getElementById(id),{{
+    type,data:{{labels:lbl,datasets:[{{data,borderColor:color,
+      backgroundColor:fill,borderWidth:type==='bar'?0:1.5,
+      pointRadius:0,fill:type==='line',tension:.1}}]}},
+    options:{{responsive:true,maintainAspectRatio:false,animation:false,
+      plugins:{{legend:{{display:false}}}},
+      scales:{{x:{{ticks:{{color:'#8b949e',maxTicksLimit:12}},grid:{{color:'#21262d'}}}},
+              y:{{ticks:{{color:'#8b949e'}},grid:{{color:'#21262d'}}}}}}}}
+  }});
+}}
+mc('eq',Array.from({{length:eq.length}},(_,i)=>i+1),eq,'#3fb950','#3fb95018');
+mc('dd',Array.from({{length:ddv.length}},(_,i)=>i+1),ddv,'#f85149','#f8514918');
+mc('dl',dll,dlv,'rgba(0,0,0,0)','rgba(0,0,0,0)','bar');
+// 日別バーは個別色
+const dChart=Chart.getChart('dl');
+if(dChart)dChart.data.datasets[0].backgroundColor=dlc,dChart.update('none');
+</script>
+</body></html>"""
+    try:
+        out_dir.mkdir(parents=True, exist_ok=True)
+        (out_dir / 'report.html').write_text(html, encoding='utf-8')
+    except Exception as e:
+        print(f"  [WARN] レポート生成失敗: {e}")
+
+
+def backtest(onnx_path, X_te, df_te, threshold, tp_mult, sl_mult,
+             seq_len=20, report_dir: Path = None, trial_no: int = 0):
     import onnxruntime as ort
     sess  = ort.InferenceSession(str(onnx_path),
                                   providers=['CPUExecutionProvider'])
@@ -422,6 +514,7 @@ def backtest(onnx_path, X_te, df_te, threshold, tp_mult, sl_mult, seq_len=20):
     atr   = df_te['atr14'].values
     high  = df_te['high'].values
     low   = df_te['low'].values
+    dates = df_te.index
     n     = len(X_te)
 
     # バッチ推論
@@ -439,6 +532,7 @@ def backtest(onnx_path, X_te, df_te, threshold, tp_mult, sl_mult, seq_len=20):
         if bi >= len(close): break
 
         c = close[bi]; a = atr[bi]
+        date_str = str(dates[bi].date()) if bi < len(dates) else str(bi)
 
         # ポジション管理
         if pos:
@@ -454,7 +548,7 @@ def backtest(onnx_path, X_te, df_te, threshold, tp_mult, sl_mult, seq_len=20):
             if pnl is None and age >= HOLD_BARS:
                 pnl = (c - pos['entry']) * pos['side'] - SPREAD
             if pnl is not None:
-                trades.append({'pnl': pnl, 'side': pos['side']})
+                trades.append({'pnl': pnl, 'side': pos['side'], 'date': date_str})
                 pos = None
 
         # エントリー
@@ -478,53 +572,112 @@ def backtest(onnx_path, X_te, df_te, threshold, tp_mult, sl_mult, seq_len=20):
     if len(trades) < MIN_TRADES:
         print(f"  [SKIP] 取引数 {len(trades)} < {MIN_TRADES} → PF=0 (除外)")
         return {'pf': 0.0, 'trades': len(trades), 'win_rate': 0.0,
-                'gross_profit': 0.0, 'gross_loss': 0.0, 'net_pnl': 0.0}
+                'gross_profit': 0.0, 'gross_loss': 0.0, 'net_pnl': 0.0,
+                'sr': 0.0, 'max_dd': 0.0}
 
-    pnl  = np.array([t['pnl'] for t in trades])
-    gp   = float(pnl[pnl>0].sum())
-    gl   = float(abs(pnl[pnl<0].sum()))
-    return {
+    pnl    = np.array([t['pnl'] for t in trades])
+    gp     = float(pnl[pnl>0].sum())
+    gl     = float(abs(pnl[pnl<0].sum()))
+    equity = np.cumsum(pnl)
+    peak   = np.maximum.accumulate(equity)
+    dd     = equity - peak
+    max_dd = float(dd.min())
+
+    # 日別 Sharpe Ratio (年率換算 √252)
+    daily: dict = {}
+    for t in trades:
+        d = t.get('date', '0')
+        daily[d] = daily.get(d, 0.0) + t['pnl']
+    dr = np.array(list(daily.values()))
+    sr = float((dr.mean() / dr.std()) * np.sqrt(252)) if len(dr) > 1 and dr.std() > 0 else 0.0
+
+    result = {
         'pf':           round(gp / max(gl, 1e-9), 4),
         'trades':       len(trades),
         'win_rate':     round(float((pnl>0).mean()), 4),
         'gross_profit': round(gp, 4),
         'gross_loss':   round(gl, 4),
         'net_pnl':      round(float(pnl.sum()), 4),
+        'sr':           round(sr, 3),
+        'max_dd':       round(max_dd, 4),
     }
+    print(f"  SR={sr:.3f}  MaxDD={max_dd:.4f}  NetPnL={result['net_pnl']:.4f}")
+
+    # 資産曲線 HTML レポート生成
+    if report_dir is not None:
+        _generate_report(trades, equity, dd, result, Path(report_dir), trial_no)
+
+    return result
+
+
+def _write_trial_progress(out_dir: Path, data: dict) -> None:
+    """並列モード: 試行固有の進捗を trial_progress.json に書く"""
+    try:
+        path = out_dir / 'trial_progress.json'
+        tmp  = path.with_suffix('.tmp')
+        tmp.write_text(json.dumps(data, ensure_ascii=False), encoding='utf-8')
+        tmp.replace(path)
+    except Exception:
+        pass
 
 
 # ─── メイン ──────────────────────────────────────────────────────────────────
 def main():
+    global OUT_DIR, ONNX_PATH, NORM_PATH
     args = parse_args()
     set_seed(args.seed)
 
-    # ダッシュボード初期化 ── 既存の累積結果を引き継ぐ
+    # --out_dir が指定されていれば出力先を切り替え (並列モード)
+    parallel_mode = bool(getattr(args, 'out_dir', ''))
+    if parallel_mode:
+        OUT_DIR   = Path(args.out_dir)
+        ONNX_PATH = OUT_DIR / 'fx_model.onnx'
+        NORM_PATH = OUT_DIR / 'norm_params.json'
+        OUT_DIR.mkdir(parents=True, exist_ok=True)
+
+    # ダッシュボード初期化
     st = args.start_time or time.time()
 
-    # 過去の試行結果を読み込む (train.py が直接起動された場合も表示が途切れないように)
-    _all_res_path = OUT_DIR / 'all_results.json'
-    _best_path    = OUT_DIR / 'best_result.json'
-    prev_results  = json.loads(_all_res_path.read_text()) if _all_res_path.exists() else []
-    best_pf_saved = (json.loads(_best_path.read_text()).get('pf', 0.0)
-                     if _best_path.exists() else 0.0)
-    best_pf_show  = max(args.best_pf, best_pf_saved)
+    if not parallel_mode:
+        _all_res_path = OUT_DIR / 'all_results.json'
+        _best_path    = OUT_DIR / 'best_result.json'
+        prev_results  = json.loads(_all_res_path.read_text()) if _all_res_path.exists() else []
+        best_pf_saved = (json.loads(_best_path.read_text()).get('pf', 0.0)
+                         if _best_path.exists() else 0.0)
+        best_pf_show  = max(args.best_pf, best_pf_saved)
+        _dash.update({
+            'phase': 'training',
+            'trial': args.trial, 'total_trials': args.total_trials,
+            'best_pf': best_pf_show, 'target_pf': 0,
+            'current_params': {k: v for k, v in vars(args).items()
+                               if k not in ('trial','total_trials','best_pf','start_time','out_dir')},
+            'epoch': 0, 'total_epochs': args.epochs,
+            'train_loss': 0.0, 'val_loss': 0.0, 'accuracy': 0.0,
+            'epoch_log': [], 'trial_results': prev_results,
+            'start_time': st, 'message': f'試行{args.trial}: データ準備中...',
+        })
+        try: update_dashboard(_dash)
+        except Exception: pass
 
-    _dash.update({
-        'phase': 'training',
-        'trial': args.trial, 'total_trials': args.total_trials,
-        'best_pf': best_pf_show, 'target_pf': 2.0,
-        'current_params': {k: v for k, v in vars(args).items()
-                           if k not in ('trial','total_trials','best_pf','start_time')},
+    # 並列モードでも trial_progress.json に初期状態を書く
+    _write_trial_progress(OUT_DIR, {
+        'trial': args.trial, 'arch': getattr(args, 'arch', '?'),
+        'hidden': getattr(args, 'hidden', 0),
         'epoch': 0, 'total_epochs': args.epochs,
         'train_loss': 0.0, 'val_loss': 0.0, 'accuracy': 0.0,
-        'epoch_log': [], 'trial_results': prev_results,
-        'start_time': st, 'message': f'試行{args.trial}: データ準備中...',
+        'phase': 'preparing',
     })
-    try: update_dashboard(_dash)
-    except Exception: pass
+
+    _write_trial_progress(OUT_DIR, {
+        'trial': args.trial, 'arch': getattr(args, 'arch', '?'),
+        'hidden': getattr(args, 'hidden', 0),
+        'epoch': 0, 'total_epochs': args.epochs,
+        'train_loss': 0.0, 'val_loss': 0.0, 'accuracy': 0.0,
+        'phase': 'training',
+    })
 
     X_tr, y_tr, X_te, y_te, mean, std, df_te, seq_len, feat_indices = prepare(args)
-    n_feat = X_tr.shape[2]   # 実際の特徴量数 (サブセット後)
+    n_feat = X_tr.shape[2]
     model = train(args, X_tr, y_tr, X_te, y_te, mean, std, n_feat=n_feat)
 
     print("\n=== ONNX エクスポート ===")
@@ -533,25 +686,37 @@ def main():
     verify_onnx(str(ONNX_PATH), seq_len, n_feat)
 
     print("\n=== バックテスト (テスト期間) ===")
-    r = backtest(ONNX_PATH, X_te, df_te, args.threshold, args.tp, args.sl, seq_len)
+    r = backtest(ONNX_PATH, X_te, df_te, args.threshold, args.tp, args.sl,
+                 seq_len=seq_len,
+                 report_dir=OUT_DIR,
+                 trial_no=args.trial)
     print(f"  PF={r['pf']}  取引={r['trades']}  勝率={r['win_rate']:.1%}  "
-          f"純損益={r['net_pnl']:.4f}")
+          f"SR={r.get('sr',0):.3f}  MaxDD={r.get('max_dd',0):.4f}")
 
     # 結果保存
-    full = {**vars(args), **r}
-    (OUT_DIR / 'last_result.json').write_text(json.dumps(full, indent=2))
+    full = {**{k: v for k, v in vars(args).items() if k != 'out_dir'}, **r}
+    (OUT_DIR / 'last_result.json').write_text(
+        json.dumps(full, indent=2, ensure_ascii=False), encoding='utf-8')
 
-    # ダッシュボード更新
-    _dash.update({
-        'phase': 'trial_done',
-        'message': f"PF={r['pf']:.4f} 取引={r['trades']} 勝率={r['win_rate']:.1%}",
+    _write_trial_progress(OUT_DIR, {
+        'trial': args.trial, 'arch': getattr(args, 'arch', '?'),
+        'hidden': getattr(args, 'hidden', 0),
+        'epoch': args.epochs, 'total_epochs': args.epochs,
+        'train_loss': 0.0, 'val_loss': 0.0, 'accuracy': 0.0,
+        'phase': 'done', 'pf': r['pf'], 'sr': r.get('sr', 0), 'max_dd': r.get('max_dd', 0),
     })
-    try: update_dashboard(_dash)
-    except Exception: pass
+
+    if not parallel_mode:
+        _dash.update({
+            'phase': 'trial_done',
+            'message': (f"PF={r['pf']:.4f}  SR={r.get('sr',0):.3f}  "
+                        f"MaxDD={r.get('max_dd',0):.4f}  取引={r['trades']}"),
+        })
+        try: update_dashboard(_dash)
+        except Exception: pass
 
     return r['pf']
 
 
 if __name__ == '__main__':
-    pf = main()
-    import sys; sys.exit(0 if pf >= 1.5 else 1)
+    main()
