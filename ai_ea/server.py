@@ -20,7 +20,7 @@ from pathlib import Path
 
 from fastapi import FastAPI, HTTPException
 from fastapi.middleware.cors import CORSMiddleware
-from fastapi.responses import HTMLResponse, JSONResponse, StreamingResponse, FileResponse
+from fastapi.responses import HTMLResponse, JSONResponse, StreamingResponse, FileResponse, PlainTextResponse
 
 WORKSPACE     = Path('/workspace')
 AI_EA_DIR     = WORKSPACE / 'ai_ea'
@@ -186,6 +186,17 @@ def download_log():
     if not LOG_FILE.exists():
         raise HTTPException(404, 'ログファイルが見つかりません')
     return FileResponse(str(LOG_FILE), filename='train_run.log')
+
+
+@app.get('/api/trial_log/{trial_no}')
+def trial_log(trial_no: int, lines: int = 100):
+    """試行ログの末尾 lines 行を返す"""
+    log_path = TRIALS_DIR / f'trial_{trial_no:06d}' / 'train.log'
+    if not log_path.exists():
+        raise HTTPException(404, f'試行#{trial_no} のログが見つかりません')
+    text = log_path.read_text(encoding='utf-8', errors='replace')
+    tail = '\n'.join(text.splitlines()[-lines:])
+    return PlainTextResponse(tail)
 
 
 @app.get('/health')
