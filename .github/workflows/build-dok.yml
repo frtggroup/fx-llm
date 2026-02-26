@@ -4,7 +4,6 @@ on:
   push:
     paths:
       - 'DOK/**'
-      - 'ai_ea/**'
       - '.github/workflows/build-dok.yml'
   workflow_dispatch:   # 手動実行ボタンも有効
 
