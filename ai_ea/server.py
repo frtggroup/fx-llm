@@ -47,12 +47,14 @@ def _read_progress() -> dict:
 
 def _gpu_stats() -> dict:
     try:
-        import pynvml
-        pynvml.nvmlInit()
-        h = pynvml.nvmlDeviceGetHandleByIndex(0)
-        u = pynvml.nvmlDeviceGetUtilizationRates(h)
-        m = pynvml.nvmlDeviceGetMemoryInfo(h)
-        n = pynvml.nvmlDeviceGetName(h)
+        from pynvml import (nvmlInit, nvmlDeviceGetHandleByIndex,
+                            nvmlDeviceGetMemoryInfo, nvmlDeviceGetUtilizationRates,
+                            nvmlDeviceGetName)
+        nvmlInit()
+        h = nvmlDeviceGetHandleByIndex(0)
+        u = nvmlDeviceGetUtilizationRates(h)
+        m = nvmlDeviceGetMemoryInfo(h)
+        n = nvmlDeviceGetName(h)
         if isinstance(n, bytes):
             n = n.decode()
         return {

@@ -49,22 +49,24 @@ HIDDEN_MAP_LOCAL = {
     'inception':   [64, 128, 256],
 }
 HIDDEN_MAP_H100 = {
-    'mlp':         [512, 1024, 2048, 4096],
-    'gru_attn':    [256, 512, 1024, 2048],
+    'mlp':         [512, 1024, 2048],
+    'gru_attn':    [256, 512, 1024],
     'bigru':       [256, 512, 1024],
-    'lstm_attn':   [256, 512, 1024, 2048],
-    'cnn':         [256, 512, 1024, 2048],
-    'tcn':         [256, 512, 1024, 2048],
+    'lstm_attn':   [256, 512, 1024],
+    'cnn':         [256, 512, 1024],
+    'tcn':         [256, 512, 1024],
     'cnn_gru':     [256, 512, 1024],
     'transformer': [256, 512, 1024],
     'resnet':      [256, 512, 1024, 2048],
     'inception':   [256, 512, 1024],
 }
 HIDDEN_MAP     = HIDDEN_MAP_H100  if H100_MODE else HIDDEN_MAP_LOCAL
-BATCH_CHOICES  = [4096, 8192, 16384, 32768] if H100_MODE else [512, 1024, 2048, 4096]
-SEQ_CHOICES    = [10, 15, 20, 30, 40, 50]   if H100_MODE else [5, 8, 10, 15, 20]
+# 並列3本 × 最大バッチを考慮: H100 80GB / 3 ≈ 26GB/試行
+# 大モデル(h≥1024)では小バッチ、小モデルでは大バッチ
+BATCH_CHOICES  = [2048, 4096, 8192, 16384] if H100_MODE else [512, 1024, 2048, 4096]
+SEQ_CHOICES    = [10, 15, 20, 30, 40, 50]  if H100_MODE else [5, 8, 10, 15, 20]
 EPOCH_COUNT    = 2000 if H100_MODE else 800
-TRIAL_TIMEOUT  = 7200 if H100_MODE else 600
+TRIAL_TIMEOUT  = 5400 if H100_MODE else 600   # 90分 (torch.compile考慮)
 
 
 # ── ハイパーパラメータサンプリング ───────────────────────────────────────────
@@ -75,7 +77,11 @@ def sample_params(rng: random.Random) -> dict:
     dropout = round(rng.uniform(0.3, 0.6), 1)
     lr      = rng.choice([1e-4, 3e-4, 5e-4, 8e-4, 1e-3, 2e-3]
                          if H100_MODE else [1e-4, 3e-4, 5e-4, 8e-4, 1e-3])
-    batch   = rng.choice(BATCH_CHOICES)
+    # 大モデルでは小バッチ強制 (CUDA OOM防止: 3並列 × 26GB/trial)
+    if H100_MODE and hidden >= 1024:
+        batch = rng.choice([2048, 4096, 8192])
+    else:
+        batch = rng.choice(BATCH_CHOICES)
     tp      = round(rng.uniform(1.5, 3.5), 1)
     sl      = round(rng.uniform(0.5, 1.5), 1)
     fwd     = rng.choice([10, 15, 20, 25, 30])
@@ -104,11 +110,13 @@ def sample_params(rng: random.Random) -> dict:
 # ── GPU 情報取得 ─────────────────────────────────────────────────────────────
 def _gpu_info() -> dict:
     try:
-        import pynvml
-        pynvml.nvmlInit()
-        h = pynvml.nvmlDeviceGetHandleByIndex(0)
-        m = pynvml.nvmlDeviceGetMemoryInfo(h)
-        u = pynvml.nvmlDeviceGetUtilizationRates(h)
+        # nvidia-ml-py (pynvml の後継パッケージ)
+        from pynvml import (nvmlInit, nvmlDeviceGetHandleByIndex,
+                            nvmlDeviceGetMemoryInfo, nvmlDeviceGetUtilizationRates)
+        nvmlInit()
+        h = nvmlDeviceGetHandleByIndex(0)
+        m = nvmlDeviceGetMemoryInfo(h)
+        u = nvmlDeviceGetUtilizationRates(h)
         return {
             'free_gb':  m.free  / 1e9,
             'total_gb': m.total / 1e9,
@@ -262,11 +270,18 @@ class ParallelTrainer:
               f"h={params['hidden']:4d}  feat={feat_info}  PID={proc.pid}")
 
     def poll_completed(self) -> list:
-        """完了した試行のリストを返し running から削除"""
+        """完了/タイムアウトした試行のリストを返し running から削除"""
         done = []
         with self.lock:
             for tno in list(self.running.keys()):
-                info = self.running[tno]
+                info    = self.running[tno]
+                elapsed = time.time() - info['start_time']
+                # タイムアウト: 強制終了
+                if elapsed > TRIAL_TIMEOUT and info['proc'].poll() is None:
+                    print(f"  [TIMEOUT] 試行#{tno} ({elapsed/60:.0f}分超) → 強制終了")
+                    info['proc'].terminate()
+                    try: info['proc'].wait(timeout=10)
+                    except Exception: info['proc'].kill()
                 if info['proc'].poll() is not None:
                     info['log_fh'].close()
                     done.append((tno, info))

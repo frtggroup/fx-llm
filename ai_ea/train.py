@@ -234,10 +234,22 @@ def train(args, X_tr, y_tr, X_te, y_te, mean, std, n_feat=None):
     seq_len  = X_tr.shape[1]
     arch     = getattr(args, 'arch', 'gru_attn')
     n_in     = n_feat if n_feat is not None else N_FEATURES
-    model    = build_model(
-        arch, n_in, seq_len,
-        args.hidden, args.layers, args.dropout,
-    ).to(device)
+    try:
+        model = build_model(
+            arch, n_in, seq_len,
+            args.hidden, args.layers, args.dropout,
+        ).to(device)
+    except torch.cuda.OutOfMemoryError:
+        # OOM: バッチ半減・モデル縮小でリトライ
+        print(f"  [OOM] モデル生成 OOM → hidden/2, batch/2 でリトライ")
+        torch.cuda.empty_cache()
+        args.hidden = max(64, args.hidden // 2)
+        args.batch  = max(256, args.batch  // 2)
+        tr_dl, va_dl = make_loaders(X_tr, y_tr, X_te, y_te, args, device)
+        model = build_model(
+            arch, n_in, seq_len,
+            args.hidden, args.layers, args.dropout,
+        ).to(device)
 
     # H100: torch.compile で kernel fusion を最大活用
     if is_h100:
@@ -303,12 +315,18 @@ def train(args, X_tr, y_tr, X_te, y_te, mean, std, n_feat=None):
 
     for epoch in range(1, args.epochs + 1):
         model.train()
-        t_loss = sum(
-            _train_step(model, xb, yb,
-                        optimizer, criterion, scheduler, scaler,
-                        use_amp, amp_dtype, use_scaler)
-            for xb, yb in tr_dl
-        ) / len(tr_dl)
+        try:
+            t_loss = sum(
+                _train_step(model, xb, yb,
+                            optimizer, criterion, scheduler, scaler,
+                            use_amp, amp_dtype, use_scaler)
+                for xb, yb in tr_dl
+            ) / len(tr_dl)
+        except torch.cuda.OutOfMemoryError:
+            torch.cuda.empty_cache()
+            print(f"  [OOM] ep{epoch} CUDA OOM → 学習打ち切り")
+            stop_reason = f'CUDA OOM (ep{epoch})'
+            break
 
         model.eval()
         v_loss, correct, total = 0.0, 0, 0
