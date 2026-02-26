@@ -28,7 +28,14 @@ DATA_PATH = Path(os.environ.get('DATA_PATH', _DEFAULT_DATA))
 OUT_DIR   = Path(__file__).parent
 ONNX_PATH = OUT_DIR / 'fx_model.onnx'
 NORM_PATH = OUT_DIR / 'norm_params.json'
-SPREAD    = 0.003  # 0.3pips × 0.01 = 0.003円
+SPREAD    = 0.003  # 0.3pips × 0.01 = 0.003円 (USDJPY H1 spread)
+
+# ── バックテスト 資金設定 ──────────────────────────────────────────────────
+BT_CAPITAL  = float(os.environ.get('BT_CAPITAL',  '150000'))  # スタート資金 (円)
+BT_LEVERAGE = float(os.environ.get('BT_LEVERAGE', '1000'))    # レバレッジ倍率
+# USDJPY 1ロット=100,000USD 想定。証拠金=LOT_UNITS×レート/LEVERAGE
+# 保守的に1回あたり 0.1lot(10,000単位) 固定でテスト
+BT_LOT_UNITS = int(os.environ.get('BT_LOT_UNITS', '10000'))   # 1トレードあたりロット単位数
 
 _dash: dict = {}
 
@@ -478,15 +485,21 @@ def _train_step(model, xb, yb, opt, crit, sched,
 def _generate_report(trades: list, equity: np.ndarray, dd: np.ndarray,
                      result: dict, out_dir: Path, trial_no: int) -> None:
     """資産曲線・DDチャートのスタンドアロン HTML を生成"""
-    eq_data = [round(float(v), 5) for v in equity]
-    dd_data = [round(float(v), 5) for v in dd]
-    # 日別損益 (分布バーチャート)
+    capital  = result.get('capital', BT_CAPITAL)
+    lot_u    = result.get('lot_units', BT_LOT_UNITS)
+    lev      = result.get('leverage', BT_LEVERAGE)
+    # 資産曲線を円ベースで (capital + cumsum(pnl_yen))
+    eq_yen   = [round(capital + float(v) * lot_u, 0) for v in equity]
+    dd_yen   = [round(float(v) * lot_u, 0) for v in dd]
+    eq_data  = eq_yen
+    dd_data  = dd_yen
+    # 日別損益 (円)
     daily: dict = {}
     for t in trades:
         d = t.get('date', '?')
-        daily[d] = round(daily.get(d, 0.0) + t['pnl'], 5)
+        daily[d] = round(daily.get(d, 0.0) + t.get('pnl_yen', t['pnl'] * lot_u), 0)
     dl   = list(daily.keys())
-    dv   = [round(daily[k], 5) for k in dl]
+    dv   = [round(daily[k], 0) for k in dl]
     dclr = [('rgba(63,185,80,.6)' if v >= 0 else 'rgba(248,81,73,.6)') for v in dv]
     pf_c = '#f0883e' if result['pf'] >= 2 else '#3fb950' if result['pf'] >= 1.5 else '#ffa657' if result['pf'] >= 1.2 else '#f85149'
 
@@ -600,7 +613,8 @@ def backtest(onnx_path, X_te, df_te, threshold, tp_mult, sl_mult,
             if pnl is None and age >= HOLD_BARS:
                 pnl = (c - pos['entry']) * pos['side'] - SPREAD
             if pnl is not None:
-                trades.append({'pnl': pnl, 'side': pos['side'], 'date': date_str})
+                trades.append({'pnl': pnl, 'side': pos['side'],
+                               'date': date_str, 'entry': pos['entry']})
                 pos = None
 
         # エントリー
@@ -625,35 +639,63 @@ def backtest(onnx_path, X_te, df_te, threshold, tp_mult, sl_mult,
         print(f"  [SKIP] 取引数 {len(trades)} < {MIN_TRADES} → PF=0 (除外)")
         return {'pf': 0.0, 'trades': len(trades), 'win_rate': 0.0,
                 'gross_profit': 0.0, 'gross_loss': 0.0, 'net_pnl': 0.0,
-                'sr': 0.0, 'max_dd': 0.0}
+                'sr': 0.0, 'max_dd': 0.0, 'max_dd_pct': 0.0,
+                'final_equity': BT_CAPITAL, 'return_pct': 0.0}
 
-    pnl    = np.array([t['pnl'] for t in trades])
-    gp     = float(pnl[pnl>0].sum())
-    gl     = float(abs(pnl[pnl<0].sum()))
-    equity = np.cumsum(pnl)
-    peak   = np.maximum.accumulate(equity)
-    dd     = equity - peak
-    max_dd = float(dd.min())
+    # 価格差 → 円換算 (USDJPY: 価格差[円] × ロット単位数 = 損益[円])
+    pnl_raw = np.array([t['pnl'] for t in trades])          # 価格差 (円/単位)
+    pnl     = pnl_raw * BT_LOT_UNITS                         # 損益 (円)
 
-    # 日別 Sharpe Ratio (年率換算 √252)
+    # 証拠金チェック: 1トレードの必要証拠金
+    # USDJPY では entry価格×ロット単位数/レバレッジ ≈ 150×10000/1000=1500円
+    entry_prices = np.array([t.get('entry', 150.0) for t in trades])
+    margin_per_trade = entry_prices * BT_LOT_UNITS / BT_LEVERAGE  # 必要証拠金(円)
+
+    gp      = float(pnl[pnl>0].sum())
+    gl      = float(abs(pnl[pnl<0].sum()))
+    equity_curve = BT_CAPITAL + np.cumsum(pnl)               # 資産推移 (円)
+    equity  = np.cumsum(pnl)                                  # 累積損益 (0起点)
+    peak    = np.maximum.accumulate(equity_curve)
+    dd      = equity_curve - peak                             # DD (円)
+    max_dd  = float(dd.min())
+    max_dd_pct = float(max_dd / BT_CAPITAL * 100)            # DD率 (%)
+
+    # 各tradeに円換算PnLとentry価格を追記
+    for i, t in enumerate(trades):
+        t['pnl_yen'] = round(float(pnl[i]), 0)
+        t['margin']  = round(float(margin_per_trade[i]), 0)
+
+    # 日別 Sharpe Ratio (円換算PnLベース、年率換算 √252)
     daily: dict = {}
     for t in trades:
         d = t.get('date', '0')
-        daily[d] = daily.get(d, 0.0) + t['pnl']
+        daily[d] = daily.get(d, 0.0) + t['pnl_yen']
     dr = np.array(list(daily.values()))
     sr = float((dr.mean() / dr.std()) * np.sqrt(252)) if len(dr) > 1 and dr.std() > 0 else 0.0
+
+    net_pnl_yen    = round(float(pnl.sum()), 0)
+    final_equity   = round(BT_CAPITAL + net_pnl_yen, 0)
+    return_pct     = round(net_pnl_yen / BT_CAPITAL * 100, 2)
 
     result = {
         'pf':           round(gp / max(gl, 1e-9), 4),
         'trades':       len(trades),
         'win_rate':     round(float((pnl>0).mean()), 4),
-        'gross_profit': round(gp, 4),
-        'gross_loss':   round(gl, 4),
-        'net_pnl':      round(float(pnl.sum()), 4),
+        'gross_profit': round(gp, 0),
+        'gross_loss':   round(gl, 0),
+        'net_pnl':      net_pnl_yen,
         'sr':           round(sr, 3),
-        'max_dd':       round(max_dd, 4),
+        'max_dd':       round(max_dd, 0),
+        'max_dd_pct':   round(max_dd_pct, 2),
+        'final_equity': final_equity,
+        'return_pct':   return_pct,
+        'capital':      BT_CAPITAL,
+        'lot_units':    BT_LOT_UNITS,
+        'leverage':     BT_LEVERAGE,
     }
-    print(f"  SR={sr:.3f}  MaxDD={max_dd:.4f}  NetPnL={result['net_pnl']:.4f}")
+    print(f"  SR={sr:.3f}  MaxDD={max_dd:,.0f}円({max_dd_pct:.1f}%)  "
+          f"NetPnL={net_pnl_yen:,.0f}円  最終資産={final_equity:,.0f}円  "
+          f"リターン={return_pct:.1f}%")
 
     # 資産曲線 HTML レポート生成
     if report_dir is not None:

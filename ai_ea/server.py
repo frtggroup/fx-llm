@@ -674,14 +674,14 @@ async function poll() {
     document.getElementById('err-cnt').textContent = errCount;
     document.getElementById('msg').textContent = '⚠ 取得エラー: '+e.message;
   }
-  // TOP100 は 15秒ごと
-  top100Timer += 3;
-  if (top100Timer >= 15) { top100Timer = 0; updateTop100(); }
+  // TOP100 は 10秒ごと
+  top100Timer += 1;
+  if (top100Timer >= 10) { top100Timer = 0; updateTop100(); }
 }
 
 poll();
 updateTop100();
-setInterval(poll, 3000);
+setInterval(poll, 1000);
 </script>
 </body>
 </html>
