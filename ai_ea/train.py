@@ -849,7 +849,7 @@ def backtest(onnx_path, X_te, df_te, threshold, tp_mult, sl_mult,
                              'tp': entry - tp_mult * a,
                              'sl': entry + sl_mult * a, 'i0': i}
 
-    MIN_TRADES = 30
+    MIN_TRADES = 200
 
     if len(trades) < MIN_TRADES:
         print(f"  [SKIP] 取引数 {len(trades)} < {MIN_TRADES} → PF=0 (除外)")

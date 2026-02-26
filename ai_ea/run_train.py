@@ -780,8 +780,8 @@ def main():
                 except Exception as e:
                     print(f"  [WARN] TOP{TOP_N} 更新失敗: {e}")
 
-            # ベスト更新
-            if pf > best_pf:
+            # ベスト更新 (200取引以上のみ対象)
+            if pf > best_pf and trades >= 200:
                 best_pf = pf
                 for src, dst in [(info['trial_dir'] / 'fx_model.onnx',    BEST_ONNX),
                                   (info['trial_dir'] / 'norm_params.json', BEST_NORM)]:
