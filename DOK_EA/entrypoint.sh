@@ -3,7 +3,7 @@
 # FX AI EA H100 コンテナ エントリポイント v3
 # 1. SSH サーバー起動
 # 2. /opt/artifact を永続ストレージとしてセットアップ (Sakura DOK)
-# 3. ダッシュボードサーバー起動 (port 7860)
+# 3. ダッシュボードサーバー起動 (port 8080)
 # 4. CSV データ自動ダウンロード (DATA_URL が設定されている場合)
 # 5. 並列ランダムサーチ学習ループ起動 (run_train.py)
 # ─────────────────────────────────────────────────────────────────────────────
@@ -99,13 +99,13 @@ else
 fi
 
 # ── 6. ダッシュボードサーバー起動 (バックグラウンド) ─────────────────────
-echo "[*] ダッシュボード起動 (port 7860)..."
+echo "[*] ダッシュボード起動 (port 8080)..."
 python /workspace/ai_ea/server.py > /workspace/dashboard.log 2>&1 &
 DASH_PID=$!
 sleep 2
 if kill -0 "$DASH_PID" 2>/dev/null; then
     echo "[OK] ダッシュボード起動 (PID: $DASH_PID)"
-    echo "     -> http://0.0.0.0:7860"
+    echo "     -> http://0.0.0.0:8080"
 else
     echo "[WARN] ダッシュボード起動失敗 — ログ: /workspace/dashboard.log"
     cat /workspace/dashboard.log 2>/dev/null | tail -20
@@ -117,7 +117,7 @@ rm -f /workspace/stop.flag
 # ── 8. 並列ランダムサーチ学習ループ起動 ────────────────────────────────────
 echo ""
 echo "[*] 並列ランダムサーチ開始  (並列=${MAX_PARALLEL}  VRAM/試行=${VRAM_PER_TRIAL}GB)"
-echo "    停止するには: http://<DOK_IP>:7860  →「学習停止」ボタン"
+    echo "    停止するには: http://<DOK_IP>:8080  →「学習停止」ボタン"
 echo "    または:       touch /workspace/stop.flag"
 echo ""
 
@@ -148,10 +148,10 @@ echo ""
 if [ $EXIT_CODE -eq 0 ]; then
     echo "======================================================"
     echo "  学習完了!"
-    echo "  ダッシュボード : http://<DOK_IP>:7860"
-    echo "  ベストモデル   : http://<DOK_IP>:7860/download/best"
-    echo "  TOP100 DL      : http://<DOK_IP>:7860/download/model/1"
-    echo "  全結果 JSON    : http://<DOK_IP>:7860/download/results"
+    echo "  ダッシュボード : http://<DOK_IP>:8080"
+  echo "  ベストモデル   : http://<DOK_IP>:8080/download/best"
+  echo "  TOP100 DL      : http://<DOK_IP>:8080/download/model/1"
+  echo "  全結果 JSON    : http://<DOK_IP>:8080/download/results"
     echo "======================================================"
 else
     echo "  [ERROR] 学習がエラーで終了しました (exit=$EXIT_CODE)"

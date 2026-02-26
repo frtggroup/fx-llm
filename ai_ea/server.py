@@ -1,6 +1,6 @@
 """
 FX AI EA 並列ランダムサーチ ダッシュボードサーバー v2
-Sakura DOK / H100 対応  ─  FastAPI  port 7860
+Sakura DOK / H100 対応  ─  FastAPI  port 8080
 
 エンドポイント:
   GET  /                      → ダッシュボード HTML
@@ -730,4 +730,4 @@ setInterval(poll, 1000);
 
 if __name__ == '__main__':
     import uvicorn
-    uvicorn.run(app, host='0.0.0.0', port=7860, log_level='info')
+    uvicorn.run(app, host='0.0.0.0', port=8080, log_level='info')

@@ -5,7 +5,7 @@
 #   docker build -f DOK_EA/Dockerfile -t fx-ea:latest .
 #
 # Run (Sakura DOK / docker run):
-#   docker run --gpus all -p 7860:7860 -p 2222:22 \
+#   docker run --gpus all -p 8080:8080 -p 2222:22 \
 #     -e DATA_URL="https://your-storage/USDJPY_M1.csv" \
 #     -e H100_MODE=1 \
 #     -e MAX_PARALLEL=3 \
@@ -91,7 +91,7 @@ RUN mkdir -p /workspace/data \
 
 WORKDIR /workspace
 
-# 22=SSH  7860=Dashboard
-EXPOSE 22 7860
+# 22=SSH  8080=Dashboard
+EXPOSE 22 8080
 
 ENTRYPOINT ["/workspace/entrypoint.sh"]

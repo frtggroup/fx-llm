@@ -58,7 +58,7 @@ else
 fi
 
 # ── ダッシュボードサーバー起動 ────────────────────────────────────────────
-echo "[*] ダッシュボード起動 (port 7860)..."
+echo "[*] ダッシュボード起動 (port 8080)..."
 python /workspace/ai_ea/server.py > /workspace/dashboard.log 2>&1 &
 DASH_PID=$!
 sleep 2
@@ -101,7 +101,7 @@ echo ""
 if [ $EXIT_CODE -eq 0 ]; then
     echo "======================================================"
     echo "  学習完了!"
-    echo "  ダッシュボード : http://localhost:7860"
+    echo "  ダッシュボード : http://localhost:8080"
     echo "======================================================"
 else
     echo "  [ERROR] 学習がエラーで終了 (exit=$EXIT_CODE)"

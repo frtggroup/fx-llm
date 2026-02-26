@@ -11,7 +11,7 @@
 #   docker build -f DOK_GTX/Dockerfile -t frtggroup/fx-ea-gtx:latest .
 #
 # Run:
-#   docker run --gpus all -p 7860:7860 -p 2222:22 \
+#   docker run --gpus all -p 8080:8080 -p 2222:22 \
 #     -v $(pwd)/data:/workspace/data \
 #     -v $(pwd)/output:/workspace/ai_ea/trials \
 #     -e DATA_URL="https://your-storage/USDJPY_M1.csv" \
@@ -92,7 +92,7 @@ RUN mkdir -p /workspace/data \
 
 WORKDIR /workspace
 
-# 22=SSH  7860=Dashboard
-EXPOSE 22 7860
+# 22=SSH  8080=Dashboard
+EXPOSE 22 8080
 
 ENTRYPOINT ["/workspace/entrypoint.sh"]
