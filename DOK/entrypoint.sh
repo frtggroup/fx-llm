@@ -41,6 +41,21 @@ export TRANSFORMERS_CACHE="/workspace/hf_cache"
 export PYTORCH_CUDA_ALLOC_CONF="expandable_segments:True,max_split_size_mb:512"
 mkdir -p /workspace/data /workspace/output /workspace/reports /workspace/hf_cache
 
+# ── 3b. CSV データ自動ダウンロード ───────────────────────────────────────────
+CSV_DEST="/workspace/data/USDJPY_M1.csv"
+if [ ! -f "$CSV_DEST" ] || [ ! -s "$CSV_DEST" ]; then
+    if [ -n "${DATA_URL}" ]; then
+        echo "[*] CSV ダウンロード中: ${DATA_URL}"
+        wget -q --show-progress -O "$CSV_DEST" "${DATA_URL}" && \
+            echo "[OK] CSV ダウンロード完了: $(du -h $CSV_DEST | cut -f1)" || \
+            echo "[ERROR] CSV ダウンロード失敗"
+    else
+        echo "[WARN] DATA_URL 未設定。/workspace/data/USDJPY_M1.csv を手動配置してください"
+    fi
+else
+    echo "[*] CSV 既存: $(du -h $CSV_DEST | cut -f1)"
+fi
+
 # GPU確認
 echo "[*] GPU 確認..."
 nvidia-smi --query-gpu=name,memory.total,driver_version \
