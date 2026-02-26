@@ -46,7 +46,8 @@ DATA_PATH = Path(os.environ.get('DATA_PATH', _DEFAULT_DATA))
 OUT_DIR   = Path(__file__).parent
 ONNX_PATH = OUT_DIR / 'fx_model.onnx'
 NORM_PATH = OUT_DIR / 'norm_params.json'
-SPREAD    = 0.003  # 0.3pips × 0.01 = 0.003円 (USDJPY H1 spread)
+SPREAD    = 0.005  # ラウンドトリップ 1.0pips = 0.010円
+                  # エントリー時・エグジット時の2回引くため 0.01/2 = 0.005 に設定
 
 # ── バックテスト 資金設定 ──────────────────────────────────────────────────
 BT_CAPITAL  = float(os.environ.get('BT_CAPITAL',  '150000'))  # スタート資金 (円)

@@ -22,10 +22,10 @@ input string   InpModelFile  = "fx_model.onnx";        // ONNXモデル
 input string   InpNormFile   = "norm_params.json";     // 正規化パラメータ
 
 input group "=== エントリー設定 ==="
-input double   InpThreshold  = 0.46;   // エントリー確率閾値 (norm_params未記載時のフォールバック)
-input double   InpTpAtr      = 3.4;    // TP倍率 (ATR×)
-input double   InpSlAtr      = 0.7;    // SL倍率 (ATR×)
-input int      InpMaxHoldBars= 15;     // 最大保有バー数
+input double   InpThreshold  = 0.42;   // エントリー確率閾値 (norm_params未記載時のフォールバック)
+input double   InpTpAtr      = 1.6;    // TP倍率 (ATR×)
+input double   InpSlAtr      = 1.4;    // SL倍率 (ATR×)
+input int      InpMaxHoldBars= 10;     // 最大保有バー数
 
 input group "=== リスク管理 ==="
 input double   InpRiskPct    = 1.0;    // リスク率 (%) ※LotSize計算に使用
