@@ -39,6 +39,8 @@ echo "    MAX_PARALLEL : ${MAX_PARALLEL} 並列"
 echo "    VRAM/試行    : ${VRAM_PER_TRIAL} GB"
 echo "    DATA_PATH    : ${DATA_PATH}"
 echo "    S3_ENDPOINT  : ${S3_ENDPOINT:-未設定}"
+echo "    S3_BUCKET    : ${S3_BUCKET:-未設定}  PREFIX: ${S3_PREFIX:-未設定}"
+echo "    (チェックポイントはS3に保存 → 再起動時に自動復元)"
 
 # ── CSV データ自動ダウンロード ──────────────────────────────────────────────
 if [ ! -f "${DATA_PATH}" ] || [ ! -s "${DATA_PATH}" ]; then

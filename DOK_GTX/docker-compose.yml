@@ -39,13 +39,6 @@ services:
       DATA_URL: "https://fxea.s3.isk01.sakurastorage.jp/USDJPY_M1.csv"
       DATA_PATH: "/workspace/data/USDJPY_M1.csv"
 
-    # ローカル永続化 (H100/DOKと違いボリュームマウントで対応)
-    volumes:
-      - ./data:/workspace/data
-      - ./output/trials:/workspace/ai_ea/trials
-      - ./output/top100:/workspace/ai_ea/top100
-      - ./output/top_cache:/workspace/ai_ea/top_cache
-
     restart: unless-stopped
 
     # GTX 1080 Ti は共有メモリ少なめ
