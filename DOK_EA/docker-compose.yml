@@ -25,9 +25,9 @@ services:
       # H100 80GB モード (大型モデル・大バッチ)
       H100_MODE: "1"
       # 並列学習数 (VRAM 空き監視で動的調整)
-      MAX_PARALLEL: "3"
-      # 1試行あたりの最低 VRAM (GB)
-      VRAM_PER_TRIAL: "10"
+      MAX_PARALLEL: "6"
+      # 1試行あたりの最低 VRAM (GB) - H100 80GB / 6並列 ≈ 13GB/試行
+      VRAM_PER_TRIAL: "13"
       # バックテスト設定 (MQL5 LotSize相当)
       BT_CAPITAL: "150000"
       BT_LEVERAGE: "1000"
