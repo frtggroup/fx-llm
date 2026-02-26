@@ -1,10 +1,11 @@
 #!/bin/bash
 # ─────────────────────────────────────────────────────────────────────────────
-# FX AI EA H100 コンテナ エントリポイント v2
+# FX AI EA H100 コンテナ エントリポイント v3
 # 1. SSH サーバー起動
-# 2. ダッシュボードサーバー起動 (port 7860)
-# 3. CSV データ自動ダウンロード (DATA_URL が設定されている場合)
-# 4. 並列ランダムサーチ学習ループ起動 (run_train.py)
+# 2. /opt/artifact を永続ストレージとしてセットアップ (Sakura DOK)
+# 3. ダッシュボードサーバー起動 (port 7860)
+# 4. CSV データ自動ダウンロード (DATA_URL が設定されている場合)
+# 5. 並列ランダムサーチ学習ループ起動 (run_train.py)
 # ─────────────────────────────────────────────────────────────────────────────
 set -e
 
@@ -32,18 +33,48 @@ chmod 600 /root/.ssh/authorized_keys 2>/dev/null || true
 SSH_PID=$!
 echo "[OK] SSH サーバー起動 (PID: $SSH_PID)"
 
-# ── 3. 環境変数 / パス ──────────────────────────────────────────────────────
+# ── 3. /opt/artifact 永続ストレージのセットアップ (Sakura DOK) ──────────────
+echo "[*] /opt/artifact 永続ストレージをセットアップ..."
+ARTIFACT=/opt/artifact
+
+# 永続ディレクトリ作成
+mkdir -p "${ARTIFACT}/data" \
+         "${ARTIFACT}/ai_ea/trials" \
+         "${ARTIFACT}/ai_ea/top100" \
+         "${ARTIFACT}/ai_ea/top_cache" \
+         "${ARTIFACT}/checkpoint"
+
+# /workspace/data → /opt/artifact/data シンボリックリンク
+if [ ! -L /workspace/data ]; then
+    rm -rf /workspace/data
+    ln -sf "${ARTIFACT}/data" /workspace/data
+    echo "[OK] /workspace/data → ${ARTIFACT}/data"
+fi
+
+# 学習結果ディレクトリも永続化
+for d in trials top100 top_cache; do
+    if [ ! -L "/workspace/ai_ea/${d}" ]; then
+        rm -rf "/workspace/ai_ea/${d}"
+        ln -sf "${ARTIFACT}/ai_ea/${d}" "/workspace/ai_ea/${d}"
+        echo "[OK] /workspace/ai_ea/${d} → ${ARTIFACT}/ai_ea/${d}"
+    fi
+done
+
+# チェックポイント
+if [ ! -L /workspace/data/checkpoint ]; then
+    ln -sf "${ARTIFACT}/checkpoint" /workspace/data/checkpoint 2>/dev/null || true
+fi
+
+echo "[OK] 永続ストレージセットアップ完了"
+df -h "${ARTIFACT}" | tail -1
+
+# ── 4. 環境変数 / パス ──────────────────────────────────────────────────────
 export PYTHONPATH="/workspace/ai_ea:${PYTHONPATH}"
 export PYTORCH_CUDA_ALLOC_CONF="expandable_segments:True,max_split_size_mb:512"
 export H100_MODE="${H100_MODE:-1}"
 export MAX_PARALLEL="${MAX_PARALLEL:-3}"
 export VRAM_PER_TRIAL="${VRAM_PER_TRIAL:-10}"
-export DATA_PATH="${DATA_PATH:-/workspace/data/USDJPY_M1.csv}"
-
-mkdir -p /workspace/data \
-         /workspace/ai_ea/trials \
-         /workspace/ai_ea/top100 \
-         /workspace/ai_ea/top_cache
+export DATA_PATH="${DATA_PATH:-/opt/artifact/data/USDJPY_M1.csv}"
 
 echo "[*] 設定:"
 echo "    H100_MODE    : ${H100_MODE}"
@@ -51,7 +82,7 @@ echo "    MAX_PARALLEL : ${MAX_PARALLEL} 並列"
 echo "    VRAM/試行    : ${VRAM_PER_TRIAL} GB"
 echo "    DATA_PATH    : ${DATA_PATH}"
 
-# ── 4. CSV データ自動ダウンロード ──────────────────────────────────────────
+# ── 5. CSV データ自動ダウンロード ──────────────────────────────────────────
 if [ ! -f "${DATA_PATH}" ] || [ ! -s "${DATA_PATH}" ]; then
     if [ -n "${DATA_URL}" ]; then
         echo "[*] CSV ダウンロード中: ${DATA_URL}"
@@ -67,7 +98,7 @@ else
     echo "[*] CSV 既存: $(du -h ${DATA_PATH} | cut -f1)"
 fi
 
-# ── 5. ダッシュボードサーバー起動 (バックグラウンド) ─────────────────────
+# ── 6. ダッシュボードサーバー起動 (バックグラウンド) ─────────────────────
 echo "[*] ダッシュボード起動 (port 7860)..."
 python /workspace/ai_ea/server.py > /workspace/dashboard.log 2>&1 &
 DASH_PID=$!
@@ -80,10 +111,10 @@ else
     cat /workspace/dashboard.log 2>/dev/null | tail -20
 fi
 
-# ── 6. stop.flag をクリア ──────────────────────────────────────────────────
+# ── 7. stop.flag をクリア ──────────────────────────────────────────────────
 rm -f /workspace/stop.flag
 
-# ── 7. 並列ランダムサーチ学習ループ起動 ────────────────────────────────────
+# ── 8. 並列ランダムサーチ学習ループ起動 ────────────────────────────────────
 echo ""
 echo "[*] 並列ランダムサーチ開始  (並列=${MAX_PARALLEL}  VRAM/試行=${VRAM_PER_TRIAL}GB)"
 echo "    停止するには: http://<DOK_IP>:7860  →「学習停止」ボタン"

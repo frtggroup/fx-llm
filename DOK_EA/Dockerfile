@@ -53,10 +53,18 @@ RUN pip install --upgrade pip && \
 # ── SSH setup ────────────────────────────────────────────────────────────────
 RUN mkdir -p /var/run/sshd /root/.ssh && \
     chmod 700 /root/.ssh && \
-    echo "PermitRootLogin yes"         >> /etc/ssh/sshd_config && \
-    echo "PasswordAuthentication no"   >> /etc/ssh/sshd_config && \
-    echo "PubkeyAuthentication yes"    >> /etc/ssh/sshd_config && \
-    echo "AllowTcpForwarding yes"      >> /etc/ssh/sshd_config
+    echo "PermitRootLogin yes"              >> /etc/ssh/sshd_config && \
+    echo "PasswordAuthentication no"        >> /etc/ssh/sshd_config && \
+    echo "PubkeyAuthentication yes"         >> /etc/ssh/sshd_config && \
+    echo "AllowTcpForwarding yes"           >> /etc/ssh/sshd_config && \
+    echo "AllowStreamLocalForwarding yes"   >> /etc/ssh/sshd_config && \
+    echo "PrintMotd no"                     >> /etc/ssh/sshd_config && \
+    echo "PrintLastLog no"                  >> /etc/ssh/sshd_config && \
+    echo "PermitTTY yes"                    >> /etc/ssh/sshd_config && \
+    # 非対話コマンド実行のため bash profile を無効化しない
+    echo "PermitUserEnvironment yes"        >> /etc/ssh/sshd_config
+# SSH 接続時にブラケットペーストモードが有効にならないよう .bashrc を設定
+RUN echo 'if [[ $- != *i* ]]; then return; fi' >> /root/.bashrc
 
 COPY DOK_EA/ssh/authorized_keys /root/.ssh/authorized_keys
 RUN chmod 600 /root/.ssh/authorized_keys

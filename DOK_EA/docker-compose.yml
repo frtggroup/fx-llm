@@ -41,13 +41,11 @@ services:
       S3_PREFIX: "checkpoint"
       # データ CSV の URL (起動時に自動ダウンロード)
       # DATA_URL: "https://your-storage/USDJPY_M1.csv"
-      DATA_PATH: "/workspace/data/USDJPY_M1.csv"
+      # Sakura DOK では /opt/artifact が永続ストレージ
+      DATA_PATH: "/opt/artifact/data/USDJPY_M1.csv"
 
-    volumes:
-      # CSV データ永続化
-      - ./data:/workspace/data
-      # 学習結果・TOP100モデル・ログ永続化
-      - ./output/ai_ea:/workspace/ai_ea
+    # Sakura DOK では /opt/artifact が永続ストレージとして自動マウントされる
+    # ローカル volume mount は DOK CaaS 環境では不要
 
     restart: unless-stopped
 
