@@ -695,6 +695,21 @@ def main():
     print(f'  GPU無使用タイムアウト: {NO_GPU_TIMEOUT//60}分  データ準備猶予: {DATA_PREP_BUDGET//60}分')
     print('=' * 60)
 
+    # ── S3 接続確認 ────────────────────────────────────────────────────────────
+    print(f'  S3_ENABLED : {S3_ENABLED}')
+    print(f'  S3_ENDPOINT: {S3_ENDPOINT or "(未設定)"}')
+    print(f'  S3_BUCKET  : {S3_BUCKET}  PREFIX: {S3_PREFIX}')
+    if S3_ENABLED:
+        try:
+            cl = _s3_client()
+            cl.put_object(Bucket=S3_BUCKET, Key=f'{S3_PREFIX}/.ping', Body=b'ok')
+            cl.delete_object(Bucket=S3_BUCKET, Key=f'{S3_PREFIX}/.ping')
+            print('  [S3] 接続テスト OK ✅')
+        except Exception as e:
+            print(f'  [S3] 接続テスト 失敗 ❌: {e}')
+    else:
+        print('  [S3] 無効 (S3_ENDPOINT/S3_ACCESS_KEY/S3_SECRET_KEY を環境変数で設定してください)')
+
     # ── 起動時にデータキャッシュを事前作成 (全試行が即座に学習開始できる) ──
     _precache_data()
 
