@@ -336,12 +336,14 @@ def train(args, X_tr, y_tr, X_te, y_te, mean, std, n_feat=None):
             args.hidden, args.layers, args.dropout,
         ).to(device)
 
-    # H100: torch.compile (並列ランダムサーチでは reduce-overhead を使用)
-    # max-autotune は初回コンパイルに10-30分かかるため並列サーチには不向き
-    if is_h100 and not getattr(args, 'out_dir', ''):
+    # H100: torch.compile で GPU カーネル効率を向上
+    # reduce-overhead: 並列サーチに最適 (初回コンパイル ~30秒)
+    # max-autotune: 初回コンパイル10-30分のためシングルモードのみ
+    if is_h100:
+        compile_mode = 'max-autotune' if not getattr(args, 'out_dir', '') else 'reduce-overhead'
         try:
-            model = torch.compile(model, mode='max-autotune')
-            print("  torch.compile(max-autotune) 有効 [シングルモード]")
+            model = torch.compile(model, mode=compile_mode)
+            print(f"  torch.compile({compile_mode}) 有効")
         except Exception as e:
             print(f"  torch.compile スキップ: {e}")
 
@@ -397,35 +399,48 @@ def train(args, X_tr, y_tr, X_te, y_te, mean, std, n_feat=None):
     stop_reason    = ''
     recent_gaps    = []
     prev_v_loss    = float('inf')    # val_loss の前エポック値 (下降判定用)
-    print(f"  early_stop: ep{min_epochs}～, patience={patience}, wd={wd}")
+    # バリデーション頻度: エポック数に応じて調整 (GPU稼働率向上)
+    # 2000ep → 5ep毎, 800ep → 3ep毎
+    val_every = max(1, args.epochs // 400)
+    print(f"  early_stop: ep{min_epochs}～, patience={patience}, wd={wd}, val_every={val_every}")
+
+    v_loss = float('inf')   # 最初のvalidationまでの初期値
+    acc    = 0.0
 
     for epoch in range(1, args.epochs + 1):
         model.train()
         try:
-            t_loss = sum(
+            # GPU上でlossを集計 → エポック終わりに1回だけ同期 (GPU稼働率向上)
+            step_losses = [
                 _train_step(model, xb, yb,
                             optimizer, criterion, scheduler, scaler,
                             use_amp, amp_dtype, use_scaler)
                 for xb, yb in tr_dl
-            ) / len(tr_dl)
+            ]
+            t_loss = torch.stack(step_losses).mean().item()  # ここで1回だけ同期
         except torch.cuda.OutOfMemoryError:
             torch.cuda.empty_cache()
             print(f"  [OOM] ep{epoch} CUDA OOM → 学習打ち切り")
             stop_reason = f'CUDA OOM (ep{epoch})'
             break
 
-        model.eval()
-        v_loss, correct, total = 0.0, 0, 0
-        with torch.no_grad():
-            for xb, yb in va_dl:
-                with torch.amp.autocast('cuda', enabled=use_amp, dtype=amp_dtype):
-                    lo = model(xb)
-                v_loss += criterion(lo, yb).item()
-                correct += (lo.argmax(1) == yb).sum().item()
-                total   += len(yb)
-        v_loss /= len(va_dl)
-        acc     = correct / max(total, 1)
-        gap     = v_loss - t_loss   # 過学習ギャップ
+        # validation は val_every エポックごとに実行 (不要なGPU同期を削減)
+        if epoch % val_every == 0 or epoch <= 5 or epoch == args.epochs:
+            model.eval()
+            v_loss_sum = torch.zeros(1, device=device)
+            correct_sum = torch.zeros(1, device=device, dtype=torch.long)
+            total_sum   = 0
+            with torch.no_grad():
+                for xb, yb in va_dl:
+                    with torch.amp.autocast('cuda', enabled=use_amp, dtype=amp_dtype):
+                        lo = model(xb)
+                    v_loss_sum  += criterion(lo, yb).detach()
+                    correct_sum += (lo.argmax(1) == yb).sum()
+                    total_sum   += len(yb)
+            v_loss = (v_loss_sum / len(va_dl)).item()   # ここで1回だけ同期
+            acc    = correct_sum.item() / max(total_sum, 1)
+
+        gap = v_loss - t_loss   # 過学習ギャップ
 
         if epoch % 10 == 0 or epoch <= 5:
             lr_now = optimizer.param_groups[0]['lr']
@@ -459,7 +474,8 @@ def train(args, X_tr, y_tr, X_te, y_te, mean, std, n_feat=None):
         # ── val_loss 改善チェック ──────────────────────────────────────────
         if v_loss < best_loss - 1e-5:
             best_loss  = v_loss
-            best_state = {k: v.cpu().clone() for k, v in model.state_dict().items()}
+            # GPU上に保持 (cpu().clone()はI/Oボトルネック → detach().clone()に変更)
+            best_state = {k: v.detach().clone() for k, v in model.state_dict().items()}
             no_imp     = 0
         else:
             no_imp += 1
@@ -525,7 +541,8 @@ def _train_step(model, xb, yb, opt, crit, sched,
         nn.utils.clip_grad_norm_(model.parameters(), 1.0)
         opt.step()
     sched.step()
-    return loss.item()
+    # .item()を呼ばず GPU上テンソルのまま返す → GPU同期を減らす
+    return loss.detach()
 
 
 # ─── バックテスト ─────────────────────────────────────────────────────────

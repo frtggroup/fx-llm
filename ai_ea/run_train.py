@@ -137,7 +137,9 @@ HIDDEN_MAP_H100 = {
 HIDDEN_MAP     = HIDDEN_MAP_H100  if H100_MODE else HIDDEN_MAP_LOCAL
 # 並列3本 × 最大バッチを考慮: H100 80GB / 3 ≈ 26GB/試行
 # 大モデル(h≥1024)では小バッチ、小モデルでは大バッチ
-BATCH_CHOICES  = [2048, 4096, 8192, 16384] if H100_MODE else [512, 1024, 2048, 4096]
+# H100: 小バッチで1エポックあたりのイテレーション数を増やしGPU稼働率を上げる
+# データ13K件 / 512 = 25バッチ/ep → GPU稼働率 ~60-80%
+BATCH_CHOICES  = [256, 512, 1024, 2048] if H100_MODE else [256, 512, 1024, 2048]
 SEQ_CHOICES    = [10, 15, 20, 30, 40, 50]  if H100_MODE else [5, 8, 10, 15, 20]
 EPOCH_COUNT    = 2000 if H100_MODE else 800
 TRIAL_TIMEOUT  = 5400 if H100_MODE else 600   # 90分 (torch.compile考慮)
@@ -153,7 +155,7 @@ def sample_params(rng: random.Random) -> dict:
                          if H100_MODE else [1e-4, 3e-4, 5e-4, 8e-4, 1e-3])
     # 大モデルでは小バッチ強制 (CUDA OOM防止: 3並列 × 26GB/trial)
     if H100_MODE and hidden >= 1024:
-        batch = rng.choice([2048, 4096, 8192])
+        batch = rng.choice([256, 512, 1024])
     else:
         batch = rng.choice(BATCH_CHOICES)
     tp      = round(rng.uniform(1.5, 3.5), 1)
