@@ -24,6 +24,9 @@ RUN apt-get update && apt-get install -y --no-install-recommends \
         tmux \
         htop \
         rsync \
+        gcc \
+        g++ \
+        build-essential \
     && apt-get clean && rm -rf /var/lib/apt/lists/*
 
 # ── Python packages ──────────────────────────────────────────────────────────
