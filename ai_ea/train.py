@@ -839,7 +839,8 @@ def _simulate_trades(probs, close, high, low, open_arr, atr,
             else:
                 if   hi  >= sl_price: pnl = entry - sl_price - SPREAD
                 elif lo  <= tp_price: pnl = entry - tp_price - SPREAD
-            if pnl is None and age >= hold_bars:
+            if pnl is None and age > hold_bars:
+                # age > hold_bars (= hold_bars+1本目の始値で決済) → MQL5 g_pos_bars >= hold_bars と同一
                 pnl = (open_arr[bi] - entry) * side - SPREAD
             if pnl is not None:
                 date_str = str(dates[bi].date()) if bi < len(dates) else str(bi)

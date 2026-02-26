@@ -36,6 +36,10 @@ input bool     InpTimeFilter = false;  // 時間フィルター
 input int      InpStartHour  = 7;      // 開始時間(UTC)
 input int      InpEndHour    = 21;     // 終了時間(UTC)
 
+input group "=== 診断 ==="
+input bool     InpDebugLog   = false;  // 特徴量CSVログ出力 (Python比較用)
+input int      InpDebugBars  = 50;     // ログ出力バー数
+
 //──────────────────────────────────────────────────────────────────
 // グローバル変数
 //──────────────────────────────────────────────────────────────────
@@ -69,6 +73,8 @@ int h_ichi;
 
 datetime g_last_bar = 0;
 int      g_pos_bars = 0;
+int      g_debug_handle = INVALID_HANDLE;
+int      g_debug_count  = 0;
 
 #define N_ALL 70   // 全特徴量数
 
@@ -135,6 +141,22 @@ int OnInit()
    g_trade.SetExpertMagicNumber(InpMagic);
    g_trade.SetDeviationInPoints(20);
 
+   // 診断ログファイルを開く
+   if(InpDebugLog)
+   {
+      g_debug_handle = FileOpen("feat_debug.csv", FILE_WRITE | FILE_TXT | FILE_ANSI | FILE_COMMON);
+      if(g_debug_handle != INVALID_HANDLE)
+      {
+         // ヘッダ: datetime, feat_idx0, feat_idx1, ... , p_hold, p_buy, p_sell
+         string hdr = "datetime";
+         for(int f = 0; f < g_n_feat; f++)
+            hdr += StringFormat(",feat%d(idx%d)", f, g_feat_idx[f]);
+         hdr += ",p_hold,p_buy,p_sell";
+         FileWriteString(g_debug_handle, hdr + "\n");
+         Print("[EA] 診断ログ開始: feat_debug.csv (Common\\Files\\)");
+      }
+   }
+
    Print("[EA] 初期化完了  seq=", g_seq_len, " feat=", g_n_feat,
          " threshold=", InpThreshold);
    return INIT_SUCCEEDED;
@@ -146,6 +168,7 @@ int OnInit()
 void OnDeinit(const int reason)
 {
    if(g_model != INVALID_HANDLE) OnnxRelease(g_model);
+   if(g_debug_handle != INVALID_HANDLE) { FileClose(g_debug_handle); g_debug_handle = INVALID_HANDLE; }
    IndicatorRelease(h_ema8);   IndicatorRelease(h_ema21);
    IndicatorRelease(h_ema55);  IndicatorRelease(h_ema200);
    IndicatorRelease(h_atr14);  IndicatorRelease(h_atr5);
@@ -665,8 +688,12 @@ bool RunInference(float &probs[])
 
       feat[62] = MathSin(2.0 * M_PI * hr  / 24.0);  // hour_sin
       feat[63] = MathCos(2.0 * M_PI * hr  / 24.0);  // hour_cos
-      feat[64] = MathSin(2.0 * M_PI * dow /  5.0);  // dow_sin
-      feat[65] = MathCos(2.0 * M_PI * dow /  5.0);  // dow_cos
+      // MQL5 day_of_week: 0=Sun,1=Mon,...,5=Fri,6=Sat
+      // Python dayofweek: 0=Mon,1=Tue,...,4=Fri,5=Sat,6=Sun
+      // 変換: Python_dow = (MQL5_dow == 0) ? 6 : (MQL5_dow - 1)
+      int dow_py = (dow == 0) ? 6 : (dow - 1);
+      feat[64] = MathSin(2.0 * M_PI * dow_py / 5.0);  // dow_sin
+      feat[65] = MathCos(2.0 * M_PI * dow_py / 5.0);  // dow_cos
       feat[66] = (hr >=  0 && hr <  9) ? 1.0 : 0.0; // is_tokyo
       feat[67] = (hr >=  7 && hr < 16) ? 1.0 : 0.0; // is_london
       feat[68] = (hr >= 13 && hr < 22) ? 1.0 : 0.0; // is_ny
@@ -695,6 +722,24 @@ bool RunInference(float &probs[])
    probs[0] = output_data[0];  // P(HOLD)
    probs[1] = output_data[1];  // P(BUY)
    probs[2] = output_data[2];  // P(SELL)
+
+   // ── 診断ログ: 最新バーの特徴量(t=0)を出力 ─────────────────
+   if(InpDebugLog && g_debug_handle != INVALID_HANDLE && g_debug_count < InpDebugBars)
+   {
+      // 最新バー(t=0)の生特徴量を出力
+      // input_data の最終行(row = g_seq_len-1) = t=0 の特徴量
+      datetime bar_time = iTime(_Symbol, PERIOD_H1, 1);  // 直近確定バーの時刻
+      string line = TimeToString(bar_time, TIME_DATE | TIME_MINUTES);
+      int last_row = g_seq_len - 1;  // t=0 は最終行
+      for(int f = 0; f < g_n_feat; f++)
+         line += StringFormat(",%.6f", input_data[last_row * g_n_feat + f]);
+      line += StringFormat(",%.6f,%.6f,%.6f", probs[0], probs[1], probs[2]);
+      FileWriteString(g_debug_handle, line + "\n");
+      FileFlush(g_debug_handle);
+      g_debug_count++;
+      if(g_debug_count >= InpDebugBars)
+         Print("[EA] 診断ログ完了: ", InpDebugBars, "バー分を feat_debug.csv に出力");
+   }
 
    return true;
 }

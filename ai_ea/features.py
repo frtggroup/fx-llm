@@ -103,7 +103,7 @@ def load_data(csv_path: str, timeframe: str = 'H1') -> pd.DataFrame:
             low=('low', 'min'),    close=('close', 'last'),
             volume=('volume', 'sum')
         ).dropna()
-        df = df[df.index.dayofweek < 5]
+        df = df[df.index.dayofweek < 5]  # weekdays only (Mon=0,...,Fri=4)
 
     print(f"  {timeframe}: {len(df):,}本  {df.index[0]} ～ {df.index[-1]}")
     return df
@@ -194,7 +194,7 @@ def add_indicators(df: pd.DataFrame) -> pd.DataFrame:
     df['cci14'] = (tp - tp20) / (0.015 * mad + 1e-9) / 100.0  # スケール調整
 
     # ── Bollinger Bands ───────────────────────────────────────────────────
-    bb_mid = c.rolling(20).mean(); bb_std = c.rolling(20).std()
+    bb_mid = c.rolling(20).mean(); bb_std = c.rolling(20).std(ddof=0)  # MT5 iBands は母標準偏差(ddof=0)
     bb_up  = bb_mid + 2*bb_std;   bb_lo  = bb_mid - 2*bb_std
     df['bb_pos']   = (c - bb_lo) / (bb_up - bb_lo + 1e-9)
     df['bb_width'] = (bb_up - bb_lo) / (bb_mid + 1e-9)
