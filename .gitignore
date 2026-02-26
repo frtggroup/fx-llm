@@ -1,0 +1,25 @@
+# SSH 秘密鍵 (絶対にコミットしない)
+DOK/ssh/id_ed25519_dok
+DOK/ssh/id_ed25519_dok.pub
+
+# Python
+__pycache__/
+*.pyc
+*.pyo
+.venv/
+venv/
+
+# データ・モデル (大容量)
+*.csv
+*.pt
+*.safetensors
+llm_adapter/
+llm_adapter_best/
+llm_checkpoint/
+hf_cache/
+
+# ログ・一時ファイル
+*.log
+*.tmp
+llm_progress.json
+llm_dashboard.html

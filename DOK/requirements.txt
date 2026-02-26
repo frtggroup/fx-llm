@@ -1,0 +1,29 @@
+# ── Unsloth (H100 / CUDA 12.4 / PyTorch 2.5) ─────────────────────────────
+unsloth[cu124-torch250]
+xformers
+flash-attn --no-build-isolation
+
+# ── Transformers ecosystem ────────────────────────────────────────────────
+transformers>=4.45.0
+peft>=0.13.0
+accelerate>=1.0.0
+bitsandbytes>=0.44.0
+trl>=0.11.0
+datasets
+
+# ── Web dashboard ─────────────────────────────────────────────────────────
+flask>=3.0.0
+flask-cors
+
+# ── Data / ML ─────────────────────────────────────────────────────────────
+numpy
+pandas
+scipy
+scikit-learn
+
+# ── Misc ──────────────────────────────────────────────────────────────────
+tqdm
+tokenizers
+sentencepiece
+huggingface_hub
+safetensors
