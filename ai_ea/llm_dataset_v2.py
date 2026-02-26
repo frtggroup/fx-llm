@@ -198,6 +198,56 @@ def describe_recent_change(seq: np.ndarray) -> str:
 
 
 # ──────────────────────────────────────────────────────────────────────────────
+# 直近ローソク足の視覚的サマリー（推奨追加機能）
+# ──────────────────────────────────────────────────────────────────────────────
+def describe_candle_sequence(seq: np.ndarray) -> str:
+    """
+    直近20本の騰落方向を記号で1行表示 + 直近5本のリターン率を記述。
+    合計トークン増加: ~50トークン
+    例:
+      Candles (last 20): ▼▲▲▼▼▲▲▲▲▼▲▲▲▼▲▲▼▲▲▲  (▲13 ▼7)
+      Last 5 returns: +0.12%, -0.08%, +0.23%, +0.05%, -0.11%  [momentum: accelerating]
+    """
+    if seq is None or len(seq) < 5:
+        return ''
+
+    body_vals = seq[:, _IDX['body']]
+    ret1_vals = seq[:, _IDX['ret1']]
+
+    # 20本の方向記号
+    symbols = []
+    for b in body_vals:
+        if b > 0.05:
+            symbols.append('▲')
+        elif b < -0.05:
+            symbols.append('▼')
+        else:
+            symbols.append('─')  # 十字線/小実体
+
+    up_cnt   = symbols.count('▲')
+    dn_cnt   = symbols.count('▼')
+    seq_str  = ''.join(symbols)
+
+    # 直近5本のリターン率（%）
+    last5 = ret1_vals[-5:]
+    ret_strs = [f'{r*100:+.2f}%' for r in last5]
+
+    # モメンタム加速度（最後2本 vs 前3本の平均）
+    recent_ret  = np.mean(last5[-2:])
+    earlier_ret = np.mean(last5[:3])
+    if recent_ret > earlier_ret + 0.0005:
+        momentum = 'accelerating up'
+    elif recent_ret < earlier_ret - 0.0005:
+        momentum = 'accelerating down' if recent_ret < 0 else 'decelerating'
+    else:
+        momentum = 'steady'
+
+    line1 = f'Candles (last {len(seq)}): {seq_str}  (▲{up_cnt} ▼{dn_cnt})'
+    line2 = f'Last 5 returns: {", ".join(ret_strs)}  [momentum: {momentum}]'
+    return line1 + '\n' + line2
+
+
+# ──────────────────────────────────────────────────────────────────────────────
 # メインプロンプト生成 v2
 # ──────────────────────────────────────────────────────────────────────────────
 def bar_to_text_v2(feat: np.ndarray, seq: np.ndarray,
@@ -244,6 +294,11 @@ def bar_to_text_v2(feat: np.ndarray, seq: np.ndarray,
     recent_str = describe_recent_change(seq)
     if recent_str:
         lines.append(recent_str)
+
+    # ── ローソク足シーケンス（直近20本方向 + 直近5本リターン） ─────────────────
+    candle_str = describe_candle_sequence(seq)
+    if candle_str:
+        lines.append(candle_str)
 
     # ── トレンド詳細 ──────────────────────────────────────────────────────────
     c200    = _f(feat, 'c_ema200')
