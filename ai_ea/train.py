@@ -503,9 +503,10 @@ def _generate_report(trades: list, equity: np.ndarray, dd: np.ndarray,
     """資産曲線・DDチャートのスタンドアロン HTML を生成"""
     capital  = result.get('capital', BT_CAPITAL)
     lev      = result.get('leverage', BT_LEVERAGE)
-    # 資産曲線・DDはすでに円ベース
-    eq_data  = [round(float(v), 0) for v in equity]
-    dd_data  = [round(float(v), 0) for v in dd]
+    # 資産曲線・DDはすでに円ベース (ラベルは各取引の決済日付)
+    eq_data    = [round(float(v), 0) for v in equity]
+    dd_data    = [round(float(v), 0) for v in dd]
+    trade_dates = [t.get('date', '') for t in trades]  # 取引日付ラベル
     # 日別損益 (円)
     daily: dict = {}
     for t in trades:
@@ -558,6 +559,7 @@ canvas{{max-height:250px}}
   <canvas id="dl"></canvas></div>
 <script>
 const eq={json.dumps(eq_data)};
+const eql={json.dumps(trade_dates)};
 const ddv={json.dumps(dd_data)};
 const dlv={json.dumps(dv)};
 const dll={json.dumps(dl)};
@@ -568,13 +570,14 @@ function mc(id,lbl,data,color,fill,type='line'){{
       backgroundColor:fill,borderWidth:type==='bar'?0:1.5,
       pointRadius:0,fill:type==='line',tension:.1}}]}},
     options:{{responsive:true,maintainAspectRatio:false,animation:false,
-      plugins:{{legend:{{display:false}}}},
-      scales:{{x:{{ticks:{{color:'#8b949e',maxTicksLimit:12}},grid:{{color:'#21262d'}}}},
-              y:{{ticks:{{color:'#8b949e'}},grid:{{color:'#21262d'}}}}}}}}
+      plugins:{{legend:{{display:false}},
+               tooltip:{{callbacks:{{label:ctx=>ctx.parsed.y.toLocaleString('ja-JP')+'円'}}}}}},
+      scales:{{x:{{ticks:{{color:'#8b949e',maxTicksLimit:14,maxRotation:45}},grid:{{color:'#21262d'}}}},
+              y:{{ticks:{{color:'#8b949e',callback:v=>v.toLocaleString('ja-JP')+'円'}},grid:{{color:'#21262d'}}}}}}}}
   }});
 }}
-mc('eq',Array.from({{length:eq.length}},(_,i)=>i+1),eq,'#3fb950','#3fb95018');
-mc('dd',Array.from({{length:ddv.length}},(_,i)=>i+1),ddv,'#f85149','#f8514918');
+mc('eq',eql,eq,'#3fb950','#3fb95018');
+mc('dd',eql,ddv,'#f85149','#f8514918');
 mc('dl',dll,dlv,'rgba(0,0,0,0)','rgba(0,0,0,0)','bar');
 // 日別バーは個別色
 const dChart=Chart.getChart('dl');
