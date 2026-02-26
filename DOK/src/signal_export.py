@@ -17,8 +17,7 @@ sys.path.insert(0, '/workspace/ai_ea')
 sys.path.insert(0, '/workspace/src')
 
 WORKSPACE    = Path('/workspace')
-ADAPTER_DIR  = WORKSPACE / 'output' / 'llm_adapter_best'
-TEST_JSONL   = WORKSPACE / 'output' / 'llm_test.jsonl'
+OUTPUT_DIR   = WORKSPACE / 'output'
 REPORT_DIR   = WORKSPACE / 'reports'
 PROGRESS_JSON = WORKSPACE / 'progress.json'
 
@@ -39,13 +38,45 @@ def update_progress(patch: dict) -> None:
         pass
 
 
+def find_test_jsonl() -> Path:
+    """v2 → v1 の順で存在するテストデータを返す"""
+    candidates = [
+        OUTPUT_DIR / 'llm_test_v2_cot.jsonl',
+        OUTPUT_DIR / 'llm_test_v2.jsonl',
+        OUTPUT_DIR / 'llm_test.jsonl',
+    ]
+    for p in candidates:
+        if p.exists() and p.stat().st_size > 0:
+            print(f"  テストデータ: {p.name}", flush=True)
+            return p
+    raise FileNotFoundError(
+        f"テストデータが見つかりません。候補: {[str(c) for c in candidates]}"
+    )
+
+
+def find_adapter_dir() -> Path:
+    """v2 → v1 の順で存在するアダプターを返す"""
+    candidates = [
+        OUTPUT_DIR / 'llm_adapter_best_v2',
+        OUTPUT_DIR / 'llm_adapter_best',
+    ]
+    for p in candidates:
+        if p.exists():
+            print(f"  アダプター: {p.name}", flush=True)
+            return p
+    raise FileNotFoundError(
+        f"アダプターが見つかりません。候補: {[str(c) for c in candidates]}"
+    )
+
+
 def load_test_samples() -> list:
-    if not TEST_JSONL.exists():
-        raise FileNotFoundError(f"テストデータが見つかりません: {TEST_JSONL}")
+    test_path = find_test_jsonl()
     samples = []
-    with open(TEST_JSONL, encoding='utf-8') as f:
+    with open(test_path, encoding='utf-8') as f:
         for line in f:
-            samples.append(json.loads(line.strip()))
+            line = line.strip()
+            if line:
+                samples.append(json.loads(line))
     print(f"  テストサンプル: {len(samples):,} 件", flush=True)
     return samples
 
@@ -95,10 +126,12 @@ def run_inference(samples: list) -> tuple[list, list]:
     import torch
     from unsloth import FastLanguageModel
 
-    print(f"  モデル読込: {ADAPTER_DIR}", flush=True)
+    adapter_dir = find_adapter_dir()
+    max_len = 1536 if 'v2' in adapter_dir.name else 1024
+    print(f"  モデル読込: {adapter_dir}  max_len={max_len}", flush=True)
     model, tokenizer = FastLanguageModel.from_pretrained(
-        model_name        = str(ADAPTER_DIR),
-        max_seq_length    = 1024,
+        model_name        = str(adapter_dir),
+        max_seq_length    = max_len,
         load_in_4bit      = True,
         dtype             = None,
         trust_remote_code = True,
