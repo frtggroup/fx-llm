@@ -8,21 +8,17 @@
 #   4. パイプライン実行 (データセット → 訓練 → バックテスト)
 # ─────────────────────────────────────────────────────────────────────────────
 set -e
+# UFW/sysctl などの非致命的エラーは無視するヘルパー
+ignore_err() { "$@" || true; }
 
 echo "======================================================"
 echo "  FX LLM Fine-tuning on Sakura DOK / H100 80GB"
 echo "======================================================"
 
 # ── 1. UFW ────────────────────────────────────────────────────────────────────
-echo "[*] UFW 設定..."
-ufw --force reset
-ufw default deny incoming
-ufw default allow outgoing
-ufw allow 22/tcp    comment 'SSH'
-ufw allow 7860/tcp  comment 'Dashboard'
-ufw --force enable
-ufw status verbose
-echo "[OK] UFW 設定完了"
+# DOK コンテナは iptables 権限がないため UFW はスキップ
+# ポート管理は DOK の設定画面 (HTTP:7860, SSH:有効) で行う
+echo "[*] UFW: DOK コンテナでは不要 (DOKがポート管理) → スキップ"
 
 # ── 2. SSH サーバー ───────────────────────────────────────────────────────────
 echo "[*] SSH サーバー起動..."
