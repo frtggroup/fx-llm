@@ -81,24 +81,55 @@ def set_seed(seed):
 
 
 # ─── データ準備 ────────────────────────────────────────────────────────────
+_DF_CACHE: dict = {}   # {timeframe: (df_tr, df_te)} プロセス内キャッシュ
+
+
 def prepare(args):
     print(f"\n=== データ準備 [{args.timeframe}] ===")
     t0 = time.time()
 
-    df = load_data(str(DATA_PATH), timeframe=args.timeframe)
-    df = add_indicators(df)
-    df.replace([np.inf, -np.inf], np.nan, inplace=True)
-    df.dropna(inplace=True)
+    # 同一プロセス内でのキャッシュ（シングルモード用）
+    # 並列モードでは各サブプロセスが独自にキャッシュを持つ
+    cache_key = args.timeframe
+    if cache_key in _DF_CACHE:
+        df_tr, df_te = _DF_CACHE[cache_key]
+        print(f"  データキャッシュHIT ({len(df_tr):,} / {len(df_te):,})")
+    else:
+        # ディスクキャッシュ: npz 形式で保存 (指標計算を毎回スキップ)
+        cache_path = OUT_DIR.parent / f'df_cache_{args.timeframe}.pkl'
+        if cache_path.exists():
+            print(f"  ディスクキャッシュ読み込み中...")
+            import pickle
+            with open(cache_path, 'rb') as f:
+                df_tr, df_te = pickle.load(f)
+            print(f"  キャッシュ読み込み完了 ({len(df_tr):,} / {len(df_te):,})  {time.time()-t0:.1f}秒")
+        else:
+            df = load_data(str(DATA_PATH), timeframe=args.timeframe)
+            df = add_indicators(df)
+            df.replace([np.inf, -np.inf], np.nan, inplace=True)
+            df.dropna(inplace=True)
 
-    # 直近1年 = テスト
-    test_start = df.index[-1] - timedelta(days=365)
-    df_tr = df[df.index < test_start].copy()
-    df_te = df[df.index >= test_start].copy()
+            # 直近1年 = テスト
+            test_start = df.index[-1] - timedelta(days=365)
+            df_tr = df[df.index < test_start].copy()
+            df_te = df[df.index >= test_start].copy()
 
-    # 訓練期間を最近N月に絞る (分布シフト対策)
+            # ディスクキャッシュ保存
+            try:
+                import pickle
+                with open(cache_path, 'wb') as f:
+                    pickle.dump((df_tr, df_te), f)
+                print(f"  ディスクキャッシュ保存: {cache_path}")
+            except Exception as e:
+                print(f"  キャッシュ保存スキップ: {e}")
+
+        _DF_CACHE[cache_key] = (df_tr, df_te)
+
+    # 訓練期間を最近N月に絞る (分布シフト対策)  ※元 df_tr をコピーして使う
+    df_tr = df_tr.copy()
     tm = getattr(args, 'train_months', 0)
     if tm > 0:
-        train_start = test_start - timedelta(days=tm * 30)
+        train_start = df_tr.index[-1] - timedelta(days=tm * 30)
         df_tr = df_tr[df_tr.index >= train_start].copy()
         print(f"  訓練期間を直近{tm}ヶ月に限定: {df_tr.index[0].date()} ～")
     print(f"  訓練: {len(df_tr):,}  テスト: {len(df_te):,}")
@@ -527,8 +558,10 @@ if(dChart)dChart.data.datasets[0].backgroundColor=dlc,dChart.update('none');
 def backtest(onnx_path, X_te, df_te, threshold, tp_mult, sl_mult,
              seq_len=20, report_dir: Path = None, trial_no: int = 0):
     import onnxruntime as ort
-    sess  = ort.InferenceSession(str(onnx_path),
-                                  providers=['CPUExecutionProvider'])
+    _providers = (['CUDAExecutionProvider', 'CPUExecutionProvider']
+                  if 'CUDAExecutionProvider' in ort.get_available_providers()
+                  else ['CPUExecutionProvider'])
+    sess = ort.InferenceSession(str(onnx_path), providers=_providers)
     close = df_te['close'].values
     atr   = df_te['atr14'].values
     high  = df_te['high'].values
