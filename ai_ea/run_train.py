@@ -730,7 +730,22 @@ def main():
     # 既存結果を引き継ぐ
     if ALL_RESULTS.exists():
         try:
-            results  = json.loads(ALL_RESULTS.read_text(encoding='utf-8'))
+            raw = json.loads(ALL_RESULTS.read_text(encoding='utf-8'))
+            # ── 重複排除: 同じ trial 番号は最初の1件のみ残す ──────────────
+            seen: set = set()
+            results = []
+            for r in raw:
+                tno_r = r.get('trial', -1)
+                if tno_r not in seen:
+                    seen.add(tno_r)
+                    results.append(r)
+            if len(raw) != len(results):
+                print(f"  [DEDUP] 重複除去: {len(raw)} → {len(results)} 件")
+                # クリーンなデータで上書き保存
+                tmp = ALL_RESULTS.with_suffix('.tmp')
+                tmp.write_text(json.dumps(results, indent=2, ensure_ascii=False),
+                               encoding='utf-8')
+                tmp.replace(ALL_RESULTS)
             trial_no = max((r.get('trial', 0) for r in results), default=0) + 1
             valid    = [r for r in results if r.get('pf', 0) > 0]
             if valid:
@@ -786,7 +801,12 @@ def main():
                 'elapsed_sec': elapsed,
                 **{k: v for k, v in info['params'].items()},
             }
-            results.append(record)
+            # 重複防止: 同じ trial_no がすでにあれば上書き、なければ追加
+            existing_idx = next((i for i, r in enumerate(results) if r['trial'] == tno), None)
+            if existing_idx is not None:
+                results[existing_idx] = record
+            else:
+                results.append(record)
             results.sort(key=lambda x: x['trial'])
 
             # all_results.json アトミック書き込み
