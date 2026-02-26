@@ -1,0 +1,16 @@
+# シェルスクリプト・Dockerfileは必ずLF
+DOK/entrypoint.sh     text eol=lf
+DOK/Dockerfile        text eol=lf
+DOK_EA/entrypoint.sh  text eol=lf
+DOK_EA/Dockerfile     text eol=lf
+.github/**/*.yml      text eol=lf
+
+# Python/テキストは自動
+*.py    text
+*.md    text
+*.json  text
+*.txt   text
+
+# バイナリ
+*.pt    binary
+*.bin   binary
