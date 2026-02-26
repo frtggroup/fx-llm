@@ -190,19 +190,19 @@ def download_log():
 
 @app.get('/download/checkpoint')
 def download_checkpoint():
-    """チェックポイント一式を zip でダウンロード"""
-    import zipfile, io
+    """チェックポイント一式 (all_results + best model + top100) を zip でダウンロード"""
     ckpt = WORKSPACE / 'data' / 'checkpoint'
-    if not ckpt.exists():
-        raise HTTPException(404, 'チェックポイントがまだ作成されていません')
+    if not ckpt.exists() or not (ckpt / 'all_results.json').exists():
+        raise HTTPException(404, 'チェックポイントがまだ作成されていません (10分ごとに自動保存)')
     buf = io.BytesIO()
     with zipfile.ZipFile(buf, 'w', zipfile.ZIP_DEFLATED) as zf:
         for f in ckpt.rglob('*'):
             if f.is_file():
                 zf.write(f, f.relative_to(ckpt))
     buf.seek(0)
+    fname = f'checkpoint_{datetime.now().strftime("%Y%m%d_%H%M%S")}.zip'
     return StreamingResponse(buf, media_type='application/zip',
-                             headers={'Content-Disposition': 'attachment; filename=checkpoint.zip'})
+                             headers={'Content-Disposition': f'attachment; filename={fname}'})
 
 
 @app.get('/api/checkpoint_status')

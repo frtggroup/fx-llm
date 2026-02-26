@@ -32,6 +32,13 @@ services:
       BT_CAPITAL: "150000"
       BT_LEVERAGE: "1000"
       BT_RISK_PCT: "1.0"       # 残高の1%をリスクにロット決定 (変更可: 0.5〜2.0)
+      # Sakura オブジェクトストレージ (チェックポイント永続化)
+      S3_ENDPOINT: "https://s3.isk01.sakurastorage.jp"
+      S3_REGION: "jp-north-1"
+      S3_ACCESS_KEY: "9LZ71SXF347BKM7MEPPM"
+      S3_SECRET_KEY: "=u/j64oP8sQvtRXjjNY33jF2S/gOY5WMVgYcdnqG"
+      S3_BUCKET: "fxea"
+      S3_PREFIX: "checkpoint"
       # データ CSV の URL (起動時に自動ダウンロード)
       # DATA_URL: "https://your-storage/USDJPY_M1.csv"
       DATA_PATH: "/workspace/data/USDJPY_M1.csv"

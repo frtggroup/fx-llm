@@ -28,10 +28,66 @@ BEST_NORM     = OUT_DIR / 'norm_params_best.json'
 BEST_JSON     = OUT_DIR / 'best_result.json'
 
 # ── チェックポイント (停止→再開用) ─────────────────────────────────────────
-# /workspace/data/checkpoint/ に定期保存。
-# Sakura DOK でディスクを /workspace/data にマウントすると自動的に永続化される。
+# ローカル: /workspace/data/checkpoint/ に定期保存
+# S3: 環境変数 S3_* が設定されていれば Sakura オブジェクトストレージにも保存
 CHECKPOINT_DIR      = _WORKSPACE / 'data' / 'checkpoint'
 CHECKPOINT_INTERVAL = 600   # 秒 (10分ごとに保存)
+
+S3_ENDPOINT  = os.environ.get('S3_ENDPOINT',   '')   # 例: https://s3.isk01.sakurastorage.jp
+S3_ACCESS_KEY= os.environ.get('S3_ACCESS_KEY',  '')
+S3_SECRET_KEY= os.environ.get('S3_SECRET_KEY',  '')
+S3_BUCKET    = os.environ.get('S3_BUCKET',      'fxea')
+S3_PREFIX    = os.environ.get('S3_PREFIX',      'checkpoint')
+S3_ENABLED   = bool(S3_ENDPOINT and S3_ACCESS_KEY and S3_SECRET_KEY)
+
+
+def _s3_client():
+    import boto3
+    return boto3.client(
+        's3',
+        endpoint_url      = S3_ENDPOINT,
+        aws_access_key_id = S3_ACCESS_KEY,
+        aws_secret_access_key = S3_SECRET_KEY,
+        region_name       = os.environ.get('S3_REGION', 'jp-north-1'),
+    )
+
+
+def s3_upload(local_path: Path, s3_key: str) -> bool:
+    """ファイルを S3 にアップロード。失敗しても例外を投げず False を返す"""
+    try:
+        _s3_client().upload_file(str(local_path), S3_BUCKET,
+                                 f'{S3_PREFIX}/{s3_key}')
+        return True
+    except Exception as e:
+        print(f'  [S3] upload失敗 {s3_key}: {e}')
+        return False
+
+
+def s3_download(s3_key: str, local_path: Path) -> bool:
+    """S3 からファイルをダウンロード。失敗したら False を返す"""
+    try:
+        local_path.parent.mkdir(parents=True, exist_ok=True)
+        _s3_client().download_file(S3_BUCKET, f'{S3_PREFIX}/{s3_key}',
+                                   str(local_path))
+        return True
+    except Exception as e:
+        print(f'  [S3] download失敗 {s3_key}: {e}')
+        return False
+
+
+def s3_list_keys(prefix: str = '') -> list:
+    """S3_PREFIX/prefix 以下のキー一覧を返す"""
+    try:
+        full_prefix = f'{S3_PREFIX}/{prefix}' if prefix else S3_PREFIX + '/'
+        paginator = _s3_client().get_paginator('list_objects_v2')
+        keys = []
+        for page in paginator.paginate(Bucket=S3_BUCKET, Prefix=full_prefix):
+            for obj in page.get('Contents', []):
+                keys.append(obj['Key'])
+        return keys
+    except Exception as e:
+        print(f'  [S3] list失敗: {e}')
+        return []
 
 TOP_N              = 100
 RANDOM_PHASE_LIMIT = 200    # この件数までは純ランダム、以降は GA 主体
@@ -423,7 +479,7 @@ class ParallelTrainer:
 
 # ── チェックポイント保存・復元 ────────────────────────────────────────────────
 def save_checkpoint(results: list, best_pf: float) -> None:
-    """all_results + best model + top100 を CHECKPOINT_DIR に保存"""
+    """all_results + best model + top100 をローカル & S3 に保存"""
     try:
         CHECKPOINT_DIR.mkdir(parents=True, exist_ok=True)
         # all_results.json
@@ -444,16 +500,53 @@ def save_checkpoint(results: list, best_pf: float) -> None:
             shutil.copytree(TOP_DIR, top_dst)
         # メタ情報
         meta = {'saved_at': time.strftime('%Y-%m-%d %H:%M:%S'),
-                'completed': len(results), 'best_pf': best_pf}
+                'completed': len(results), 'best_pf': best_pf,
+                's3': S3_ENABLED}
         (CHECKPOINT_DIR / 'meta.json').write_text(
             json.dumps(meta, ensure_ascii=False), encoding='utf-8')
-        print(f'  [CKPT] 保存完了 → {CHECKPOINT_DIR}  ({len(results)}件 / bestPF={best_pf:.4f})')
+        print(f'  [CKPT] ローカル保存完了 ({len(results)}件 / bestPF={best_pf:.4f})')
+
+        # S3 アップロード
+        if S3_ENABLED:
+            upload_files = ['all_results.json', 'meta.json',
+                            'fx_model_best.onnx', 'norm_params_best.json', 'best_result.json']
+            ok = 0
+            for name in upload_files:
+                p = CHECKPOINT_DIR / name
+                if p.exists() and s3_upload(p, name):
+                    ok += 1
+            # top100 を S3 に同期
+            if top_dst.exists():
+                for f in top_dst.rglob('*'):
+                    if f.is_file():
+                        rel = f.relative_to(CHECKPOINT_DIR)
+                        s3_upload(f, str(rel).replace('\\', '/'))
+            print(f'  [S3]  アップロード完了 ({ok}/{len(upload_files)}件) '
+                  f'→ s3://{S3_BUCKET}/{S3_PREFIX}/')
     except Exception as e:
         print(f'  [CKPT] 保存失敗: {e}')
 
 
 def restore_checkpoint() -> bool:
-    """CHECKPOINT_DIR からファイルを作業ディレクトリに復元。成功したら True を返す"""
+    """S3 → ローカル → 作業ディレクトリ の順にチェックポイントを復元"""
+    # S3 から先にダウンロードを試みる
+    if S3_ENABLED:
+        print(f'  [S3]  チェックポイント確認中 s3://{S3_BUCKET}/{S3_PREFIX}/ ...')
+        dl_files = ['all_results.json', 'meta.json',
+                    'fx_model_best.onnx', 'norm_params_best.json', 'best_result.json']
+        downloaded = 0
+        for name in dl_files:
+            if s3_download(name, CHECKPOINT_DIR / name):
+                downloaded += 1
+        # top100 をダウンロード
+        for key in s3_list_keys('top100'):
+            rel  = key[len(S3_PREFIX)+1:]   # 'checkpoint/top100/...' → 'top100/...'
+            dest = CHECKPOINT_DIR / rel
+            s3_download(key[len(S3_PREFIX)+1:], dest)
+        if downloaded == 0:
+            print('  [S3]  チェックポイントなし')
+
+    # ローカルから復元
     meta_path = CHECKPOINT_DIR / 'meta.json'
     ar_path   = CHECKPOINT_DIR / 'all_results.json'
     if not ar_path.exists():
@@ -462,16 +555,13 @@ def restore_checkpoint() -> bool:
         meta = json.loads(meta_path.read_text(encoding='utf-8')) if meta_path.exists() else {}
         print(f'  [CKPT] チェックポイント発見: {meta.get("saved_at","?")}  '
               f'{meta.get("completed","?")}件  bestPF={meta.get("best_pf","?")}')
-        # all_results.json
         shutil.copy2(ar_path, ALL_RESULTS)
-        # best model
-        for name, dst in [('fx_model_best.onnx',    BEST_ONNX),
-                          ('norm_params_best.json',  BEST_NORM),
-                          ('best_result.json',        BEST_JSON)]:
+        for name, dst in [('fx_model_best.onnx',   BEST_ONNX),
+                          ('norm_params_best.json', BEST_NORM),
+                          ('best_result.json',       BEST_JSON)]:
             src = CHECKPOINT_DIR / name
             if src.exists():
                 shutil.copy2(src, dst)
-        # top100
         top_src = CHECKPOINT_DIR / 'top100'
         if top_src.exists():
             if TOP_DIR.exists():
