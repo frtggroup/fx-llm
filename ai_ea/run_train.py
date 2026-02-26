@@ -184,14 +184,8 @@ def sample_params(rng: random.Random) -> dict:
 
 
 # ── 遺伝的アルゴリズム ────────────────────────────────────────────────────────
-def _mutate(params: dict, rng: random.Random) -> dict:
-    """1 パラメータをランダムに突然変異させる"""
-    p = dict(params)
-    key = rng.choice([
-        'arch', 'hidden', 'layers', 'dropout', 'lr', 'batch',
-        'tp', 'sl', 'forward', 'threshold', 'seq_len',
-        'scheduler', 'wd', 'train_months',
-    ])
+def _apply_one_mutation(p: dict, key: str, rng: random.Random) -> None:
+    """key に対応するパラメータを1つ変異させる (in-place)"""
     if key == 'arch':
         p['arch']    = rng.choice(ARCHS)
         p['hidden']  = rng.choice(HIDDEN_MAP[p['arch']])
@@ -200,7 +194,7 @@ def _mutate(params: dict, rng: random.Random) -> dict:
     elif key == 'layers':
         p['layers']  = rng.choice([1, 2, 3] if p['arch'] not in ('mlp','gru_attn') else [1,2])
     elif key == 'dropout':
-        p['dropout'] = round(rng.uniform(0.3, 0.6), 1)
+        p['dropout'] = round(rng.uniform(0.2, 0.7), 1)
     elif key == 'lr':
         p['lr']      = rng.choice([1e-4, 3e-4, 5e-4, 8e-4, 1e-3, 2e-3]
                                    if H100_MODE else [1e-4, 3e-4, 5e-4, 8e-4, 1e-3])
@@ -208,21 +202,42 @@ def _mutate(params: dict, rng: random.Random) -> dict:
         p['batch']   = (rng.choice([2048, 4096, 8192]) if H100_MODE and p['hidden'] >= 1024
                         else rng.choice(BATCH_CHOICES))
     elif key == 'tp':
-        p['tp']      = round(rng.uniform(1.5, 3.5), 1)
+        p['tp']      = round(rng.uniform(1.2, 4.0), 1)
     elif key == 'sl':
-        p['sl']      = round(rng.uniform(0.5, 1.5), 1)
+        p['sl']      = round(rng.uniform(0.5, 2.0), 1)
     elif key == 'forward':
-        p['forward'] = rng.choice([10, 15, 20, 25, 30])
+        p['forward'] = rng.choice([10, 15, 20, 25, 30, 40])
     elif key == 'threshold':
-        p['threshold'] = round(rng.uniform(0.33, 0.50), 2)
+        p['threshold'] = round(rng.uniform(0.33, 0.55), 2)
     elif key == 'seq_len':
         p['seq_len'] = rng.choice(SEQ_CHOICES)
     elif key == 'scheduler':
         p['sched']   = rng.choice(['onecycle', 'cosine'])
     elif key == 'wd':
-        p['wd']      = rng.choice([1e-3, 1e-2, 5e-2, 1e-1])
+        p['wd']      = rng.choice([1e-4, 1e-3, 1e-2, 5e-2, 1e-1])
     elif key == 'train_months':
-        p['train_months'] = rng.choice([0, 0, 0, 12, 18, 12])
+        p['train_months'] = rng.choice([0, 0, 12, 18, 24, 12])
+    elif key == 'feat_set':
+        # フィーチャーセットを変える (探索多様性向上)
+        p['feat_set'] = rng.randint(0, 99)
+
+
+def _mutate(params: dict, rng: random.Random) -> dict:
+    """複数パラメータを変異させる (1〜3個をランダムに選択)"""
+    p = dict(params)
+    mut_keys = [
+        'arch', 'hidden', 'layers', 'dropout', 'lr', 'batch',
+        'tp', 'sl', 'forward', 'threshold', 'seq_len',
+        'scheduler', 'wd', 'train_months', 'feat_set',
+    ]
+    # 変異数: 多様性のため1〜3個
+    n_mut = rng.choices([1, 2, 3], weights=[0.5, 0.35, 0.15])[0]
+    chosen = rng.sample(mut_keys, n_mut)
+    for key in chosen:
+        _apply_one_mutation(p, key, rng)
+    # arch/hidden の整合性を保証
+    if p['hidden'] not in HIDDEN_MAP.get(p['arch'], [p['hidden']]):
+        p['hidden'] = rng.choice(HIDDEN_MAP[p['arch']])
     p['seed'] = rng.randint(0, 9999)
     return p
 
@@ -255,22 +270,43 @@ def _tournament_select(pool: list, rng: random.Random, k: int = 4) -> dict:
 
 
 def ga_sample(results: list, rng: random.Random) -> dict:
-    """遺伝的アルゴリズムでパラメータを生成する (突然変異か交叉を確率的に選択)"""
+    """遺伝的アルゴリズムでパラメータを生成する"""
     valid = [r for r in results if r.get('pf', 0) > 0 and r.get('trades', 0) >= 200]
     if len(valid) < 2:
         return sample_params(rng)   # 候補不足ならランダムにフォールバック
 
-    pool = sorted(valid, key=lambda x: -x['pf'])[:GA_PARENT_POOL]
+    # ── 親プール: 上位 GA_PARENT_POOL 件 (多様性のため arch・feat_set が被らないよう調整) ──
+    sorted_valid = sorted(valid, key=lambda x: -x['pf'])
+    pool = []
+    seen_arch_feat: set = set()
+    for r in sorted_valid:
+        key = (r.get('arch', '?'), r.get('feat_set', -1))
+        if key not in seen_arch_feat or len(pool) < GA_PARENT_POOL // 2:
+            pool.append(r)
+            seen_arch_feat.add(key)
+        if len(pool) >= GA_PARENT_POOL:
+            break
 
-    if rng.random() < 0.5:
+    r_val = rng.random()
+    if r_val < 0.5:
         # 交叉: 親 2 体を選んでパラメータを混合
         p1 = _tournament_select(pool, rng)
         p2 = _tournament_select(pool, rng)
         child = _crossover(p1, p2, rng)
-    else:
-        # 突然変異: 親 1 体から 1 パラメータを変える
+    elif r_val < 0.85:
+        # 突然変異: 親 1 体から複数パラメータを変える
         p1    = _tournament_select(pool, rng)
         child = _mutate(p1, rng)
+    else:
+        # 15%: 上位から親を選んでランダム大変異 (exploration)
+        p1 = pool[0]  # best parent
+        child = _mutate(p1, rng)
+        # さらに追加で 1〜2 パラメータをランダムに再変異
+        extra = rng.sample(['arch', 'tp', 'sl', 'threshold', 'feat_set', 'forward'], 2)
+        for k in extra:
+            _apply_one_mutation(child, k, rng)
+        if child['hidden'] not in HIDDEN_MAP.get(child['arch'], [child['hidden']]):
+            child['hidden'] = rng.choice(HIDDEN_MAP[child['arch']])
 
     return child
 
@@ -600,11 +636,18 @@ def restore_checkpoint() -> bool:
         for name in dl_files:
             if s3_download(name, CHECKPOINT_DIR / name):
                 downloaded += 1
-        # top100 をダウンロード
+        # top100 は result.json のみダウンロード (ONNXは大きいので起動時はスキップ)
+        top100_json_count = 0
         for key in s3_list_keys('top100'):
-            rel  = key[len(S3_PREFIX)+1:]   # 'checkpoint/top100/...' → 'top100/...'
+            if not key.endswith('result.json'):
+                continue   # ONNX / norm_params / report.html はスキップ
+            rel  = key[len(S3_PREFIX)+1:]
             dest = CHECKPOINT_DIR / rel
-            s3_download(key[len(S3_PREFIX)+1:], dest)
+            dest.parent.mkdir(parents=True, exist_ok=True)
+            if s3_download(key[len(S3_PREFIX)+1:], dest):
+                top100_json_count += 1
+        if top100_json_count:
+            print(f'  [S3]  top100 result.json {top100_json_count}件 取得 (ONNX はスキップ)')
         if downloaded == 0:
             print('  [S3]  チェックポイントなし')
 
@@ -874,6 +917,21 @@ def main():
         shutil.copy2(BEST_ONNX, OUT_DIR / 'fx_model.onnx')
     if BEST_NORM.exists():
         shutil.copy2(BEST_NORM, OUT_DIR / 'norm_params.json')
+
+    # ── MT5 Common\Files へ自動コピー ────────────────────────────────────
+    _appdata = Path(os.environ.get('APPDATA', ''))
+    _common  = _appdata / 'MetaQuotes' / 'Terminal' / 'Common' / 'Files'
+    if _common.exists():
+        _copies = [
+            (OUT_DIR / 'fx_model.onnx',    _common / 'fx_model.onnx'),
+            (OUT_DIR / 'norm_params.json',  _common / 'norm_params.json'),
+        ]
+        for src, dst in _copies:
+            if src.exists():
+                shutil.copy2(src, dst)
+                print(f"  → Common\\Files\\ にコピー: {src.name}")
+    else:
+        print(f"  [skip] Common\\Files 未検出: {_common}")
 
 
 if __name__ == '__main__':
