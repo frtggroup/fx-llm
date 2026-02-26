@@ -1,15 +1,15 @@
 #!/bin/bash
 # ─────────────────────────────────────────────────────────────────────────────
-# FX AI EA H100 コンテナ エントリポイント
+# FX AI EA H100 コンテナ エントリポイント v2
 # 1. SSH サーバー起動
 # 2. ダッシュボードサーバー起動 (port 7860)
 # 3. CSV データ自動ダウンロード (DATA_URL が設定されている場合)
-# 4. ランダムサーチ学習ループ起動 (run_train.py)
+# 4. 並列ランダムサーチ学習ループ起動 (run_train.py)
 # ─────────────────────────────────────────────────────────────────────────────
 set -e
 
 echo "======================================================"
-echo "  FX AI EA ランダムサーチ on Sakura DOK / H100 80GB"
+echo "  FX AI EA 並列ランダムサーチ on Sakura DOK / H100"
 echo "======================================================"
 
 # ── 1. GPU 確認 ────────────────────────────────────────────────────────────
@@ -36,15 +36,20 @@ echo "[OK] SSH サーバー起動 (PID: $SSH_PID)"
 export PYTHONPATH="/workspace/ai_ea:${PYTHONPATH}"
 export PYTORCH_CUDA_ALLOC_CONF="expandable_segments:True,max_split_size_mb:512"
 export H100_MODE="${H100_MODE:-1}"
+export MAX_PARALLEL="${MAX_PARALLEL:-3}"
+export VRAM_PER_TRIAL="${VRAM_PER_TRIAL:-10}"
 export DATA_PATH="${DATA_PATH:-/workspace/data/USDJPY_M1.csv}"
 
 mkdir -p /workspace/data \
-         /workspace/ai_ea/top10 \
-         /workspace/ai_ea/top10_cache
+         /workspace/ai_ea/trials \
+         /workspace/ai_ea/top100 \
+         /workspace/ai_ea/top_cache
 
 echo "[*] 設定:"
-echo "    H100_MODE : ${H100_MODE}"
-echo "    DATA_PATH : ${DATA_PATH}"
+echo "    H100_MODE    : ${H100_MODE}"
+echo "    MAX_PARALLEL : ${MAX_PARALLEL} 並列"
+echo "    VRAM/試行    : ${VRAM_PER_TRIAL} GB"
+echo "    DATA_PATH    : ${DATA_PATH}"
 
 # ── 4. CSV データ自動ダウンロード ──────────────────────────────────────────
 if [ ! -f "${DATA_PATH}" ] || [ ! -s "${DATA_PATH}" ]; then
@@ -67,15 +72,23 @@ echo "[*] ダッシュボード起動 (port 7860)..."
 python /workspace/ai_ea/server.py > /workspace/dashboard.log 2>&1 &
 DASH_PID=$!
 sleep 2
-echo "[OK] ダッシュボード起動 (PID: $DASH_PID)"
-echo "     -> http://0.0.0.0:7860"
+if kill -0 "$DASH_PID" 2>/dev/null; then
+    echo "[OK] ダッシュボード起動 (PID: $DASH_PID)"
+    echo "     -> http://0.0.0.0:7860"
+else
+    echo "[WARN] ダッシュボード起動失敗 — ログ: /workspace/dashboard.log"
+    cat /workspace/dashboard.log 2>/dev/null | tail -20
+fi
 
 # ── 6. stop.flag をクリア ──────────────────────────────────────────────────
 rm -f /workspace/stop.flag
 
-# ── 7. 学習ループ起動 ─────────────────────────────────────────────────────
+# ── 7. 並列ランダムサーチ学習ループ起動 ────────────────────────────────────
 echo ""
-echo "[*] ランダムサーチ学習ループ開始..."
+echo "[*] 並列ランダムサーチ開始  (並列=${MAX_PARALLEL}  VRAM/試行=${VRAM_PER_TRIAL}GB)"
+echo "    停止するには: http://<DOK_IP>:7860  →「学習停止」ボタン"
+echo "    または:       touch /workspace/stop.flag"
+echo ""
 python /workspace/ai_ea/run_train.py 2>&1 | tee /workspace/train_run.log
 EXIT_CODE=${PIPESTATUS[0]}
 
@@ -83,12 +96,14 @@ echo ""
 if [ $EXIT_CODE -eq 0 ]; then
     echo "======================================================"
     echo "  学習完了!"
-    echo "  ダッシュボード: http://<DOK_IP>:7860"
-    echo "  ベストモデル:   http://<DOK_IP>:7860/download/best"
-    echo "  TOP10:          http://<DOK_IP>:7860/download/model/1"
+    echo "  ダッシュボード : http://<DOK_IP>:7860"
+    echo "  ベストモデル   : http://<DOK_IP>:7860/download/best"
+    echo "  TOP100 DL      : http://<DOK_IP>:7860/download/model/1"
+    echo "  全結果 JSON    : http://<DOK_IP>:7860/download/results"
     echo "======================================================"
 else
     echo "  [ERROR] 学習がエラーで終了しました (exit=$EXIT_CODE)"
+    echo "  ログ: /workspace/train_run.log"
 fi
 
 # コンテナを終了させずに待機 (ダッシュボード・SSH を継続)

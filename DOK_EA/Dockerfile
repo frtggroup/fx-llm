@@ -1,14 +1,16 @@
 # ─────────────────────────────────────────────────────────────────────────────
-# FX AI EA ランダムサーチ on Sakura DOK / H100 80GB
+# FX AI EA 並列ランダムサーチ on Sakura DOK / H100 80GB  (v2)
 #
 # Build (from repo root):
 #   docker build -f DOK_EA/Dockerfile -t fx-ea:latest .
 #
 # Run (Sakura DOK / docker run):
-#   docker run --gpus all -p 7860:7860 \
+#   docker run --gpus all -p 7860:7860 -p 2222:22 \
 #     -e DATA_URL="https://your-storage/USDJPY_M1.csv" \
 #     -e H100_MODE=1 \
-#     -v /host/data:/workspace/data \
+#     -e MAX_PARALLEL=3 \
+#     -e VRAM_PER_TRIAL=10 \
+#     -v /host/output:/workspace/ai_ea \
 #     fx-ea:latest
 # ─────────────────────────────────────────────────────────────────────────────
 FROM pytorch/pytorch:2.5.1-cuda12.4-cudnn9-runtime
@@ -21,6 +23,9 @@ ENV DEBIAN_FRONTEND=noninteractive \
     TORCH_ALLOW_TF32=1 \
     # H100 モード: 大型モデル・バッチサイズ・エポック数
     H100_MODE=1 \
+    # 並列数 / 1試行あたりの最低 VRAM (GB)
+    MAX_PARALLEL=3 \
+    VRAM_PER_TRIAL=10 \
     # データパス (DATA_URL で上書き可能)
     DATA_PATH=/workspace/data/USDJPY_M1.csv \
     WORKSPACE=/workspace
@@ -61,10 +66,11 @@ COPY ai_ea/ /workspace/ai_ea/
 COPY DOK_EA/entrypoint.sh /workspace/entrypoint.sh
 RUN chmod +x /workspace/entrypoint.sh
 
-# ── Directories ──────────────────────────────────────────────────────────────
+# ── ディレクトリ作成 ─────────────────────────────────────────────────────────
 RUN mkdir -p /workspace/data \
-             /workspace/ai_ea/top10 \
-             /workspace/ai_ea/top10_cache
+             /workspace/ai_ea/trials \
+             /workspace/ai_ea/top100 \
+             /workspace/ai_ea/top_cache
 
 WORKDIR /workspace
 

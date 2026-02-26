@@ -24,23 +24,27 @@ services:
     environment:
       # H100 80GB モード (大型モデル・大バッチ)
       H100_MODE: "1"
+      # 並列学習数 (VRAM 空き監視で動的調整)
+      MAX_PARALLEL: "3"
+      # 1試行あたりの最低 VRAM (GB)
+      VRAM_PER_TRIAL: "10"
       # データ CSV の URL (起動時に自動ダウンロード)
       # DATA_URL: "https://your-storage/USDJPY_M1.csv"
       DATA_PATH: "/workspace/data/USDJPY_M1.csv"
 
     volumes:
-      # CSV データ永続化 (ホストから提供する場合)
+      # CSV データ永続化
       - ./data:/workspace/data
-      # 学習結果・モデル永続化
-      - ./output:/workspace/ai_ea/output_ext
+      # 学習結果・TOP100モデル・ログ永続化
+      - ./output/ai_ea:/workspace/ai_ea
 
     restart: unless-stopped
 
-    # コンテナのリソース制限 (必要に応じて調整)
-    shm_size: "4gb"
+    # 共有メモリ (大バッチ学習時に必要)
+    shm_size: "8gb"
 
     logging:
       driver: "json-file"
       options:
         max-size: "100m"
-        max-file: "3"
+        max-file: "5"
