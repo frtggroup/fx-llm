@@ -1,7 +1,6 @@
-# ── Unsloth (H100 / CUDA 12.4 / PyTorch 2.5) ─────────────────────────────
-unsloth[cu124-torch250]
-xformers
-flash-attn --no-build-isolation
+# ── Unsloth (Flash Attention / xformers は Unsloth が管理) ─────────────────
+unsloth
+# xformers と flash-attn は Unsloth が起動時に自動インストール
 
 # ── Transformers ecosystem ────────────────────────────────────────────────
 transformers>=4.45.0

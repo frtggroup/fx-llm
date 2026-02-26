@@ -3,7 +3,8 @@
 # Build from repo root:
 #   docker build -f DOK/Dockerfile -t fx-llm:latest .
 # ─────────────────────────────────────────────────────────────────────────────
-FROM pytorch/pytorch:2.5.1-cuda12.4-cudnn9-devel
+# runtime (~6GB) を使用 — devel (~18GB) はGitHub Actions のディスクを超えるため
+FROM pytorch/pytorch:2.5.1-cuda12.4-cudnn9-runtime
 
 ENV DEBIAN_FRONTEND=noninteractive \
     PYTHONUNBUFFERED=1 \
