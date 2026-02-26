@@ -6,7 +6,7 @@ FX AI EA 自動トレーニング v8 - ハイブリッド遺伝的アルゴリ�
   ・停止条件なし (stop.flag が置かれるまで無限継続)
   ・TOP100 モデル保存 + SR / DD / 資産曲線レポート
 """
-import os, subprocess, sys, json, shutil, time, random, threading
+import os, subprocess, sys, json, shutil, time, random, threading, signal
 from pathlib import Path
 
 sys.path.insert(0, str(Path(__file__).parent))
@@ -574,13 +574,17 @@ def save_checkpoint(results: list, best_pf: float) -> None:
                 if p.exists() and s3_upload(p, name):
                     ok += 1
             # top100 を S3 に同期
+            top100_ok = 0
             if top_dst.exists():
                 for f in top_dst.rglob('*'):
                     if f.is_file():
                         rel = f.relative_to(CHECKPOINT_DIR)
-                        s3_upload(f, str(rel).replace('\\', '/'))
-            print(f'  [S3]  アップロード完了 ({ok}/{len(upload_files)}件) '
+                        if s3_upload(f, str(rel).replace('\\', '/')):
+                            top100_ok += 1
+            print(f'  [S3]  アップロード完了 ({ok}/{len(upload_files)}件 + top100:{top100_ok}件) '
                   f'→ s3://{S3_BUCKET}/{S3_PREFIX}/')
+        else:
+            print(f'  [CKPT] S3未設定 → ローカルのみ保存 ({CHECKPOINT_DIR})')
     except Exception as e:
         print(f'  [CKPT] 保存失敗: {e}')
 
@@ -672,6 +676,13 @@ def _precache_data() -> bool:
 
 
 def main():
+    # SIGTERM (コンテナ停止時) を受け取ったら stop.flag を置いてgraceful shutdown
+    def _sigterm_handler(signum, frame):
+        print('\n[SIGNAL] SIGTERM 受信 → チェックポイント保存して停止します...')
+        STOP_FLAG.touch()
+    signal.signal(signal.SIGTERM, _sigterm_handler)
+    signal.signal(signal.SIGINT,  _sigterm_handler)
+
     TRIALS_DIR.mkdir(parents=True, exist_ok=True)
     TOP_CACHE_DIR.mkdir(parents=True, exist_ok=True)
     TOP_DIR.mkdir(parents=True, exist_ok=True)

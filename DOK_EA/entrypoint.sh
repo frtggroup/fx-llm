@@ -120,8 +120,29 @@ echo "[*] 並列ランダムサーチ開始  (並列=${MAX_PARALLEL}  VRAM/試�
 echo "    停止するには: http://<DOK_IP>:7860  →「学習停止」ボタン"
 echo "    または:       touch /workspace/stop.flag"
 echo ""
-python /workspace/ai_ea/run_train.py 2>&1 | tee /workspace/train_run.log
-EXIT_CODE=${PIPESTATUS[0]}
+
+# SIGTERM/SIGINT を受け取ったとき run_train.py に SIGTERM を転送してgraceful shutdown
+TRAIN_PID=""
+_graceful_stop() {
+    echo "[*] シグナル受信 → run_train.py に SIGTERM を送信..."
+    if [ -n "$TRAIN_PID" ] && kill -0 "$TRAIN_PID" 2>/dev/null; then
+        kill -TERM "$TRAIN_PID"
+        # 最大30秒待ってチェックポイント保存を待つ
+        for i in $(seq 1 30); do
+            kill -0 "$TRAIN_PID" 2>/dev/null || break
+            sleep 1
+        done
+        # まだ生きていたら強制終了
+        kill -0 "$TRAIN_PID" 2>/dev/null && kill -KILL "$TRAIN_PID" || true
+    fi
+    echo "[OK] graceful shutdown 完了"
+}
+trap '_graceful_stop' SIGTERM SIGINT
+
+python /workspace/ai_ea/run_train.py 2>&1 | tee /workspace/train_run.log &
+TRAIN_PID=$!
+wait $TRAIN_PID
+EXIT_CODE=$?
 
 echo ""
 if [ $EXIT_CODE -eq 0 ]; then
