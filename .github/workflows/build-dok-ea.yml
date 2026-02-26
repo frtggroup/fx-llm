@@ -41,11 +41,10 @@ jobs:
           file: DOK_EA/Dockerfile
           push: true
           provenance: false
+          sbom: false
           tags: |
             ${{ secrets.DOCKERHUB_USERNAME }}/fx-ea-v2:latest
             ${{ secrets.DOCKERHUB_USERNAME }}/fx-ea-v2:${{ github.sha }}
-          cache-from: type=gha
-          cache-to:   type=gha,mode=max
           platforms: linux/amd64
 
       - name: Summary
