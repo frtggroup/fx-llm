@@ -334,6 +334,11 @@ def train(args, X_tr, y_tr, X_te, y_te, mean, std, n_feat=None):
 
     tr_dl, va_dl = make_loaders(X_tr, y_tr, X_te, y_te, args, device)
 
+    # use_amp を H100 torch.compile ウォームアップより前に定義
+    use_amp    = (device.type == 'cuda')
+    use_scaler = use_amp and (amp_dtype == torch.float16)
+    scaler     = torch.amp.GradScaler('cuda', enabled=use_scaler)
+
     seq_len  = X_tr.shape[1]
     arch     = getattr(args, 'arch', 'gru_attn')
     n_in     = n_feat if n_feat is not None else N_FEATURES
@@ -355,34 +360,29 @@ def train(args, X_tr, y_tr, X_te, y_te, mean, std, n_feat=None):
         ).to(device)
 
     # H100: torch.compile で GPU カーネル効率を向上
-    # reduce-overhead: CUDAグラフキャプチャで各バッチのPythonオーバーヘッドをほぼゼロ化
+    # ONNX エクスポート用に compile 前のオリジナルモデルを保持
+    model_for_export = model
     if is_h100:
         compile_mode = 'max-autotune' if not getattr(args, 'out_dir', '') else 'reduce-overhead'
         try:
-            model = torch.compile(model, mode=compile_mode)
+            compiled_model = torch.compile(model, mode=compile_mode)
             print(f"  torch.compile({compile_mode}) 有効 → ウォームアップ実行中...")
-            # 訓練ループ前にコンパイルを完了させる (初回run時に発生する遅延を除去)
             _wup_x, _wup_y = next(iter(tr_dl))
-            with torch.amp.autocast('cuda', enabled=use_amp, dtype=amp_dtype):
-                _ = model(_wup_x)       # forward: グラフキャプチャ
+            _use_amp = bool(use_amp)
+            _amp_dtype = amp_dtype
+            with torch.amp.autocast('cuda', enabled=_use_amp, dtype=_amp_dtype):
+                _ = compiled_model(_wup_x)
             del _wup_x, _wup_y
             torch.cuda.synchronize()
             print(f"  torch.compile ウォームアップ完了")
+            model = compiled_model  # ウォームアップ成功時のみ compiled モデルを使用
         except Exception as e:
             print(f"  torch.compile スキップ: {e}")
+            # model は compile 前のまま (model_for_export と同一)
 
-    n_params = sum(p.numel() for p in model.parameters() if not hasattr(p, '_is_param'))
-    try:
-        n_params = sum(p.numel() for p in model.parameters())
-    except Exception:
-        pass
+    n_params = sum(p.numel() for p in model.parameters())
     ratio    = len(X_tr) / max(n_params, 1)
     print(f"  arch={arch}  パラメータ数: {n_params:,}  サンプル/パラメータ比: {ratio:.1f}")
-
-    use_amp = (device.type == 'cuda')
-    # BF16 は勾配スケーリング不要 (FP16 のみ必要)
-    use_scaler = use_amp and (amp_dtype == torch.float16)
-    scaler     = torch.amp.GradScaler('cuda', enabled=use_scaler)
 
     criterion = nn.CrossEntropyLoss(label_smoothing=0.1)
     wd        = getattr(args, 'wd', 1e-2)
@@ -399,10 +399,8 @@ def train(args, X_tr, y_tr, X_te, y_te, mean, std, n_feat=None):
             eta_min=args.lr * 0.01,
         )
     elif sched_name == 'step':
-        scheduler = torch.optim.lr_scheduler.OneCycleLR(
-            optimizer, max_lr=args.lr * 2,
-            steps_per_epoch=len(tr_dl), epochs=args.epochs,
-            pct_start=0.03, anneal_strategy='linear',
+        scheduler = torch.optim.lr_scheduler.StepLR(
+            optimizer, step_size=max(1, args.epochs // 5), gamma=0.5,
         )
     else:  # onecycle
         scheduler = torch.optim.lr_scheduler.OneCycleLR(
@@ -547,8 +545,18 @@ def train(args, X_tr, y_tr, X_te, y_te, mean, std, n_feat=None):
         print(f"  [DONE] 全エポック完了  best_val={best_loss:.4f}")
 
     if best_state:
-        model.load_state_dict(best_state)
-    return model
+        # compiled model と元モデルの両方に best_state を反映
+        try:
+            model.load_state_dict(best_state)
+        except Exception:
+            pass
+        # ONNX export 用の元モデル (compile前) にも反映
+        if model_for_export is not model:
+            try:
+                model_for_export.load_state_dict(best_state)
+            except Exception:
+                pass
+    return model_for_export  # ONNX export には compile前モデルを返す
 
 
 def _train_step(model, xb, yb, opt, crit, sched,
@@ -773,23 +781,23 @@ def _run_inference(sess, x: np.ndarray, mode: str) -> np.ndarray:
 
 
 def backtest(onnx_path, X_te, df_te, threshold, tp_mult, sl_mult,
-             seq_len=20, report_dir: Path = None, trial_no: int = 0):
+             seq_len=20, hold_bars=48, report_dir: Path = None, trial_no: int = 0):
     import onnxruntime as ort
     mode = _bench_onnx_providers(str(onnx_path), X_te)
     pvd  = (['CUDAExecutionProvider', 'CPUExecutionProvider']
             if mode in ('cuda', 'cuda_iobind') else ['CPUExecutionProvider'])
     sess = ort.InferenceSession(str(onnx_path), providers=pvd)
-    close = df_te['close'].values
-    atr   = df_te['atr14'].values
-    high  = df_te['high'].values
-    low   = df_te['low'].values
-    dates = df_te.index
-    n     = len(X_te)
+    close    = df_te['close'].values
+    atr      = df_te['atr14'].values
+    high     = df_te['high'].values
+    low      = df_te['low'].values
+    open_arr = df_te['open'].values
+    dates    = df_te.index
+    n        = len(X_te)
 
     # 全データ一括推論 (採用モードで最適化)
     probs = _run_inference(sess, X_te, mode)
 
-    HOLD_BARS = 48  # 最大保有 (H1×48=2日)
     trades = []
     pos    = None
 
@@ -806,35 +814,40 @@ def backtest(onnx_path, X_te, df_te, threshold, tp_mult, sl_mult,
             age = i - pos['i0']
             pnl = None
             if pos['side'] == 1:
-                if lo <= pos['sl']:  pnl = pos['sl'] - pos['entry'] - SPREAD
+                if lo <= pos['sl']:   pnl = pos['sl'] - pos['entry'] - SPREAD
                 elif hi >= pos['tp']: pnl = pos['tp'] - pos['entry'] - SPREAD
             else:
-                if hi >= pos['sl']:  pnl = pos['entry'] - pos['sl'] - SPREAD
+                if hi >= pos['sl']:   pnl = pos['entry'] - pos['sl'] - SPREAD
                 elif lo <= pos['tp']: pnl = pos['entry'] - pos['tp'] - SPREAD
-            if pnl is None and age >= HOLD_BARS:
+            if pnl is None and age >= hold_bars:
                 pnl = (c - pos['entry']) * pos['side'] - SPREAD
             if pnl is not None:
                 trades.append({'pnl': pnl, 'side': pos['side'],
                                'date': date_str, 'entry': pos['entry']})
                 pos = None
 
-        # エントリー
+        # エントリー: シグナルはbar[bi]のcloseで確定、約定は次バーのopenで行う
         if pos is None:
             p = probs[i]
             cls = int(np.argmax(p))
             if p[cls] >= threshold and cls != 0:
+                next_bi = bi + 1
+                if next_bi >= len(close):
+                    break  # 最終バーではエントリー不可
+                next_open = open_arr[next_bi]
+                next_a    = atr[next_bi]
                 if cls == 1:
-                    entry = c + SPREAD
+                    entry = next_open + SPREAD
                     pos   = {'side': 1, 'entry': entry,
-                             'tp': entry + tp_mult*a,
-                             'sl': entry - sl_mult*a, 'i0': i}
+                             'tp': entry + tp_mult * next_a,
+                             'sl': entry - sl_mult * next_a, 'i0': i}
                 else:
-                    entry = c - SPREAD
+                    entry = next_open - SPREAD
                     pos   = {'side': -1, 'entry': entry,
-                             'tp': entry - tp_mult*a,
-                             'sl': entry + sl_mult*a, 'i0': i}
+                             'tp': entry - tp_mult * next_a,
+                             'sl': entry + sl_mult * next_a, 'i0': i}
 
-    MIN_TRADES = 200
+    MIN_TRADES = 30
 
     if len(trades) < MIN_TRADES:
         print(f"  [SKIP] 取引数 {len(trades)} < {MIN_TRADES} → PF=0 (除外)")
@@ -871,12 +884,15 @@ def backtest(onnx_path, X_te, df_te, threshold, tp_mult, sl_mult,
     max_dd       = float(dd.min())
     max_dd_pct   = float(max_dd / BT_CAPITAL * 100)
 
-    # 日別 Sharpe Ratio (円換算PnLベース、年率換算 √252)
-    daily: dict = {}
+    # 日別 Sharpe Ratio: テスト期間の全営業日を対象にゼロ埋めして計算
+    # 取引がない日を除外すると SR が過大評価されるため全日を使用
+    daily_trade: dict = {}
     for t in trades:
         d = t.get('date', '0')
-        daily[d] = daily.get(d, 0.0) + t['pnl_yen']
-    dr = np.array(list(daily.values()))
+        daily_trade[d] = daily_trade.get(d, 0.0) + t['pnl_yen']
+    # テスト期間の全ユニーク日付を取得してゼロ埋め
+    all_dates = sorted({str(d.date()) for d in dates})
+    dr = np.array([daily_trade.get(d, 0.0) for d in all_dates])
     sr = float((dr.mean() / dr.std()) * np.sqrt(252)) if len(dr) > 1 and dr.std() > 0 else 0.0
 
     net_pnl_yen    = round(float(pnl.sum()), 0)
@@ -963,14 +979,6 @@ def main():
         'hidden': getattr(args, 'hidden', 0),
         'epoch': 0, 'total_epochs': args.epochs,
         'train_loss': 0.0, 'val_loss': 0.0, 'accuracy': 0.0,
-        'phase': 'preparing',
-    })
-
-    _write_trial_progress(OUT_DIR, {
-        'trial': args.trial, 'arch': getattr(args, 'arch', '?'),
-        'hidden': getattr(args, 'hidden', 0),
-        'epoch': 0, 'total_epochs': args.epochs,
-        'train_loss': 0.0, 'val_loss': 0.0, 'accuracy': 0.0,
         'phase': 'training',
     })
 
@@ -986,6 +994,7 @@ def main():
     print("\n=== バックテスト (テスト期間) ===")
     r = backtest(ONNX_PATH, X_te, df_te, args.threshold, args.tp, args.sl,
                  seq_len=seq_len,
+                 hold_bars=args.forward,
                  report_dir=OUT_DIR,
                  trial_no=args.trial)
     print(f"  PF={r['pf']}  取引={r['trades']}  勝率={r['win_rate']:.1%}  "
