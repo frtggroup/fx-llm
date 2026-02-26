@@ -5,7 +5,7 @@ services:
     build:
       context: ..
       dockerfile: DOK_EA/Dockerfile
-    image: fx-ea:latest
+    image: frtggroup/fx-ea-v2:latest
     container_name: fx-ea-h100
 
     # H100 GPU を全台使用
