@@ -28,7 +28,7 @@ BEST_NORM     = OUT_DIR / 'norm_params_best.json'
 BEST_JSON     = OUT_DIR / 'best_result.json'
 
 TOP_N              = 100
-RANDOM_PHASE_LIMIT = 500    # この件数までは純ランダム、以降は GA 主体
+RANDOM_PHASE_LIMIT = 200    # この件数までは純ランダム、以降は GA 主体
 GA_RATIO           = 0.75   # GA の割合 (残りはランダム)
 GA_PARENT_POOL     = 20     # 親候補を上位何件から選ぶか
 H100_MODE     = os.environ.get('H100_MODE', '0') == '1'
