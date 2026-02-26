@@ -251,11 +251,12 @@ def train(args, X_tr, y_tr, X_te, y_te, mean, std, n_feat=None):
             args.hidden, args.layers, args.dropout,
         ).to(device)
 
-    # H100: torch.compile で kernel fusion を最大活用
-    if is_h100:
+    # H100: torch.compile (並列ランダムサーチでは reduce-overhead を使用)
+    # max-autotune は初回コンパイルに10-30分かかるため並列サーチには不向き
+    if is_h100 and not getattr(args, 'out_dir', ''):
         try:
             model = torch.compile(model, mode='max-autotune')
-            print("  torch.compile(max-autotune) 有効")
+            print("  torch.compile(max-autotune) 有効 [シングルモード]")
         except Exception as e:
             print(f"  torch.compile スキップ: {e}")
 
