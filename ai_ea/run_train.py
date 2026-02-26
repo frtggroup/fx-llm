@@ -224,7 +224,12 @@ def _apply_one_mutation(p: dict, key: str, rng: random.Random) -> None:
 
 def _mutate(params: dict, rng: random.Random) -> dict:
     """複数パラメータを変異させる (1〜3個をランダムに選択)"""
-    p = dict(params)
+    # ハイパーパラメータのみコピー (trial/pf 等の結果メタデータは除外)
+    _hp_keys = ('arch', 'hidden', 'layers', 'dropout', 'lr', 'batch',
+                'tp', 'sl', 'forward', 'threshold', 'seq_len',
+                'scheduler', 'sched', 'wd', 'train_months', 'feat_set', 'n_features',
+                'seed', 'epochs', 'timeframe', 'label_type')
+    p = {k: v for k, v in params.items() if k in _hp_keys}
     mut_keys = [
         'arch', 'hidden', 'layers', 'dropout', 'lr', 'batch',
         'tp', 'sl', 'forward', 'threshold', 'seq_len',
@@ -249,7 +254,8 @@ def _crossover(p1: dict, p2: dict, rng: random.Random) -> dict:
         'tp', 'sl', 'forward', 'threshold', 'seq_len',
         'scheduler', 'wd', 'train_months', 'feat_set', 'n_features',
     ]
-    child = dict(p1)
+    # ハイパーパラメータのみコピー (trial/pf/strategy 等の結果メタデータは除外)
+    child = {k: p1[k] for k in keys if k in p1}
     for k in keys:
         if rng.random() < 0.5 and k in p2:
             child[k] = p2[k]
@@ -842,7 +848,12 @@ def main():
             max_dd = float(r.get('max_dd', 0.0))
             elapsed= round(time.time() - info['start_time'], 0)
 
+            # ハイパーパラメータのみ展開 (trial/pf 等の結果メタデータは除外して上書きを防ぐ)
+            _meta_keys = {'trial', 'pf', 'trades', 'sr', 'max_dd', 'win_rate',
+                          'net_pnl', 'gross_profit', 'gross_loss', 'elapsed_sec',
+                          'timestamp', 'strategy'}
             record = {
+                **{k: v for k, v in info['params'].items() if k not in _meta_keys},
                 'trial':     tno,
                 'timestamp': time.strftime('%Y-%m-%d %H:%M:%S'),
                 'strategy':  info.get('strategy', 'random'),
@@ -855,7 +866,6 @@ def main():
                 'sr':        sr,
                 'max_dd':    max_dd,
                 'elapsed_sec': elapsed,
-                **{k: v for k, v in info['params'].items()},
             }
             # 重複防止: 同じ trial_no がすでにあれば上書き、なければ追加
             existing_idx = next((i for i, r in enumerate(results) if r['trial'] == tno), None)
