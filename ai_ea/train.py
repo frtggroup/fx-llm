@@ -675,13 +675,25 @@ if(dChart)dChart.data.datasets[0].backgroundColor=dlc,dChart.update('none');
 
 
 _BT_MODE: str | None = None  # キャッシュ: 'cpu' / 'cuda_iobind' / 'cuda'
+_BT_MODE_CACHE_FILE = Path('/tmp/fx_bt_mode.txt')  # 並列サブプロセス間共有ファイルキャッシュ
 
 def _bench_onnx_providers(onnx_path: str, full_data: np.ndarray) -> str:
-    """CPU / CUDA / CUDA+IOBinding の3パターンで全データ推論速度を比較し
-    最速モードを返す。結果は _BT_MODE にキャッシュして再利用。"""
+    """CUDA利用可能時はCUDA vs CUDA+IOBindingのみ比較（CPUベンチはスキップ）。
+    結果はインメモリ + ファイルキャッシュで再利用し、並列試行での再計測を防ぐ。"""
     global _BT_MODE
     if _BT_MODE is not None:
         return _BT_MODE
+
+    # ── ファイルキャッシュ確認（並列サブプロセス間で共有）──────────────
+    if _BT_MODE_CACHE_FILE.exists():
+        try:
+            cached = _BT_MODE_CACHE_FILE.read_text().strip()
+            if cached in ('cpu', 'cuda', 'cuda_iobind'):
+                _BT_MODE = cached
+                print(f'  [BT-bench] キャッシュ使用: {_BT_MODE}')
+                return _BT_MODE
+        except Exception:
+            pass
 
     import onnxruntime as ort
     import time
@@ -690,35 +702,22 @@ def _bench_onnx_providers(onnx_path: str, full_data: np.ndarray) -> str:
     if 'CUDAExecutionProvider' not in available:
         _BT_MODE = 'cpu'
         print('  [BT-bench] CUDA unavailable → CPU')
+        _BT_MODE_CACHE_FILE.write_text(_BT_MODE)
         return _BT_MODE
 
-    x = np.ascontiguousarray(full_data)   # 全データで計測（実運用と同条件）
-    results = {}
-
-    # ── CPU ────────────────────────────────────────────────────────────
-    try:
-        s = ort.InferenceSession(onnx_path, providers=['CPUExecutionProvider'])
-        s.run(None, {'input': x[:512]})   # ウォームアップ
-        t0 = time.perf_counter()
-        for _ in range(3):
-            s.run(None, {'input': x})
-        results['cpu'] = (time.perf_counter() - t0) / 3
-    except Exception as e:
-        print(f'  [BT-bench] CPU error: {e}')
-        results['cpu'] = float('inf')
-
+    # ── CUDA利用可能: CPUベンチはスキップしCUDA vs CUDA+IOBindのみ比較 ──
+    # CUDAが常にCPUより高速なため、CPUの38秒ベンチを省略して高速化
+    x = np.ascontiguousarray(full_data[:1024])  # 1024サンプルで十分
     cuda_pvd = ['CUDAExecutionProvider', 'CPUExecutionProvider']
+    results = {}
 
     # ── CUDA (通常バッチ転送) ───────────────────────────────────────────
     try:
         s = ort.InferenceSession(onnx_path, providers=cuda_pvd)
-        s.run(None, {'input': x[:512]})
+        s.run(None, {'input': x[:64]})   # ウォームアップ
         t0 = time.perf_counter()
         for _ in range(3):
-            bs = 512
-            out = np.zeros((len(x), 3), dtype=np.float32)
-            for i in range(0, len(x), bs):
-                out[i:i+bs] = s.run(None, {'input': x[i:i+bs]})[0]
+            s.run(None, {'input': x})[0]
         results['cuda'] = (time.perf_counter() - t0) / 3
     except Exception as e:
         print(f'  [BT-bench] CUDA error: {e}')
@@ -726,30 +725,31 @@ def _bench_onnx_providers(onnx_path: str, full_data: np.ndarray) -> str:
 
     # ── CUDA + IOBinding (データをGPUメモリに常駐) ─────────────────────
     try:
-        import ctypes
-        s = ort.InferenceSession(onnx_path, providers=cuda_pvd)
-        io = s.io_binding()
-        # 全データを一括でGPU常駐テンソルとしてバインド
-        x_ort = ort.OrtValue.ortvalue_from_numpy(x, 'cuda', 0)
-        out_shape = (len(x), 3)
-        out_ort = ort.OrtValue.ortvalue_from_shape_and_type(out_shape, np.float32, 'cuda', 0)
+        s2 = ort.InferenceSession(onnx_path, providers=cuda_pvd)
+        io = s2.io_binding()
+        x_ort   = ort.OrtValue.ortvalue_from_numpy(x, 'cuda', 0)
+        out_ort = ort.OrtValue.ortvalue_from_shape_and_type((len(x), 3), np.float32, 'cuda', 0)
         io.bind_ortvalue_input('input', x_ort)
         io.bind_ortvalue_output('output', out_ort)
-        s.run_with_iobinding(io)  # ウォームアップ
+        s2.run_with_iobinding(io)   # ウォームアップ
         t0 = time.perf_counter()
         for _ in range(3):
-            s.run_with_iobinding(io)
-        _ = out_ort.numpy()       # GPU→CPU (計測に含める)
+            s2.run_with_iobinding(io)
+        _ = out_ort.numpy()
         results['cuda_iobind'] = (time.perf_counter() - t0) / 3
     except Exception as e:
         print(f'  [BT-bench] CUDA+IOBind error: {e}')
         results['cuda_iobind'] = float('inf')
 
     _BT_MODE = min(results, key=results.get)
-    print(f'  [BT-bench] CPU={results.get("cpu",99)*1000:.1f}ms  '
-          f'CUDA={results.get("cuda",99)*1000:.1f}ms  '
+    print(f'  [BT-bench] CUDA={results.get("cuda",99)*1000:.1f}ms  '
           f'CUDA+IOBind={results.get("cuda_iobind",99)*1000:.1f}ms  '
           f'→ {_BT_MODE} を採用')
+    # ファイルキャッシュに保存（以降の全試行がスキップ可能）
+    try:
+        _BT_MODE_CACHE_FILE.write_text(_BT_MODE)
+    except Exception:
+        pass
     return _BT_MODE
 
 
@@ -798,56 +798,77 @@ def backtest(onnx_path, X_te, df_te, threshold, tp_mult, sl_mult,
     # 全データ一括推論 (採用モードで最適化)
     probs = _run_inference(sess, X_te, mode)
 
-    trades = []
-    pos    = None
+    trades = _simulate_trades(
+        probs, close, high, low, open_arr, atr,
+        n, seq_len, hold_bars, threshold, tp_mult, sl_mult, dates
+    )
+    return _backtest_evaluate(trades, dates, report_dir, trial_no)
+
+
+def _simulate_trades(probs, close, high, low, open_arr, atr,
+                     n, seq_len, hold_bars, threshold, tp_mult, sl_mult, dates):
+    """NumPy最適化版トレードシミュレーション。
+    推論結果(probs)をもとにTP/SL/hold決済を処理し取引リストを返す。"""
+    # シグナル検出をNumPyで一括計算
+    cls_arr   = np.argmax(probs, axis=1).astype(np.int8)       # (n,)
+    conf_arr  = probs[np.arange(n), cls_arr]                   # (n,)
+    signal    = (conf_arr > threshold) & (cls_arr != 0)        # (n,) bool
+
+    trades    = []
+    in_pos    = False
+    side      = 0
+    entry     = 0.0
+    tp_price  = 0.0
+    sl_price  = 0.0
+    entry_i   = 0
 
     for i in range(n):
         bi = seq_len - 1 + i
-        if bi >= len(close): break
+        if bi >= len(close):
+            break
 
-        c = close[bi]; a = atr[bi]
-        date_str = str(dates[bi].date()) if bi < len(dates) else str(bi)
-
-        # ポジション管理
-        if pos:
-            hi = high[bi]; lo = low[bi]
-            age = i - pos['i0']
+        if in_pos:
+            hi  = high[bi]
+            lo  = low[bi]
+            age = i - entry_i
             pnl = None
-            if pos['side'] == 1:
-                if lo <= pos['sl']:   pnl = pos['sl'] - pos['entry'] - SPREAD
-                elif hi >= pos['tp']: pnl = pos['tp'] - pos['entry'] - SPREAD
+            if side == 1:
+                if   lo  <= sl_price: pnl = sl_price - entry - SPREAD
+                elif hi  >= tp_price: pnl = tp_price - entry - SPREAD
             else:
-                if hi >= pos['sl']:   pnl = pos['entry'] - pos['sl'] - SPREAD
-                elif lo <= pos['tp']: pnl = pos['entry'] - pos['tp'] - SPREAD
+                if   hi  >= sl_price: pnl = entry - sl_price - SPREAD
+                elif lo  <= tp_price: pnl = entry - tp_price - SPREAD
             if pnl is None and age >= hold_bars:
-                # MT5は新バーのopen時点で決済 → open[bi]を使用
-                pnl = (open_arr[bi] - pos['entry']) * pos['side'] - SPREAD
+                pnl = (open_arr[bi] - entry) * side - SPREAD
             if pnl is not None:
-                trades.append({'pnl': pnl, 'side': pos['side'],
-                               'date': date_str, 'entry': pos['entry']})
-                pos = None
+                date_str = str(dates[bi].date()) if bi < len(dates) else str(bi)
+                trades.append({'pnl': pnl, 'side': side,
+                               'date': date_str, 'entry': entry})
+                in_pos = False
 
-        # エントリー: シグナルはbar[bi]のcloseで確定、約定は次バーのopenで行う
-        # TP/SL幅はシグナルバーのATR(a)を使用 → MT5のGetATR14(1)と一致
-        # エントリー条件は > (>=ではない) → MT5の p_buy > InpThreshold と一致
-        if pos is None:
-            p = probs[i]
-            cls = int(np.argmax(p))
-            if p[cls] > threshold and cls != 0:
-                next_bi = bi + 1
-                if next_bi >= len(close):
-                    break  # 最終バーではエントリー不可
-                next_open = open_arr[next_bi]
-                if cls == 1:
-                    entry = next_open + SPREAD
-                    pos   = {'side': 1, 'entry': entry,
-                             'tp': entry + tp_mult * a,
-                             'sl': entry - sl_mult * a, 'i0': i}
-                else:
-                    entry = next_open - SPREAD
-                    pos   = {'side': -1, 'entry': entry,
-                             'tp': entry - tp_mult * a,
-                             'sl': entry + sl_mult * a, 'i0': i}
+        if not in_pos and signal[i]:
+            next_bi = bi + 1
+            if next_bi >= len(close):
+                break
+            a         = atr[bi]
+            next_open = open_arr[next_bi]
+            side      = int(cls_arr[i])   # 1=BUY, 2→-1=SELL
+            if side == 1:
+                entry    = next_open + SPREAD
+                tp_price = entry + tp_mult * a
+                sl_price = entry - sl_mult * a
+            else:
+                side     = -1
+                entry    = next_open - SPREAD
+                tp_price = entry - tp_mult * a
+                sl_price = entry + sl_mult * a
+            entry_i  = i
+            in_pos   = True
+
+    return trades
+
+
+def _backtest_evaluate(trades, dates, report_dir, trial_no):
 
     MIN_TRADES = 200
 
