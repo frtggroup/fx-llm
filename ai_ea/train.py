@@ -33,9 +33,25 @@ SPREAD    = 0.003  # 0.3pips × 0.01 = 0.003円 (USDJPY H1 spread)
 # ── バックテスト 資金設定 ──────────────────────────────────────────────────
 BT_CAPITAL  = float(os.environ.get('BT_CAPITAL',  '150000'))  # スタート資金 (円)
 BT_LEVERAGE = float(os.environ.get('BT_LEVERAGE', '1000'))    # レバレッジ倍率
-# USDJPY 1ロット=100,000USD 想定。証拠金=LOT_UNITS×レート/LEVERAGE
-# 保守的に1回あたり 0.1lot(10,000単位) 固定でテスト
-BT_LOT_UNITS = int(os.environ.get('BT_LOT_UNITS', '10000'))   # 1トレードあたりロット単位数
+BT_RISK_PCT = float(os.environ.get('BT_RISK_PCT', '1.0'))     # リスク率 (%)
+
+
+def _calc_lot(equity_yen: float, risk_pct: float = BT_RISK_PCT) -> float:
+    """MQL5 LotSize() 相当: 口座残高の risk_pct % を使うロット数を返す
+    JPY口座: magnification=10000
+    例) 150,000円 × 1% → MathCeil(150000*1/10000)/100 - 0.01 = 0.14 lot
+    """
+    import math
+    magnification = 10000  # JPY口座
+    lot = math.ceil(equity_yen * risk_pct / magnification) / 100.0
+    lot = lot - 0.01
+    if lot < 0.01:
+        lot = 0.01
+    if lot > 1.0:
+        lot = math.ceil(lot)
+    if lot > 20.0:
+        lot = 20.0
+    return lot
 
 _dash: dict = {}
 
@@ -486,22 +502,24 @@ def _generate_report(trades: list, equity: np.ndarray, dd: np.ndarray,
                      result: dict, out_dir: Path, trial_no: int) -> None:
     """資産曲線・DDチャートのスタンドアロン HTML を生成"""
     capital  = result.get('capital', BT_CAPITAL)
-    lot_u    = result.get('lot_units', BT_LOT_UNITS)
     lev      = result.get('leverage', BT_LEVERAGE)
-    # 資産曲線を円ベースで (capital + cumsum(pnl_yen))
-    eq_yen   = [round(capital + float(v) * lot_u, 0) for v in equity]
-    dd_yen   = [round(float(v) * lot_u, 0) for v in dd]
-    eq_data  = eq_yen
-    dd_data  = dd_yen
+    # 資産曲線・DDはすでに円ベース
+    eq_data  = [round(float(v), 0) for v in equity]
+    dd_data  = [round(float(v), 0) for v in dd]
     # 日別損益 (円)
     daily: dict = {}
     for t in trades:
         d = t.get('date', '?')
-        daily[d] = round(daily.get(d, 0.0) + t.get('pnl_yen', t['pnl'] * lot_u), 0)
+        daily[d] = round(daily.get(d, 0.0) + t.get('pnl_yen', t['pnl']), 0)
     dl   = list(daily.keys())
     dv   = [round(daily[k], 0) for k in dl]
     dclr = [('rgba(63,185,80,.6)' if v >= 0 else 'rgba(248,81,73,.6)') for v in dv]
-    pf_c = '#f0883e' if result['pf'] >= 2 else '#3fb950' if result['pf'] >= 1.5 else '#ffa657' if result['pf'] >= 1.2 else '#f85149'
+    pf_c    = '#f0883e' if result['pf'] >= 2 else '#3fb950' if result['pf'] >= 1.5 else '#ffa657' if result['pf'] >= 1.2 else '#f85149'
+    net_pnl = result.get('net_pnl', 0)
+    fin_eq  = result.get('final_equity', capital)
+    ret_pct = result.get('return_pct', 0)
+    mdd     = result.get('max_dd', 0)
+    mdd_pct = result.get('max_dd_pct', 0)
 
     html = f"""<!DOCTYPE html>
 <html lang="ja"><head><meta charset="UTF-8">
@@ -510,25 +528,27 @@ def _generate_report(trades: list, equity: np.ndarray, dd: np.ndarray,
 <style>
 *{{box-sizing:border-box;margin:0;padding:0}}
 body{{background:#0d1117;color:#e6edf3;font-family:'Segoe UI',sans-serif;padding:20px}}
-h1{{color:#58a6ff;font-size:1.15em;margin-bottom:16px}}
-.stats{{display:flex;gap:12px;margin-bottom:16px;flex-wrap:wrap}}
-.s{{background:#161b22;border:1px solid #30363d;border-radius:8px;padding:12px 18px;text-align:center;min-width:110px}}
-.sv{{font-size:1.5em;font-weight:700}}
-.sl{{font-size:.72em;color:#8b949e;margin-top:4px}}
-.cw{{background:#161b22;border:1px solid #30363d;border-radius:8px;padding:16px;margin-bottom:14px}}
-.ct{{font-size:.72em;color:#8b949e;text-transform:uppercase;letter-spacing:.8px;margin-bottom:10px}}
-canvas{{max-height:260px}}
+h1{{color:#58a6ff;font-size:1.15em;margin-bottom:4px}}
+.sub{{font-size:.72em;color:#8b949e;margin-bottom:14px}}
+.stats{{display:flex;gap:10px;margin-bottom:14px;flex-wrap:wrap}}
+.s{{background:#161b22;border:1px solid #30363d;border-radius:8px;padding:10px 16px;text-align:center;min-width:100px}}
+.sv{{font-size:1.45em;font-weight:700}}
+.sl{{font-size:.7em;color:#8b949e;margin-top:3px}}
+.cw{{background:#161b22;border:1px solid #30363d;border-radius:8px;padding:14px;margin-bottom:12px}}
+.ct{{font-size:.7em;color:#8b949e;text-transform:uppercase;letter-spacing:.8px;margin-bottom:8px}}
+canvas{{max-height:250px}}
 </style></head><body>
 <h1>Trial #{trial_no} バックテストレポート</h1>
+<div class="sub">資金: {capital:,.0f}円 / レバレッジ: {lev:.0f}倍 / リスク: {BT_RISK_PCT:.0f}%/取引 (動的ロット)</div>
 <div class="stats">
   <div class="s"><div class="sv" style="color:{pf_c}">{result['pf']:.4f}</div><div class="sl">Profit Factor</div></div>
-  <div class="s"><div class="sv" style="color:{'#3fb950' if result['net_pnl']>=0 else '#f85149'}">{result['net_pnl']:.3f}</div><div class="sl">純利益 (円)</div></div>
+  <div class="s"><div class="sv" style="color:{'#3fb950' if net_pnl>=0 else '#f85149'}">{net_pnl:+,.0f}円</div><div class="sl">純利益</div></div>
+  <div class="s"><div class="sv" style="color:{'#3fb950' if ret_pct>=0 else '#f85149'}">{ret_pct:+.1f}%</div><div class="sl">リターン</div></div>
   <div class="s"><div class="sv" style="color:#79c0ff">{result.get('sr',0):.3f}</div><div class="sl">Sharpe Ratio</div></div>
-  <div class="s"><div class="sv" style="color:#f85149">{result.get('max_dd',0):.4f}</div><div class="sl">最大 DD</div></div>
+  <div class="s"><div class="sv" style="color:#f85149">{mdd:,.0f}円<br><span style="font-size:.55em">({mdd_pct:.1f}%)</span></div><div class="sl">最大 DD</div></div>
+  <div class="s"><div class="sv" style="color:#58a6ff">{fin_eq:,.0f}円</div><div class="sl">最終資産</div></div>
   <div class="s"><div class="sv">{result['trades']}</div><div class="sl">取引数</div></div>
   <div class="s"><div class="sv" style="color:#3fb950">{result['win_rate']*100:.1f}%</div><div class="sl">勝率</div></div>
-  <div class="s"><div class="sv" style="color:#ffa657">{result['gross_profit']:.3f}</div><div class="sl">総利益</div></div>
-  <div class="s"><div class="sv" style="color:#f85149">{result['gross_loss']:.3f}</div><div class="sl">総損失</div></div>
 </div>
 <div class="cw"><div class="ct">資産曲線 (累積損益)</div>
   <canvas id="eq"></canvas></div>
@@ -642,28 +662,33 @@ def backtest(onnx_path, X_te, df_te, threshold, tp_mult, sl_mult,
                 'sr': 0.0, 'max_dd': 0.0, 'max_dd_pct': 0.0,
                 'final_equity': BT_CAPITAL, 'return_pct': 0.0}
 
-    # 価格差 → 円換算 (USDJPY: 価格差[円] × ロット単位数 = 損益[円])
-    pnl_raw = np.array([t['pnl'] for t in trades])          # 価格差 (円/単位)
-    pnl     = pnl_raw * BT_LOT_UNITS                         # 損益 (円)
+    # ── 動的ロットサイズ計算 (MQL5 LotSize() 相当) ──────────────────────────
+    # 各トレード時点の残高に基づいてロットを動的計算 → 複利効果
+    cur_equity = BT_CAPITAL
+    pnl_yen_list   = []
+    equity_curve_list = [BT_CAPITAL]
+    for t in trades:
+        lot        = _calc_lot(cur_equity, BT_RISK_PCT)
+        lot_units  = round(lot * 100_000)          # 単位数 (整数)
+        pnl_yen    = t['pnl'] * lot_units          # 損益(円)
+        margin     = t.get('entry', 150.0) * lot_units / BT_LEVERAGE
+        cur_equity += pnl_yen
+        pnl_yen_list.append(pnl_yen)
+        equity_curve_list.append(cur_equity)
+        t['pnl_yen']   = round(pnl_yen, 0)
+        t['lot']       = lot
+        t['lot_units'] = lot_units
+        t['margin']    = round(margin, 0)
+        t['equity']    = round(cur_equity, 0)
 
-    # 証拠金チェック: 1トレードの必要証拠金
-    # USDJPY では entry価格×ロット単位数/レバレッジ ≈ 150×10000/1000=1500円
-    entry_prices = np.array([t.get('entry', 150.0) for t in trades])
-    margin_per_trade = entry_prices * BT_LOT_UNITS / BT_LEVERAGE  # 必要証拠金(円)
-
-    gp      = float(pnl[pnl>0].sum())
-    gl      = float(abs(pnl[pnl<0].sum()))
-    equity_curve = BT_CAPITAL + np.cumsum(pnl)               # 資産推移 (円)
-    equity  = np.cumsum(pnl)                                  # 累積損益 (0起点)
-    peak    = np.maximum.accumulate(equity_curve)
-    dd      = equity_curve - peak                             # DD (円)
-    max_dd  = float(dd.min())
-    max_dd_pct = float(max_dd / BT_CAPITAL * 100)            # DD率 (%)
-
-    # 各tradeに円換算PnLとentry価格を追記
-    for i, t in enumerate(trades):
-        t['pnl_yen'] = round(float(pnl[i]), 0)
-        t['margin']  = round(float(margin_per_trade[i]), 0)
+    pnl          = np.array(pnl_yen_list)
+    equity_curve = np.array(equity_curve_list[1:])  # 各取引後の資産
+    gp           = float(pnl[pnl>0].sum())
+    gl           = float(abs(pnl[pnl<0].sum()))
+    peak         = np.maximum.accumulate(equity_curve)
+    dd           = equity_curve - peak
+    max_dd       = float(dd.min())
+    max_dd_pct   = float(max_dd / BT_CAPITAL * 100)
 
     # 日別 Sharpe Ratio (円換算PnLベース、年率換算 √252)
     daily: dict = {}
@@ -674,8 +699,8 @@ def backtest(onnx_path, X_te, df_te, threshold, tp_mult, sl_mult,
     sr = float((dr.mean() / dr.std()) * np.sqrt(252)) if len(dr) > 1 and dr.std() > 0 else 0.0
 
     net_pnl_yen    = round(float(pnl.sum()), 0)
-    final_equity   = round(BT_CAPITAL + net_pnl_yen, 0)
-    return_pct     = round(net_pnl_yen / BT_CAPITAL * 100, 2)
+    final_equity   = round(float(equity_curve[-1]), 0)
+    return_pct     = round((final_equity - BT_CAPITAL) / BT_CAPITAL * 100, 2)
 
     result = {
         'pf':           round(gp / max(gl, 1e-9), 4),
@@ -690,7 +715,7 @@ def backtest(onnx_path, X_te, df_te, threshold, tp_mult, sl_mult,
         'final_equity': final_equity,
         'return_pct':   return_pct,
         'capital':      BT_CAPITAL,
-        'lot_units':    BT_LOT_UNITS,
+        'risk_pct':     BT_RISK_PCT,
         'leverage':     BT_LEVERAGE,
     }
     print(f"  SR={sr:.3f}  MaxDD={max_dd:,.0f}円({max_dd_pct:.1f}%)  "
@@ -699,7 +724,7 @@ def backtest(onnx_path, X_te, df_te, threshold, tp_mult, sl_mult,
 
     # 資産曲線 HTML レポート生成
     if report_dir is not None:
-        _generate_report(trades, equity, dd, result, Path(report_dir), trial_no)
+        _generate_report(trades, equity_curve, dd, result, Path(report_dir), trial_no)
 
     return result
 

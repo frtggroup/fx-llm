@@ -26,6 +26,10 @@ ENV DEBIAN_FRONTEND=noninteractive \
     # 並列数 / 1試行あたりの最低 VRAM (GB)
     MAX_PARALLEL=3 \
     VRAM_PER_TRIAL=10 \
+    # バックテスト設定 (MQL5 LotSize相当: 残高の BT_RISK_PCT% をリスクにロット決定)
+    BT_CAPITAL=150000 \
+    BT_LEVERAGE=1000 \
+    BT_RISK_PCT=1.0 \
     # データパス (DATA_URL で上書き可能)
     DATA_PATH=/workspace/data/USDJPY_M1.csv \
     WORKSPACE=/workspace

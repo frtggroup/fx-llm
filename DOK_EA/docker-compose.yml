@@ -28,6 +28,10 @@ services:
       MAX_PARALLEL: "3"
       # 1試行あたりの最低 VRAM (GB)
       VRAM_PER_TRIAL: "10"
+      # バックテスト設定 (MQL5 LotSize相当)
+      BT_CAPITAL: "150000"
+      BT_LEVERAGE: "1000"
+      BT_RISK_PCT: "1.0"       # 残高の1%をリスクにロット決定 (変更可: 0.5〜2.0)
       # データ CSV の URL (起動時に自動ダウンロード)
       # DATA_URL: "https://your-storage/USDJPY_M1.csv"
       DATA_PATH: "/workspace/data/USDJPY_M1.csv"
