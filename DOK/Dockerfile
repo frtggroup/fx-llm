@@ -49,6 +49,7 @@ RUN chmod 600 /root/.ssh/authorized_keys
 # ── Source files ─────────────────────────────────────────────────────────────
 COPY ai_ea/ /workspace/ai_ea/
 COPY DOK/src/ /workspace/src/
+COPY DOK/mql5/ /workspace/mql5/
 COPY DOK/entrypoint.sh /workspace/entrypoint.sh
 RUN chmod +x /workspace/entrypoint.sh
 
@@ -56,6 +57,7 @@ RUN chmod +x /workspace/entrypoint.sh
 RUN mkdir -p /workspace/data \
              /workspace/output \
              /workspace/reports \
+             /workspace/mql5 \
              /workspace/hf_cache
 
 WORKDIR /workspace

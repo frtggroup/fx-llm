@@ -149,12 +149,23 @@ def main():
     if not ok:
         sys.exit(1)
 
+    # ── STEP 4: MT5シグナルCSV生成 ────────────────────────────────────────
+    ok = run_step('MT5シグナルCSV生成', [
+        sys.executable, '/workspace/src/signal_export.py',
+        '--tp', str(args.tp),
+        '--sl', str(args.sl),
+    ])
+    if not ok:
+        print("[WARN] MT5シグナル生成に失敗しましたが続行します", flush=True)
+
     elapsed = time.time() - t_start
     print(f"\n{'='*60}", flush=True)
     print(f"  パイプライン完了！  {elapsed/60:.1f}分", flush=True)
-    print(f"  ダッシュボード: http://<DOK_IP>:7860", flush=True)
-    print(f"  レポートDL:     http://<DOK_IP>:7860/download/report", flush=True)
-    print(f"  モデルDL:       http://<DOK_IP>:7860/download/adapter", flush=True)
+    print(f"  ダッシュボード:     http://<DOK_IP>:7860", flush=True)
+    print(f"  レポートDL:         http://<DOK_IP>:7860/download/report", flush=True)
+    print(f"  モデルDL:           http://<DOK_IP>:7860/download/adapter", flush=True)
+    print(f"  MT5シグナルDL:      http://<DOK_IP>:7860/download/mt5signals", flush=True)
+    print(f"  MT5 EA DL:          http://<DOK_IP>:7860/download/mt5ea", flush=True)
     print(f"{'='*60}", flush=True)
 
 

@@ -139,6 +139,24 @@ tr:hover{background:#21262d}
   </div>
 </div>
 
+<!-- MT5 セクション -->
+<div class="card" style="margin-top:12px" id="mt5-card">
+  <h2>MT5 バックテスト連携</h2>
+  <div id="mt5-waiting" style="color:#8b949e;font-size:0.82em;padding:10px">
+    訓練・バックテスト完了後にシグナルCSVが自動生成されます
+  </div>
+  <div id="mt5-ready" style="display:none">
+    <div class="stat-row" id="mt5-stats"></div>
+    <div style="font-size:0.78em;color:#8b949e;margin:8px 0 12px">
+      ① CSVをMT5の <code style="color:#79c0ff">MQL5/Files/</code> フォルダにコピー<br>
+      ② EAをコンパイルして同フォルダの任意のチャートに適用<br>
+      ③ MT5ストラテジーテスターで <b>USDJPY H1</b> 期間を合わせてバックテスト実行
+    </div>
+    <a class="btn btn-green" href="/download/mt5signals" target="_blank">📥 シグナルCSVダウンロード</a>
+    <a class="btn btn-blue"  href="/download/mt5ea"      target="_blank">🤖 MT5 EAダウンロード (.mq5)</a>
+  </div>
+</div>
+
 <div style="text-align:right;font-size:0.7em;color:#484f58;margin-top:10px">
   最終更新: <span id="last-update">-</span> &nbsp;|&nbsp; 3秒ポーリング
 </div>
@@ -330,10 +348,29 @@ async function poll() {
     // バックテスト
     if (d.backtest_result) updateBacktest(d.backtest_result);
 
+    // MT5シグナル
+    if (d.mt5_stats) updateMT5(d.mt5_stats);
+
     document.getElementById('last-update').textContent = new Date().toLocaleTimeString('ja-JP');
   } catch(e) {
     console.warn('poll error', e);
   }
+}
+
+function updateMT5(st) {
+  if (!st) return;
+  document.getElementById('mt5-waiting').style.display = 'none';
+  document.getElementById('mt5-ready').style.display   = 'block';
+  const items = [
+    ['総シグナル', st.total ?? '-',                             '#e6edf3'],
+    ['BUY',        st.buy   ?? '-',                             '#3fb950'],
+    ['SELL',       st.sell  ?? '-',                             '#f85149'],
+    ['HOLD',       st.hold  ?? '-',                             '#8b949e'],
+    ['平均信頼度', st.avg_conf != null ? (st.avg_conf*100).toFixed(1)+'%' : '-', '#ffa657'],
+  ];
+  document.getElementById('mt5-stats').innerHTML = items.map(([l,v,c]) =>
+    `<div class="stat-item"><div class="stat-val" style="color:${c};font-size:1.1em">${v}</div><div class="stat-lbl">${l}</div></div>`
+  ).join('');
 }
 
 poll();
@@ -391,6 +428,35 @@ def download_adapter():
     resp.headers['Content-Type'] = 'application/gzip'
     resp.headers['Content-Disposition'] = 'attachment; filename=llm_adapter_best.tar.gz'
     return resp
+
+
+@app.route('/download/mt5signals')
+def download_mt5signals():
+    csv_files = sorted(REPORT_DIR.glob('mt5_signals_*.csv'))
+    if not csv_files:
+        return Response('MT5シグナルCSVがまだ生成されていません。訓練完了後に自動生成されます。',
+                        mimetype='text/plain; charset=utf-8', status=404)
+    latest = csv_files[-1]
+    return send_file(
+        str(latest),
+        mimetype='text/csv',
+        as_attachment=True,
+        download_name=latest.name,
+    )
+
+
+@app.route('/download/mt5ea')
+def download_mt5ea():
+    ea_path = WORKSPACE / 'mql5' / 'LLM_Signal_EA.mq5'
+    if not ea_path.exists():
+        return Response('MT5 EAファイルが見つかりません。',
+                        mimetype='text/plain; charset=utf-8', status=404)
+    return send_file(
+        str(ea_path),
+        mimetype='text/plain',
+        as_attachment=True,
+        download_name='LLM_Signal_EA.mq5',
+    )
 
 
 def run():
