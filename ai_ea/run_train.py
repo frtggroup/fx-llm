@@ -774,14 +774,27 @@ def main():
     if ALL_RESULTS.exists():
         try:
             raw = json.loads(ALL_RESULTS.read_text(encoding='utf-8'))
-            # ── 重複排除: 同じ trial 番号は最初の1件のみ残す ──────────────
-            seen: set = set()
+            # ── 重複排除 ステップ1: 同じ trial 番号は最初の1件のみ残す ──────
+            seen_trial: set = set()
             results = []
             for r in raw:
                 tno_r = r.get('trial', -1)
-                if tno_r not in seen:
-                    seen.add(tno_r)
+                if tno_r not in seen_trial:
+                    seen_trial.add(tno_r)
                     results.append(r)
+
+            # ── 重複排除 ステップ2: 結果が同一なレコードも除去 ────────────
+            # (arch・feat_set・pf・trades が一致 → 同じモデルが別trial番号で登録されたケース)
+            seen_result: set = set()
+            deduped: list = []
+            for r in results:
+                sig = (r.get('arch'), r.get('feat_set', -1),
+                       round(r.get('pf', 0), 4), r.get('trades', 0))
+                if sig not in seen_result or sig == (None, -1, 0.0, 0):
+                    seen_result.add(sig)
+                    deduped.append(r)
+            results = deduped
+
             if len(raw) != len(results):
                 print(f"  [DEDUP] 重複除去: {len(raw)} → {len(results)} 件")
                 # クリーンなデータで上書き保存
