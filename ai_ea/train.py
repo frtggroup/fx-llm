@@ -588,12 +588,51 @@ if(dChart)dChart.data.datasets[0].backgroundColor=dlc,dChart.update('none');
         print(f"  [WARN] レポート生成失敗: {e}")
 
 
+_BT_PROVIDERS: list | None = None  # キャッシュ: 初回ベンチで決定
+
+def _bench_onnx_providers(onnx_path: str, sample: np.ndarray) -> list:
+    """CPU vs CUDA でONNX推論速度を計測し、速い方のproviderリストを返す。
+    結果はグローバルキャッシュ _BT_PROVIDERS に保存して再利用。"""
+    global _BT_PROVIDERS
+    if _BT_PROVIDERS is not None:
+        return _BT_PROVIDERS
+
+    import onnxruntime as ort
+    import time
+
+    available = ort.get_available_providers()
+    if 'CUDAExecutionProvider' not in available:
+        _BT_PROVIDERS = ['CPUExecutionProvider']
+        print('  [BT-bench] CUDA unavailable → CPU')
+        return _BT_PROVIDERS
+
+    x = sample[:min(512, len(sample))]  # ウォームアップ用サンプル
+    results = {}
+    for name, pvd in [('CPU', ['CPUExecutionProvider']),
+                      ('CUDA', ['CUDAExecutionProvider', 'CPUExecutionProvider'])]:
+        try:
+            s = ort.InferenceSession(onnx_path, providers=pvd)
+            s.run(None, {'input': x})      # ウォームアップ
+            t0 = time.perf_counter()
+            for _ in range(5):
+                s.run(None, {'input': x})
+            results[name] = (time.perf_counter() - t0) / 5
+        except Exception as e:
+            print(f'  [BT-bench] {name} error: {e}')
+            results[name] = float('inf')
+
+    faster = min(results, key=results.get)
+    print(f'  [BT-bench] CPU={results.get("CPU",999)*1000:.1f}ms  '
+          f'CUDA={results.get("CUDA",999)*1000:.1f}ms  → {faster} を採用')
+    _BT_PROVIDERS = (['CUDAExecutionProvider', 'CPUExecutionProvider']
+                     if faster == 'CUDA' else ['CPUExecutionProvider'])
+    return _BT_PROVIDERS
+
+
 def backtest(onnx_path, X_te, df_te, threshold, tp_mult, sl_mult,
              seq_len=20, report_dir: Path = None, trial_no: int = 0):
     import onnxruntime as ort
-    _providers = (['CUDAExecutionProvider', 'CPUExecutionProvider']
-                  if 'CUDAExecutionProvider' in ort.get_available_providers()
-                  else ['CPUExecutionProvider'])
+    _providers = _bench_onnx_providers(str(onnx_path), X_te)
     sess = ort.InferenceSession(str(onnx_path), providers=_providers)
     close = df_te['close'].values
     atr   = df_te['atr14'].values
