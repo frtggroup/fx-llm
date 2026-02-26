@@ -27,6 +27,12 @@ BEST_ONNX     = OUT_DIR / 'fx_model_best.onnx'
 BEST_NORM     = OUT_DIR / 'norm_params_best.json'
 BEST_JSON     = OUT_DIR / 'best_result.json'
 
+# ── チェックポイント (停止→再開用) ─────────────────────────────────────────
+# /workspace/data/checkpoint/ に定期保存。
+# Sakura DOK でディスクを /workspace/data にマウントすると自動的に永続化される。
+CHECKPOINT_DIR      = _WORKSPACE / 'data' / 'checkpoint'
+CHECKPOINT_INTERVAL = 600   # 秒 (10分ごとに保存)
+
 TOP_N              = 100
 RANDOM_PHASE_LIMIT = 200    # この件数までは純ランダム、以降は GA 主体
 GA_RATIO           = 0.75   # GA の割合 (残りはランダム)
@@ -415,6 +421,69 @@ class ParallelTrainer:
         return len(self.running)
 
 
+# ── チェックポイント保存・復元 ────────────────────────────────────────────────
+def save_checkpoint(results: list, best_pf: float) -> None:
+    """all_results + best model + top100 を CHECKPOINT_DIR に保存"""
+    try:
+        CHECKPOINT_DIR.mkdir(parents=True, exist_ok=True)
+        # all_results.json
+        tmp = CHECKPOINT_DIR / 'all_results.json.tmp'
+        tmp.write_text(json.dumps(results, indent=2, ensure_ascii=False), encoding='utf-8')
+        tmp.replace(CHECKPOINT_DIR / 'all_results.json')
+        # best model ファイル
+        for src, name in [(BEST_ONNX, 'fx_model_best.onnx'),
+                          (BEST_NORM, 'norm_params_best.json'),
+                          (BEST_JSON, 'best_result.json')]:
+            if src.exists():
+                shutil.copy2(src, CHECKPOINT_DIR / name)
+        # top100 ディレクトリ
+        top_dst = CHECKPOINT_DIR / 'top100'
+        if TOP_DIR.exists():
+            if top_dst.exists():
+                shutil.rmtree(top_dst)
+            shutil.copytree(TOP_DIR, top_dst)
+        # メタ情報
+        meta = {'saved_at': time.strftime('%Y-%m-%d %H:%M:%S'),
+                'completed': len(results), 'best_pf': best_pf}
+        (CHECKPOINT_DIR / 'meta.json').write_text(
+            json.dumps(meta, ensure_ascii=False), encoding='utf-8')
+        print(f'  [CKPT] 保存完了 → {CHECKPOINT_DIR}  ({len(results)}件 / bestPF={best_pf:.4f})')
+    except Exception as e:
+        print(f'  [CKPT] 保存失敗: {e}')
+
+
+def restore_checkpoint() -> bool:
+    """CHECKPOINT_DIR からファイルを作業ディレクトリに復元。成功したら True を返す"""
+    meta_path = CHECKPOINT_DIR / 'meta.json'
+    ar_path   = CHECKPOINT_DIR / 'all_results.json'
+    if not ar_path.exists():
+        return False
+    try:
+        meta = json.loads(meta_path.read_text(encoding='utf-8')) if meta_path.exists() else {}
+        print(f'  [CKPT] チェックポイント発見: {meta.get("saved_at","?")}  '
+              f'{meta.get("completed","?")}件  bestPF={meta.get("best_pf","?")}')
+        # all_results.json
+        shutil.copy2(ar_path, ALL_RESULTS)
+        # best model
+        for name, dst in [('fx_model_best.onnx',    BEST_ONNX),
+                          ('norm_params_best.json',  BEST_NORM),
+                          ('best_result.json',        BEST_JSON)]:
+            src = CHECKPOINT_DIR / name
+            if src.exists():
+                shutil.copy2(src, dst)
+        # top100
+        top_src = CHECKPOINT_DIR / 'top100'
+        if top_src.exists():
+            if TOP_DIR.exists():
+                shutil.rmtree(TOP_DIR)
+            shutil.copytree(top_src, TOP_DIR)
+        print('  [CKPT] 復元完了 → 前回の続きから再開します')
+        return True
+    except Exception as e:
+        print(f'  [CKPT] 復元失敗: {e}')
+        return False
+
+
 # ── メイン ────────────────────────────────────────────────────────────────────
 def main():
     TRIALS_DIR.mkdir(parents=True, exist_ok=True)
@@ -438,6 +507,10 @@ def main():
     trial_no = 1
     start    = time.time()
 
+    # ── チェックポイントから復元 (ディスクマウント時は自動継続) ──────────────
+    if not ALL_RESULTS.exists():
+        restore_checkpoint()
+
     # 既存結果を引き継ぐ
     if ALL_RESULTS.exists():
         try:
@@ -450,6 +523,8 @@ def main():
                 print(f"  前回最良PF={best_pf:.4f}  完了{len(results)}件  次試行#{trial_no}")
         except Exception:
             pass
+
+    last_checkpoint = time.time()
 
     write_progress(trainer.running, results, best_pf, start)
 
@@ -541,10 +616,17 @@ def main():
 
         # ── 進捗 JSON 書き込み (5秒ごと) ───────────────────────────────────
         write_progress(trainer.running, results, best_pf, start)
+
+        # ── チェックポイント定期保存 ────────────────────────────────────────
+        if time.time() - last_checkpoint >= CHECKPOINT_INTERVAL:
+            save_checkpoint(results, best_pf)
+            last_checkpoint = time.time()
+
         time.sleep(5)
 
     # ── 終了処理 ────────────────────────────────────────────────────────────
     write_progress({}, results, best_pf, start)
+    save_checkpoint(results, best_pf)   # 停止時に必ずチェックポイント保存
     print(f"\n完了  総試行: {len(results)}件  最良PF: {best_pf:.4f}")
     if BEST_ONNX.exists():
         shutil.copy2(BEST_ONNX, OUT_DIR / 'fx_model.onnx')

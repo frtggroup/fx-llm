@@ -188,6 +188,36 @@ def download_log():
     return FileResponse(str(LOG_FILE), filename='train_run.log')
 
 
+@app.get('/download/checkpoint')
+def download_checkpoint():
+    """チェックポイント一式を zip でダウンロード"""
+    import zipfile, io
+    ckpt = WORKSPACE / 'data' / 'checkpoint'
+    if not ckpt.exists():
+        raise HTTPException(404, 'チェックポイントがまだ作成されていません')
+    buf = io.BytesIO()
+    with zipfile.ZipFile(buf, 'w', zipfile.ZIP_DEFLATED) as zf:
+        for f in ckpt.rglob('*'):
+            if f.is_file():
+                zf.write(f, f.relative_to(ckpt))
+    buf.seek(0)
+    return StreamingResponse(buf, media_type='application/zip',
+                             headers={'Content-Disposition': 'attachment; filename=checkpoint.zip'})
+
+
+@app.get('/api/checkpoint_status')
+def checkpoint_status():
+    """チェックポイントのメタ情報を返す"""
+    meta_path = WORKSPACE / 'data' / 'checkpoint' / 'meta.json'
+    if not meta_path.exists():
+        return {'exists': False}
+    try:
+        meta = json.loads(meta_path.read_text(encoding='utf-8'))
+        return {'exists': True, **meta}
+    except Exception:
+        return {'exists': False}
+
+
 @app.get('/api/trial_log/{trial_no}')
 def trial_log(trial_no: int, lines: int = 100):
     """試行ログの末尾 lines 行を返す"""
