@@ -1,0 +1,58 @@
+version: "3.9"
+
+services:
+  fx-ea-gtx:
+    image: frtggroup/fx-ea-gtx:latest
+    container_name: fx-ea-gtx
+
+    # GTX GPU を使用
+    deploy:
+      resources:
+        reservations:
+          devices:
+            - driver: nvidia
+              count: all
+              capabilities: [gpu]
+
+    ports:
+      - "7860:7860"   # ダッシュボード
+      - "2222:22"     # SSH
+
+    environment:
+      # GTX 1080 Ti モード (FP16 AMP, torch.compile無効)
+      H100_MODE: "0"
+      # GTX 1080 Ti VRAM 11GB → 1並列 (余裕あれば2)
+      MAX_PARALLEL: "1"
+      VRAM_PER_TRIAL: "8"
+      # バックテスト設定
+      BT_CAPITAL: "150000"
+      BT_LEVERAGE: "1000"
+      BT_RISK_PCT: "1.0"
+      # Sakura オブジェクトストレージ (チェックポイント永続化)
+      S3_ENDPOINT: "https://s3.isk01.sakurastorage.jp"
+      S3_REGION: "jp-north-1"
+      S3_ACCESS_KEY: "9LZ71SXF347BKM7MEPPM"
+      S3_SECRET_KEY: "=u/j64oP8sQvtRXjjNY33jF2S/gOY5WMVgYcdnqG"
+      S3_BUCKET: "fxea"
+      S3_PREFIX: "checkpoint_gtx"   # H100とは別プレフィックスで保存
+      # データ CSV の URL (起動時に自動ダウンロード / 既存なら skip)
+      DATA_URL: "https://fxea.s3.isk01.sakurastorage.jp/USDJPY_M1.csv"
+      DATA_PATH: "/workspace/data/USDJPY_M1.csv"
+
+    # ローカル永続化 (H100/DOKと違いボリュームマウントで対応)
+    volumes:
+      - ./data:/workspace/data
+      - ./output/trials:/workspace/ai_ea/trials
+      - ./output/top100:/workspace/ai_ea/top100
+      - ./output/top_cache:/workspace/ai_ea/top_cache
+
+    restart: unless-stopped
+
+    # GTX 1080 Ti は共有メモリ少なめ
+    shm_size: "2gb"
+
+    logging:
+      driver: "json-file"
+      options:
+        max-size: "100m"
+        max-file: "5"
