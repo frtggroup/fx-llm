@@ -97,6 +97,13 @@ H100_MODE     = os.environ.get('H100_MODE', '0') == '1'
 MAX_PARALLEL  = int(os.environ.get('MAX_PARALLEL', '3' if H100_MODE else '1'))
 VRAM_PER_TRIAL= float(os.environ.get('VRAM_PER_TRIAL', '10'))   # GB
 
+# ── フリーズ検知: GPU無使用タイムアウト ──────────────────────────────────────
+# データロード・前処理フェーズに DATA_PREP_BUDGET 秒の猶予を与え、
+# それ以降も GPU を使っていなければ強制終了
+DATA_PREP_BUDGET  = 600    # 秒: データ準備の最大許容時間 (10分)
+NO_GPU_TIMEOUT    = 900    # 秒: GPU使用なしでこれ以上→強制終了 (15分)
+LAUNCH_INTERVAL   = 5      # 秒: 試行投入間隔 (CUDA初期化の重複を防ぐ)
+
 ARCHS = [
     'mlp', 'gru_attn', 'bigru', 'lstm_attn',
     'cnn', 'tcn', 'cnn_gru', 'transformer', 'resnet', 'inception',
@@ -296,6 +303,23 @@ def _gpu_info() -> dict:
         return {'free_gb': 999, 'total_gb': 80, 'used_gb': 0, 'gpu_pct': 0, 'mem_pct': 0}
 
 
+def get_gpu_compute_pids() -> set:
+    """nvidia-smi で現在 GPU 計算を使用している PID セットを返す"""
+    try:
+        r = subprocess.run(
+            ['nvidia-smi', '--query-compute-apps=pid', '--format=csv,noheader'],
+            capture_output=True, text=True, timeout=10
+        )
+        pids = set()
+        for line in r.stdout.strip().split('\n'):
+            line = line.strip()
+            if line.isdigit():
+                pids.add(int(line))
+        return pids
+    except Exception:
+        return set()
+
+
 def get_max_parallel(n_running: int) -> int:
     """VRAM/GPU 使用率から動的に最大並列数を返す"""
     if not H100_MODE:
@@ -306,7 +330,8 @@ def get_max_parallel(n_running: int) -> int:
     # GPU が高負荷なら維持
     if gi['gpu_pct'] > 92 and n_running > 0:
         return n_running
-    return min(MAX_PARALLEL, vram_slots)
+    # VRAM不足でも最低1並列は保証 (フリーズ防止)
+    return max(1, min(MAX_PARALLEL, vram_slots))
 
 
 # ── TOP_N 管理 ────────────────────────────────────────────────────────────────
@@ -449,17 +474,47 @@ class ParallelTrainer:
     def poll_completed(self) -> list:
         """完了/タイムアウトした試行のリストを返し running から削除"""
         done = []
+        gpu_pids = get_gpu_compute_pids()   # 現在GPU使用中のPIDセット
+        now = time.time()
+
         with self.lock:
             for tno in list(self.running.keys()):
                 info    = self.running[tno]
-                elapsed = time.time() - info['start_time']
-                # タイムアウト: 強制終了
-                if elapsed > TRIAL_TIMEOUT and info['proc'].poll() is None:
-                    print(f"  [TIMEOUT] 試行#{tno} ({elapsed/60:.0f}分超) → 強制終了")
-                    info['proc'].terminate()
-                    try: info['proc'].wait(timeout=10)
-                    except Exception: info['proc'].kill()
-                if info['proc'].poll() is not None:
+                elapsed = now - info['start_time']
+                proc    = info['proc']
+
+                if proc.poll() is None:   # まだ実行中
+                    pid = proc.pid
+
+                    # ── GPU使用中PIDの追跡 ──────────────────────────────
+                    if pid in gpu_pids:
+                        info['last_gpu_time'] = now   # GPUアクティブ時刻を更新
+
+                    last_gpu = info.get('last_gpu_time')
+                    since_gpu = (now - last_gpu) if last_gpu else elapsed
+
+                    # ── GPUノーアクティビティウォッチドッグ ─────────────
+                    # DATA_PREP_BUDGET 秒以内はデータ準備中として許容
+                    # それ以降も GPU を使っていなければ強制終了
+                    if elapsed > DATA_PREP_BUDGET and since_gpu > NO_GPU_TIMEOUT:
+                        print(f"  [NO-GPU] 試行#{tno}  経過{elapsed/60:.1f}分"
+                              f"  GPU無使用{since_gpu/60:.1f}分 → 強制終了")
+                        try:
+                            proc.terminate()
+                            proc.wait(timeout=10)
+                        except Exception:
+                            proc.kill()
+
+                    # ── 全体タイムアウト ────────────────────────────────
+                    elif elapsed > TRIAL_TIMEOUT:
+                        print(f"  [TIMEOUT] 試行#{tno} ({elapsed/60:.0f}分超) → 強制終了")
+                        try:
+                            proc.terminate()
+                            proc.wait(timeout=10)
+                        except Exception:
+                            proc.kill()
+
+                if proc.poll() is not None:
                     info['log_fh'].close()
                     done.append((tno, info))
                     del self.running[tno]
@@ -575,6 +630,44 @@ def restore_checkpoint() -> bool:
 
 
 # ── メイン ────────────────────────────────────────────────────────────────────
+def _precache_data() -> bool:
+    """データキャッシュを事前作成して全試行が即座に使えるようにする"""
+    import pickle
+    DATA_PATH = Path(os.environ.get('DATA_PATH', '/workspace/data/USDJPY_M1.csv'))
+    cache_path = TRIALS_DIR.parent / 'df_cache_H1.pkl'
+    if cache_path.exists():
+        print(f"  [PRE-CACHE] キャッシュ既存: {cache_path}")
+        return True
+    if not DATA_PATH.exists():
+        print(f"  [PRE-CACHE] データファイルなし: {DATA_PATH}")
+        return False
+    print(f"  [PRE-CACHE] データキャッシュを事前作成中... (初回のみ数分かかります)")
+    try:
+        import sys as _sys
+        _sys.path.insert(0, str(TRAIN_PY.parent))
+        from features import load_data, add_indicators
+        import numpy as np
+        from datetime import timedelta
+        t0 = time.time()
+        df = load_data(str(DATA_PATH), timeframe='H1')
+        df = add_indicators(df)
+        df.replace([np.inf, -np.inf], np.nan, inplace=True)
+        df.dropna(inplace=True)
+        test_start = df.index[-1] - timedelta(days=365)
+        df_tr = df[df.index < test_start].copy()
+        df_te = df[df.index >= test_start].copy()
+        tmp = cache_path.with_suffix('.tmp')
+        with open(tmp, 'wb') as f:
+            pickle.dump((df_tr, df_te), f)
+        tmp.replace(cache_path)
+        print(f"  [PRE-CACHE] 完了 {time.time()-t0:.1f}秒  "
+              f"訓練:{len(df_tr):,}行  テスト:{len(df_te):,}行  → {cache_path}")
+        return True
+    except Exception as e:
+        print(f"  [PRE-CACHE] 失敗 (訓練は続行): {e}")
+        return False
+
+
 def main():
     TRIALS_DIR.mkdir(parents=True, exist_ok=True)
     TOP_CACHE_DIR.mkdir(parents=True, exist_ok=True)
@@ -583,9 +676,13 @@ def main():
     mode_str = f'H100 80GB  並列={MAX_PARALLEL}  VRAM/試行={VRAM_PER_TRIAL}GB' \
                if H100_MODE else 'GTX 1080 Ti  シングル'
     print('=' * 60)
-    print(f'FX AI EA v7 - 並列ランダムサーチ [{mode_str}]')
+    print(f'FX AI EA v8 - 並列ランダムサーチ [{mode_str}]')
     print(f'  TOP {TOP_N} 保存  タイムアウト {TRIAL_TIMEOUT//60}分  stop.flag: {STOP_FLAG}')
+    print(f'  GPU無使用タイムアウト: {NO_GPU_TIMEOUT//60}分  データ準備猶予: {DATA_PREP_BUDGET//60}分')
     print('=' * 60)
+
+    # ── 起動時にデータキャッシュを事前作成 (全試行が即座に学習開始できる) ──
+    _precache_data()
 
     if STOP_FLAG.exists():
         STOP_FLAG.unlink()
@@ -702,7 +799,7 @@ def main():
             p, strategy = next_params(results, rng)
             trainer.launch(trial_no, p, best_pf, start, strategy)
             trial_no += 1
-            time.sleep(2)   # 連続起動の間隔
+            time.sleep(LAUNCH_INTERVAL)   # 連続起動の間隔 (CUDA初期化の重複を防ぐ)
 
         # ── 進捗 JSON 書き込み (5秒ごと) ───────────────────────────────────
         write_progress(trainer.running, results, best_pf, start)

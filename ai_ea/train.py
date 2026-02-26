@@ -118,33 +118,64 @@ def prepare(args):
         df_tr, df_te = _DF_CACHE[cache_key]
         print(f"  データキャッシュHIT ({len(df_tr):,} / {len(df_te):,})")
     else:
-        # ディスクキャッシュ: npz 形式で保存 (指標計算を毎回スキップ)
+        # ディスクキャッシュ: 並列試行間で共有 (ファイルロックで競合防止)
         cache_path = OUT_DIR.parent / f'df_cache_{args.timeframe}.pkl'
-        if cache_path.exists():
-            print(f"  ディスクキャッシュ読み込み中...")
-            import pickle
+        lock_path  = cache_path.with_suffix('.lock')
+        import pickle, fcntl
+
+        def _load_cache():
             with open(cache_path, 'rb') as f:
-                df_tr, df_te = pickle.load(f)
-            print(f"  キャッシュ読み込み完了 ({len(df_tr):,} / {len(df_te):,})  {time.time()-t0:.1f}秒")
-        else:
+                return pickle.load(f)
+
+        def _build_and_save():
             df = load_data(str(DATA_PATH), timeframe=args.timeframe)
             df = add_indicators(df)
             df.replace([np.inf, -np.inf], np.nan, inplace=True)
             df.dropna(inplace=True)
-
-            # 直近1年 = テスト
             test_start = df.index[-1] - timedelta(days=365)
-            df_tr = df[df.index < test_start].copy()
-            df_te = df[df.index >= test_start].copy()
-
-            # ディスクキャッシュ保存
+            dtr = df[df.index < test_start].copy()
+            dte = df[df.index >= test_start].copy()
             try:
-                import pickle
-                with open(cache_path, 'wb') as f:
-                    pickle.dump((df_tr, df_te), f)
+                tmp = cache_path.with_suffix('.tmp')
+                with open(tmp, 'wb') as f:
+                    pickle.dump((dtr, dte), f)
+                tmp.replace(cache_path)
                 print(f"  ディスクキャッシュ保存: {cache_path}")
             except Exception as e:
                 print(f"  キャッシュ保存スキップ: {e}")
+            return dtr, dte
+
+        if cache_path.exists():
+            print(f"  ディスクキャッシュ読み込み中...")
+            try:
+                df_tr, df_te = _load_cache()
+                print(f"  キャッシュ読み込み完了 ({len(df_tr):,} / {len(df_te):,})  {time.time()-t0:.1f}秒")
+            except Exception:
+                # 破損キャッシュ → 再構築
+                print(f"  キャッシュ破損 → 再構築します")
+                cache_path.unlink(missing_ok=True)
+                df_tr, df_te = _build_and_save()
+        else:
+            # ファイルロックで1プロセスだけが構築し、他は待機して読む
+            print(f"  キャッシュ未作成 → 排他ロックで構築中...")
+            try:
+                lock_fh = open(lock_path, 'w')
+                fcntl.flock(lock_fh, fcntl.LOCK_EX)   # 排他ロック取得
+                try:
+                    if cache_path.exists():   # ロック待ち中に他が作成済み
+                        df_tr, df_te = _load_cache()
+                        print(f"  他プロセスが作成済みキャッシュを読み込み ({len(df_tr):,}/{len(df_te):,})")
+                    else:
+                        df_tr, df_te = _build_and_save()
+                finally:
+                    fcntl.flock(lock_fh, fcntl.LOCK_UN)
+                    lock_fh.close()
+            except (ImportError, AttributeError):
+                # Windows など fcntl 非対応環境はロックなしで実行
+                if cache_path.exists():
+                    df_tr, df_te = _load_cache()
+                else:
+                    df_tr, df_te = _build_and_save()
 
         _DF_CACHE[cache_key] = (df_tr, df_te)
 
