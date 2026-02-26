@@ -18,14 +18,14 @@
 // 入力パラメータ
 //──────────────────────────────────────────────────────────────────
 input group "=== モデルファイル ==="
-input string   InpModelFile  = "fx_model_best.onnx";        // ONNXモデル
-input string   InpNormFile   = "norm_params_best.json";     // 正規化パラメータ
+input string   InpModelFile  = "fx_model.onnx";        // ONNXモデル
+input string   InpNormFile   = "norm_params.json";     // 正規化パラメータ
 
 input group "=== エントリー設定 ==="
-input double   InpThreshold  = 0.38;   // エントリー確率閾値
-input double   InpTpAtr      = 2.0;    // TP倍率 (ATR×)
-input double   InpSlAtr      = 1.0;    // SL倍率 (ATR×)
-input int      InpMaxHoldBars= 48;     // 最大保有バー数
+input double   InpThreshold  = 0.46;   // エントリー確率閾値 (norm_params未記載時のフォールバック)
+input double   InpTpAtr      = 3.4;    // TP倍率 (ATR×)
+input double   InpSlAtr      = 0.7;    // SL倍率 (ATR×)
+input int      InpMaxHoldBars= 15;     // 最大保有バー数
 
 input group "=== リスク管理 ==="
 input double   InpRiskPct    = 1.0;    // リスク率 (%) ※LotSize計算に使用
@@ -90,7 +90,7 @@ int OnInit()
    h_macd   = iMACD(_Symbol, PERIOD_H1, 12, 26, 9, PRICE_CLOSE);
    h_stoch  = iStochastic(_Symbol, PERIOD_H1, 14, 3, 3, MODE_SMA, STO_LOWHIGH);
    h_wpr    = iWPR(_Symbol, PERIOD_H1, 14);
-   h_cci20  = iCCI(_Symbol, PERIOD_H1, 14, PRICE_TYPICAL);
+   h_cci20  = iCCI(_Symbol, PERIOD_H1, 20, PRICE_TYPICAL);  // Python features.py と同じ20期間
    h_bb     = iBands(_Symbol, PERIOD_H1, 20, 0, 2.0, PRICE_CLOSE);
    h_ichi   = iIchimoku(_Symbol, PERIOD_H1, 9, 26, 52);
 
@@ -385,8 +385,10 @@ bool RunInference(float &probs[])
       feat[12] = rsi28_buf[i] / 100.0;
 
       // ── [13-14] macd_hist, macd_signal ──────────────────────
-      feat[13] = macd_hist[i] / (atr + 1e-9);
-      feat[14] = macd_sig[i]  / (atr + 1e-9);
+      // iMACD buffer[0]=main_line(ema12-ema26), buffer[1]=signal
+      // Pythonのmacd_hist = main_line - signal → buffer[0]-buffer[1]
+      feat[13] = (macd_hist[i] - macd_sig[i]) / (atr + 1e-9);
+      feat[14] = macd_sig[i]                  / (atr + 1e-9);
 
       // ── [15-17] stoch_k, stoch_d, stoch_kd_diff ─────────────
       feat[15] = sk_buf[i] / 100.0;
@@ -591,11 +593,24 @@ bool RunInference(float &probs[])
       feat[53] = (op - close_buf[MathMin(i+1,need-1)]) / (atr + 1e-9);
 
       // ── 一目均衡表 ──────────────────────────────────────────
-      double cloud_top = MathMax(ichi_spa[i], ichi_spb[i]);
-      double cloud_bot = MathMin(ichi_spa[i], ichi_spb[i]);
-      feat[54] = (ichi_tk[i] - ichi_kj[i])               / (atr + 1e-9); // ichi_tk_diff
-      feat[55] = (c - (cloud_top + cloud_bot) / 2.0)      / (atr + 1e-9); // ichi_cloud_pos
-      feat[56] = (cloud_top - cloud_bot)                  / (atr + 1e-9); // ichi_cloud_thick
+      // MT5のiIchimoku buffer[2/3](スパンA/B)は26本先行シフト済みのためPythonと不一致
+      // → Pythonと同じ「シフトなし」の現在値をtk/kjおよびhigh/lowから直接計算
+      double span_a_cur = (ichi_tk[i] + ichi_kj[i]) / 2.0;
+      {
+         // span_b_cur: 52本high/lowの中値 (Python: h.rolling(52).max/min / 2)
+         double hi52 = high_buf[i], lo52 = low_buf[i];
+         for(int k = 1; k < 52; k++){
+            int ki = MathMin(i + k, need - 1);
+            hi52 = MathMax(hi52, high_buf[ki]);
+            lo52 = MathMin(lo52, low_buf[ki]);
+         }
+         double span_b_cur = (hi52 + lo52) / 2.0;
+         double cloud_top = MathMax(span_a_cur, span_b_cur);
+         double cloud_bot = MathMin(span_a_cur, span_b_cur);
+         feat[54] = (ichi_tk[i] - ichi_kj[i])               / (atr + 1e-9); // ichi_tk_diff
+         feat[55] = (c - (cloud_top + cloud_bot) / 2.0)      / (atr + 1e-9); // ichi_cloud_pos
+         feat[56] = (cloud_top - cloud_bot)                  / (atr + 1e-9); // ichi_cloud_thick
+      }
 
       // ── 出来高 ─────────────────────────────────────────────
       double vol_ma20 = 0;
