@@ -820,32 +820,34 @@ def backtest(onnx_path, X_te, df_te, threshold, tp_mult, sl_mult,
                 if hi >= pos['sl']:   pnl = pos['entry'] - pos['sl'] - SPREAD
                 elif lo <= pos['tp']: pnl = pos['entry'] - pos['tp'] - SPREAD
             if pnl is None and age >= hold_bars:
-                pnl = (c - pos['entry']) * pos['side'] - SPREAD
+                # MT5は新バーのopen時点で決済 → open[bi]を使用
+                pnl = (open_arr[bi] - pos['entry']) * pos['side'] - SPREAD
             if pnl is not None:
                 trades.append({'pnl': pnl, 'side': pos['side'],
                                'date': date_str, 'entry': pos['entry']})
                 pos = None
 
         # エントリー: シグナルはbar[bi]のcloseで確定、約定は次バーのopenで行う
+        # TP/SL幅はシグナルバーのATR(a)を使用 → MT5のGetATR14(1)と一致
+        # エントリー条件は > (>=ではない) → MT5の p_buy > InpThreshold と一致
         if pos is None:
             p = probs[i]
             cls = int(np.argmax(p))
-            if p[cls] >= threshold and cls != 0:
+            if p[cls] > threshold and cls != 0:
                 next_bi = bi + 1
                 if next_bi >= len(close):
                     break  # 最終バーではエントリー不可
                 next_open = open_arr[next_bi]
-                next_a    = atr[next_bi]
                 if cls == 1:
                     entry = next_open + SPREAD
                     pos   = {'side': 1, 'entry': entry,
-                             'tp': entry + tp_mult * next_a,
-                             'sl': entry - sl_mult * next_a, 'i0': i}
+                             'tp': entry + tp_mult * a,
+                             'sl': entry - sl_mult * a, 'i0': i}
                 else:
                     entry = next_open - SPREAD
                     pos   = {'side': -1, 'entry': entry,
-                             'tp': entry - tp_mult * next_a,
-                             'sl': entry + sl_mult * next_a, 'i0': i}
+                             'tp': entry - tp_mult * a,
+                             'sl': entry + sl_mult * a, 'i0': i}
 
     MIN_TRADES = 30
 
@@ -1004,6 +1006,20 @@ def main():
     full = {**{k: v for k, v in vars(args).items() if k != 'out_dir'}, **r}
     (OUT_DIR / 'last_result.json').write_text(
         json.dumps(full, indent=2, ensure_ascii=False), encoding='utf-8')
+
+    # norm_params.json にEA用パラメータを追記
+    # EA はこのファイルを読んで threshold/tp/sl/hold_bars を自動適用する
+    try:
+        np_data = json.loads(NORM_PATH.read_text(encoding='utf-8'))
+        np_data['threshold'] = args.threshold
+        np_data['tp_atr']    = args.tp
+        np_data['sl_atr']    = args.sl
+        np_data['hold_bars'] = args.forward
+        NORM_PATH.write_text(json.dumps(np_data, indent=2, ensure_ascii=False),
+                             encoding='utf-8')
+        print(f"  norm_params更新: threshold={args.threshold} tp={args.tp} sl={args.sl} hold={args.forward}")
+    except Exception as e:
+        print(f"  [WARN] norm_params更新失敗: {e}")
 
     _write_trial_progress(OUT_DIR, {
         'trial': args.trial, 'arch': getattr(args, 'arch', '?'),

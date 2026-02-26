@@ -22,7 +22,7 @@ input string   InpModelFile  = "fx_model_best.onnx";        // ONNXモデル
 input string   InpNormFile   = "norm_params_best.json";     // 正規化パラメータ
 
 input group "=== エントリー設定 ==="
-input double   InpThreshold  = 0.40;   // エントリー確率閾値 (0.35-0.50)
+input double   InpThreshold  = 0.38;   // エントリー確率閾値
 input double   InpTpAtr      = 2.0;    // TP倍率 (ATR×)
 input double   InpSlAtr      = 1.0;    // SL倍率 (ATR×)
 input int      InpMaxHoldBars= 48;     // 最大保有バー数
@@ -48,6 +48,12 @@ double   g_std[70];
 int      g_feat_idx[];   // 使用特徴量インデックス (feat_indices)
 int      g_n_feat = 70;  // 選択特徴量数
 int      g_seq_len = 20; // シーケンス長
+
+// norm_params.json から読み込む取引パラメータ (未記載時はInpXxxの値を使用)
+double   g_threshold  = -1.0;  // -1 = norm_params未記載 → InpThreshold使用
+double   g_tp_atr     = -1.0;
+double   g_sl_atr     = -1.0;
+int      g_hold_bars  = -1;
 
 // インジケータハンドル
 int h_ema8, h_ema21, h_ema55, h_ema200;
@@ -104,7 +110,10 @@ int OnInit()
    }
 
    // ── ONNX モデル読み込み ──────────────────────────────────────
+   // まず MQL5\Files\ を試み、なければ共通フォルダを試みる
    g_model = OnnxCreate(InpModelFile, 0);
+   if(g_model == INVALID_HANDLE)
+      g_model = OnnxCreate(InpModelFile, ONNX_COMMON_FOLDER);
    if(g_model == INVALID_HANDLE)
    {
       Print("[EA] ONNX モデル読み込み失敗: ", InpModelFile,
@@ -160,7 +169,7 @@ void OnTick()
    // 時間フィルター
    if(InpTimeFilter)
    {
-      int h = TimeHour(TimeCurrent());
+      MqlDateTime _t; TimeToStruct(TimeCurrent(), _t); int h = _t.hour;
       if(h < InpStartHour || h >= InpEndHour) return;
    }
 
@@ -175,6 +184,14 @@ void OnTick()
    float p_buy  = probs[1];
    float p_sell = probs[2];
 
+   // デバッグ: 100バーに1回確率を出力
+   static int dbg_cnt = 0;
+   if(++dbg_cnt % 100 == 0)
+      Print("[PROB] hold=", DoubleToString(p_hold,3),
+            " buy=",  DoubleToString(p_buy,3),
+            " sell=", DoubleToString(p_sell,3),
+            " max=",  DoubleToString(MathMax(p_buy,p_sell),3));
+
    // ── ポジション有無を確認 ────────────────────────────────────
    bool has_pos = HasPosition();
    if(has_pos) return;  // 1ポジション管理
@@ -183,14 +200,19 @@ void OnTick()
    double atr = GetATR14(1);
    if(atr <= 0) return;
 
+   // norm_params.json のパラメータを優先、未記載ならInpXxxを使用
+   double use_threshold = (g_threshold > 0) ? g_threshold : InpThreshold;
+   double use_tp_atr    = (g_tp_atr    > 0) ? g_tp_atr    : InpTpAtr;
+   double use_sl_atr    = (g_sl_atr    > 0) ? g_sl_atr    : InpSlAtr;
+
    double ask = SymbolInfoDouble(_Symbol, SYMBOL_ASK);
    double bid = SymbolInfoDouble(_Symbol, SYMBOL_BID);
    double lot = LotSize();
 
-   if(p_buy > InpThreshold && p_buy > p_sell && p_buy > p_hold)
+   if(p_buy > use_threshold && p_buy > p_sell && p_buy > p_hold)
    {
-      double sl = ask - InpSlAtr * atr;
-      double tp = ask + InpTpAtr * atr;
+      double sl = ask - use_sl_atr * atr;
+      double tp = ask + use_tp_atr * atr;
       sl = NormalizeDouble(sl, _Digits);
       tp = NormalizeDouble(tp, _Digits);
       if(g_trade.Buy(lot, _Symbol, ask, sl, tp,
@@ -201,10 +223,10 @@ void OnTick()
                " p_buy=", p_buy);
       }
    }
-   else if(p_sell > InpThreshold && p_sell > p_buy && p_sell > p_hold)
+   else if(p_sell > use_threshold && p_sell > p_buy && p_sell > p_hold)
    {
-      double sl = bid + InpSlAtr * atr;
-      double tp = bid - InpTpAtr * atr;
+      double sl = bid + use_sl_atr * atr;
+      double tp = bid - use_tp_atr * atr;
       sl = NormalizeDouble(sl, _Digits);
       tp = NormalizeDouble(tp, _Digits);
       if(g_trade.Sell(lot, _Symbol, bid, sl, tp,
@@ -224,7 +246,8 @@ void ManagePosition()
 {
    if(!HasPosition()) { g_pos_bars = 0; return; }
    g_pos_bars++;
-   if(g_pos_bars >= InpMaxHoldBars)
+   int use_hold = (g_hold_bars > 0) ? g_hold_bars : InpMaxHoldBars;
+   if(g_pos_bars >= use_hold)
    {
       for(int i = PositionsTotal()-1; i >= 0; i--)
       {
@@ -258,7 +281,7 @@ bool HasPosition()
 //──────────────────────────────────────────────────────────────────
 bool RunInference(float &probs[])
 {
-   int need = g_seq_len + 250;  // インジケータウォームアップ分
+   int need = MathMax(g_seq_len + 250, 300);  // インジケータウォームアップ分 (最低300本)
 
    // ── インジケータバッファ取得 ────────────────────────────────
    double ema8_buf[],  ema21_buf[], ema55_buf[], ema200_buf[];
@@ -304,6 +327,7 @@ bool RunInference(float &probs[])
    if(CopyOpen (_Symbol, PERIOD_H1, 1, need, open_buf)  < need) return false;
    if(CopyTickVolume(_Symbol, PERIOD_H1, 1, need, vol_buf_tick) < need) return false;
    // TickVolumeをdoubleに変換
+   ArrayResize(vol_buf, need);
    for(int i=0; i<need; i++) vol_buf[i] = (double)vol_buf_tick[i];
 
    // ── 全70特徴量を seq_len バー分計算 ──────────────────────────
@@ -633,16 +657,14 @@ bool RunInference(float &probs[])
       feat[68] = (hr >= 13 && hr < 22) ? 1.0 : 0.0; // is_ny
       feat[69] = (hr >= 13 && hr < 16) ? 1.0 : 0.0; // is_overlap
 
-      // ── 特徴量選択 + 正規化 → 入力テンソルに書き込み ─────────
+      // ── 特徴量選択 → 入力テンソルに書き込み ─────────────────
+      // 正規化はモデル内部 (FXPredictorWithNorm) で実施済み → EA側では生値を渡す
       // テンソル順序: [seq_len-1-t] (古→新の時系列順)
       int row = g_seq_len - 1 - t;
       for(int f = 0; f < g_n_feat; f++)
       {
-         int fi  = g_feat_idx[f];  // 70次元中のインデックス
-         double v = (feat[fi] - g_mean[f]) / (g_std[f] + 1e-9);
-         // float32に収める (±5でクリップ)
-         v = MathMax(-5.0, MathMin(5.0, v));
-         input_data[row * g_n_feat + f] = (float)v;
+         int fi = g_feat_idx[f];  // 70次元中のインデックス
+         input_data[row * g_n_feat + f] = (float)feat[fi];
       }
    }
 
@@ -654,12 +676,10 @@ bool RunInference(float &probs[])
       return false;
    }
 
-   // Softmax 正規化
-   double s = 0;
-   for(int i=0;i<3;i++) s += MathExp(output_data[i]);
-   probs[0] = (float)(MathExp(output_data[0]) / s);
-   probs[1] = (float)(MathExp(output_data[1]) / s);
-   probs[2] = (float)(MathExp(output_data[2]) / s);
+   // モデル出力は既にSoftmax確率 → そのままコピー
+   probs[0] = output_data[0];  // P(HOLD)
+   probs[1] = output_data[1];  // P(BUY)
+   probs[2] = output_data[2];  // P(SELL)
 
    return true;
 }
@@ -701,7 +721,7 @@ double GetATR14(int shift = 1)
 //──────────────────────────────────────────────────────────────────
 double LotSize()
 {
-   double free_margin = AccountInfoDouble(ACCOUNT_FREEMARGIN);
+   double free_margin = AccountInfoDouble(ACCOUNT_MARGIN_FREE);
    int magnification;
    string currency = AccountInfoString(ACCOUNT_CURRENCY);
    magnification = (currency == "JPY") ? 10000 : 100;
@@ -726,7 +746,10 @@ double LotSize()
 //──────────────────────────────────────────────────────────────────
 bool LoadNormParams(string filename)
 {
+   // まず通常の MQL5\Files\ を試み、なければ共通フォルダ (FILE_COMMON) を試みる
    int fh = FileOpen(filename, FILE_READ | FILE_TXT | FILE_ANSI);
+   if(fh == INVALID_HANDLE)
+      fh = FileOpen(filename, FILE_READ | FILE_TXT | FILE_ANSI | FILE_COMMON);
    if(fh == INVALID_HANDLE)
    {
       Print("[EA] ファイルを開けません: ", filename);
@@ -790,7 +813,26 @@ bool LoadNormParams(string filename)
       }
    }
 
-   Print("[EA] norm_params読込完了  feat=", g_n_feat, " seq=", g_seq_len);
+   // ── 取引パラメータ読み込み (threshold / tp_atr / sl_atr / hold_bars) ──
+   // 記載がある場合のみ上書き。なければ Inp*** のデフォルト値を使用
+   g_threshold = ParseJsonDouble(content, "\"threshold\"", g_threshold);
+   g_tp_atr    = ParseJsonDouble(content, "\"tp_atr\"",    g_tp_atr);
+   g_sl_atr    = ParseJsonDouble(content, "\"sl_atr\"",    g_sl_atr);
+   {
+      double hb = ParseJsonDouble(content, "\"hold_bars\"", -1.0);
+      if(hb > 0) g_hold_bars = (int)hb;
+   }
+
+   string thr_src  = (g_threshold > 0) ? "norm_params" : "InpThreshold";
+   string tp_src   = (g_tp_atr    > 0) ? "norm_params" : "InpTpAtr";
+   double thr_use  = (g_threshold > 0) ? g_threshold : InpThreshold;
+   double tp_use   = (g_tp_atr    > 0) ? g_tp_atr    : InpTpAtr;
+   double sl_use   = (g_sl_atr    > 0) ? g_sl_atr    : InpSlAtr;
+   int    hb_use   = (g_hold_bars > 0) ? g_hold_bars  : InpMaxHoldBars;
+
+   Print("[EA] norm_params読込完了  feat=", g_n_feat, " seq=", g_seq_len,
+         "  threshold=", thr_use, "(", thr_src, ")",
+         "  tp=", tp_use, "  sl=", sl_use, "  hold=", hb_use);
    return true;
 }
 
@@ -817,4 +859,24 @@ bool ParseJsonArray(string &content, string key, double &out[], int max_size)
       out[i] = StringToDouble(parts[i]);
    }
    return true;
+}
+
+//──────────────────────────────────────────────────────────────────
+// JSON スカラー値パーサ (数値のみ対応)
+//──────────────────────────────────────────────────────────────────
+double ParseJsonDouble(const string &content, string key, double default_val)
+{
+   int pos = StringFind(content, key);
+   if(pos < 0) return default_val;
+   int colon = StringFind(content, ":", pos);
+   if(colon < 0) return default_val;
+   int nc  = StringFind(content, ",", colon);
+   int nb  = StringFind(content, "}", colon);
+   int end = (nc >= 0 && (nb < 0 || nc < nb)) ? nc : nb;
+   if(end < 0) return default_val;
+   string val = StringSubstr(content, colon + 1, end - colon - 1);
+   StringTrimLeft(val);
+   StringTrimRight(val);
+   if(StringLen(val) == 0) return default_val;
+   return StringToDouble(val);
 }
