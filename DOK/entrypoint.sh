@@ -81,6 +81,11 @@ MAX_LENGTH="${LLM_MAX_LENGTH:-1024}"
 LR="${LLM_LR:-5e-5}"
 SKIP_DATASET="${LLM_SKIP_DATASET:-}"
 RESUME="${LLM_RESUME:-}"
+USE_V2="${LLM_V2:-}"
+USE_COT="${LLM_COT:-}"
+
+# 起動時に前回の停止フラグをクリア
+rm -f /workspace/stop.flag
 
 echo "[*] パイプライン設定:"
 echo "    モデル      : ${MODEL_ID}"
@@ -102,6 +107,8 @@ PIPELINE_ARGS=(
 )
 [ -n "${SKIP_DATASET}" ] && PIPELINE_ARGS+=("--skip_dataset")
 [ -n "${RESUME}"       ] && PIPELINE_ARGS+=("--resume")
+[ -n "${USE_V2}"       ] && PIPELINE_ARGS+=("--v2")
+[ -n "${USE_COT}"      ] && PIPELINE_ARGS+=("--cot")
 
 # ── 6. パイプライン実行 ───────────────────────────────────────────────────────
 echo ""

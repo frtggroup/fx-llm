@@ -1,0 +1,90 @@
+# ─────────────────────────────────────────────────────────────────────────────
+# FX LLM Fine-tuning v2 — Sakura DOK / H100 80GB
+#
+# v1 との差分:
+#   - llm_dataset_v2.py (改善版プロンプト・CoT対応)
+#   - dataset_prep_v2.py / backtest_report_v2.py
+#   - max_seq_length=1536 (v2プロンプトが長い)
+#   - 学習停止ボタン対応 (/workspace/stop.flag)
+#   - エポック別ベストモデル保存 (llm_adapter_ep01/ など)
+#   - ダッシュボードUIをlocal_monitor.htmlと統一
+#
+# Build from repo root:
+#   docker build -f DOK/Dockerfile.v2 -t fx-llm-v2:latest .
+#
+# Push:
+#   docker tag fx-llm-v2:latest <USER>/fx-llm-v2:latest
+#   docker push <USER>/fx-llm-v2:latest
+# ─────────────────────────────────────────────────────────────────────────────
+FROM pytorch/pytorch:2.5.1-cuda12.4-cudnn9-runtime
+
+ENV DEBIAN_FRONTEND=noninteractive \
+    PYTHONUNBUFFERED=1 \
+    PYTORCH_CUDA_ALLOC_CONF=expandable_segments:True \
+    HF_HOME=/workspace/hf_cache \
+    TRANSFORMERS_CACHE=/workspace/hf_cache \
+    WORKSPACE=/workspace
+
+# ── System packages ──────────────────────────────────────────────────────────
+RUN apt-get update && apt-get install -y --no-install-recommends \
+        openssh-server \
+        curl \
+        git \
+        vim \
+        wget \
+        tmux \
+        htop \
+        rsync \
+        gcc \
+        g++ \
+        build-essential \
+    && apt-get clean && rm -rf /var/lib/apt/lists/*
+
+# ── Python packages ──────────────────────────────────────────────────────────
+COPY DOK/requirements.txt /tmp/requirements.txt
+RUN pip install --upgrade pip && \
+    pip install --no-cache-dir -r /tmp/requirements.txt
+
+# ── SSH setup ────────────────────────────────────────────────────────────────
+RUN mkdir -p /var/run/sshd /root/.ssh && \
+    chmod 700 /root/.ssh && \
+    echo "PermitRootLogin yes"     >> /etc/ssh/sshd_config && \
+    echo "PasswordAuthentication no"  >> /etc/ssh/sshd_config && \
+    echo "PubkeyAuthentication yes"   >> /etc/ssh/sshd_config && \
+    echo "AllowTcpForwarding yes"     >> /etc/ssh/sshd_config
+
+COPY DOK/ssh/authorized_keys /root/.ssh/authorized_keys
+RUN chmod 600 /root/.ssh/authorized_keys
+
+# ── Source files ─────────────────────────────────────────────────────────────
+COPY ai_ea/ /workspace/ai_ea/
+COPY DOK/src/ /workspace/src/
+COPY DOK/mql5/ /workspace/mql5/
+COPY DOK/entrypoint.sh /workspace/entrypoint.sh
+RUN chmod +x /workspace/entrypoint.sh
+
+# ── Directories ──────────────────────────────────────────────────────────────
+RUN mkdir -p /workspace/data \
+             /workspace/output \
+             /workspace/reports \
+             /workspace/mql5 \
+             /workspace/hf_cache
+
+WORKDIR /workspace
+
+# 22=SSH  7860=Dashboard
+EXPOSE 22 7860
+
+# ── デフォルト環境変数 (DOK UI で上書き可能) ─────────────────────────────────
+# v2プロンプト使用
+ENV LLM_V2=1 \
+    LLM_MODEL_ID=Qwen/Qwen3-8B \
+    LLM_EPOCHS=10 \
+    LLM_BATCH=8 \
+    LLM_GRAD_ACCUM=8 \
+    LLM_LORA_R=64 \
+    LLM_LORA_ALPHA=128 \
+    LLM_MAX_LENGTH=1536 \
+    LLM_LR=5e-5
+
+ENTRYPOINT ["/workspace/entrypoint.sh"]

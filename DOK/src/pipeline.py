@@ -10,6 +10,8 @@ FX LLM H100 パイプライン
 import sys, os, subprocess, json, time
 from pathlib import Path
 
+STOP_FLAG = Path('/workspace/stop.flag')
+
 sys.path.insert(0, '/workspace/ai_ea')
 sys.path.insert(0, '/workspace/src')
 
@@ -72,6 +74,10 @@ def main():
     p.add_argument('--skip_train',   action='store_true',
                    help='訓練をスキップ (既存アダプターでバックテストのみ)')
     p.add_argument('--resume',       action='store_true')
+    p.add_argument('--v2',           action='store_true',
+                   help='v2プロンプト+v2データセットで訓練・評価する')
+    p.add_argument('--cot',          action='store_true',
+                   help='v2+CoTラベルを使用する (--v2 も自動ON)')
     args = p.parse_args()
 
     OUTPUT_DIR.mkdir(parents=True, exist_ok=True)
@@ -87,6 +93,8 @@ def main():
     })
 
     t_start = time.time()
+
+    use_v2 = args.v2 or args.cot
 
     # ── STEP 1: データセット生成 ───────────────────────────────────────────
     if not args.skip_dataset:
@@ -105,14 +113,23 @@ def main():
             'message': f'データセット生成中... ({csv_path.name})',
         })
 
-        ok = run_step('データセット生成', [
-            sys.executable, '/workspace/src/dataset_prep.py',
+        prep_script = '/workspace/src/dataset_prep_v2.py' if use_v2 \
+                      else '/workspace/src/dataset_prep.py'
+        prep_cmd = [
+            sys.executable, prep_script,
             '--csv',      str(csv_path),
             '--seq_len',  str(args.seq_len),
             '--tp',       str(args.tp),
             '--sl',       str(args.sl),
             '--out_dir',  str(OUTPUT_DIR),
-        ])
+        ]
+        if use_v2 and args.cot:
+            prep_cmd.append('--cot')
+
+        label = 'データセット生成 v2 (CoT)' if args.cot else \
+                'データセット生成 v2'       if use_v2 else \
+                'データセット生成'
+        ok = run_step(label, prep_cmd)
         if not ok:
             sys.exit(1)
     else:
@@ -120,6 +137,13 @@ def main():
 
     # ── STEP 2: H100 ファインチューニング ─────────────────────────────────
     if not args.skip_train:
+        # v2 ではデータファイル名が llm_train_v2[_cot].jsonl
+        cot_suffix = '_cot' if args.cot else ''
+        train_jsonl = str(OUTPUT_DIR / f'llm_train_v2{cot_suffix}.jsonl') if use_v2 \
+                      else str(OUTPUT_DIR / 'llm_train.jsonl')
+        adapter_out = str(OUTPUT_DIR / 'llm_adapter_best_v2') if use_v2 \
+                      else str(OUTPUT_DIR / 'llm_adapter_best')
+
         train_cmd = [
             sys.executable, '/workspace/src/train_h100.py',
             '--model_id',   args.model_id,
@@ -128,8 +152,10 @@ def main():
             '--grad_accum', str(args.grad_accum),
             '--lora_r',     str(args.lora_r),
             '--lora_alpha', str(args.lora_alpha),
-            '--max_length', str(args.max_length),
+            '--max_length', '1536' if use_v2 else str(args.max_length),
             '--lr',         str(args.lr),
+            '--train_jsonl', train_jsonl,
+            '--adapter_out', adapter_out,
         ]
         if args.resume:
             train_cmd.append('--resume')
@@ -140,12 +166,28 @@ def main():
     else:
         print("  訓練: スキップ", flush=True)
 
+    # 停止フラグが残っていれば削除（訓練スクリプト内で削除されるはずだが念のため）
+    if STOP_FLAG.exists():
+        STOP_FLAG.unlink()
+        print("  [INFO] 停止フラグをクリア → バックテスト・完了処理を続行", flush=True)
+        write_progress({'stop_requested': False, 'message': '停止後バックテスト実行中...'})
+
     # ── STEP 3: バックテスト + レポート ───────────────────────────────────
-    ok = run_step('バックテスト + HTML レポート生成', [
-        sys.executable, '/workspace/src/backtest_report.py',
-        '--tp', str(args.tp),
-        '--sl', str(args.sl),
-    ])
+    if use_v2:
+        bt_cmd = [
+            sys.executable, '/workspace/src/backtest_report_v2.py',
+            '--tp', str(args.tp),
+            '--sl', str(args.sl),
+        ]
+        if args.cot:
+            bt_cmd.append('--cot')
+        ok = run_step('バックテスト + HTML レポート生成 (v2)', bt_cmd)
+    else:
+        ok = run_step('バックテスト + HTML レポート生成', [
+            sys.executable, '/workspace/src/backtest_report.py',
+            '--tp', str(args.tp),
+            '--sl', str(args.sl),
+        ])
     if not ok:
         sys.exit(1)
 

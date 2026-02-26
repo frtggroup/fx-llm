@@ -37,6 +37,7 @@ TRAIN_JSONL  = WORKSPACE / 'output' / 'llm_train.jsonl'
 TEST_JSONL   = WORKSPACE / 'output' / 'llm_test.jsonl'
 RESULT_JSON  = WORKSPACE / 'output' / 'llm_train_result.json'
 PROGRESS_JSON= WORKSPACE / 'progress.json'
+STOP_FLAG    = WORKSPACE / 'stop.flag'
 
 DEFAULT_MODEL = "Qwen/Qwen3-8B"
 LABEL_NAMES   = ['HOLD', 'BUY', 'SELL']
@@ -287,11 +288,17 @@ def train(args):
     })
 
     # ── データ読み込み ────────────────────────────────────────────────────────
-    if not TRAIN_JSONL.exists():
-        print(f"[ERROR] {TRAIN_JSONL} がありません。pipeline.py を実行してください")
+    # --train_jsonl / --adapter_out で明示指定されている場合はそちらを優先
+    _train_jsonl = Path(args.train_jsonl) if args.train_jsonl else TRAIN_JSONL
+    _test_jsonl  = _train_jsonl.parent / _train_jsonl.name.replace('train', 'test')
+    _best_dir    = Path(args.adapter_out) if args.adapter_out else BEST_DIR
+    _adapter_dir = _best_dir.parent / (_best_dir.name.replace('_best', ''))
+
+    if not _train_jsonl.exists():
+        print(f"[ERROR] {_train_jsonl} がありません。pipeline.py を実行してください")
         sys.exit(1)
-    train_raw = load_jsonl(TRAIN_JSONL)
-    test_raw  = load_jsonl(TEST_JSONL)
+    train_raw = load_jsonl(_train_jsonl)
+    test_raw  = load_jsonl(_test_jsonl) if _test_jsonl.exists() else []
     # H100: 件数制限なし (max_train=0 がデフォルト)
     if args.max_train > 0 and len(train_raw) > args.max_train:
         rng = np.random.default_rng(args.seed)
@@ -544,11 +551,17 @@ def train(args):
 
         if is_best:
             best_acc = ev['accuracy']
-            BEST_DIR.mkdir(parents=True, exist_ok=True)
-            model.save_pretrained(str(BEST_DIR))
-            tokenizer.save_pretrained(str(BEST_DIR))
+            # ── ベストモデルをエポック番号付きで個別保存 ──────────────────
+            epoch_best_dir = _best_dir.parent / f'llm_adapter_ep{epoch:02d}'
+            _best_dir.mkdir(parents=True, exist_ok=True)
+            epoch_best_dir.mkdir(parents=True, exist_ok=True)
+            model.save_pretrained(str(_best_dir))        # 最新 best (上書き)
+            model.save_pretrained(str(epoch_best_dir))   # エポック別 best (追加保存)
+            tokenizer.save_pretrained(str(_best_dir))
+            tokenizer.save_pretrained(str(epoch_best_dir))
             no_imp_acc = 0
-            print(f"  [BEST] acc={best_acc:.4f}  val_loss={val_loss:.4f}", flush=True)
+            print(f"  [BEST] ep={epoch}  acc={best_acc:.4f}  val_loss={val_loss:.4f}"
+                  f"  → {epoch_best_dir.name}", flush=True)
         else:
             no_imp_acc += 1
 
@@ -586,6 +599,16 @@ def train(args):
                         f'acc={ev["accuracy"]:.4f}'),
         })
 
+        # ── 停止フラグ チェック ────────────────────────────────────────────
+        if STOP_FLAG.exists():
+            print(f"  [STOP] 停止フラグ検知 → エポック {epoch} 完了後に停止します",
+                  flush=True)
+            update_progress({
+                'phase': 'stopping',
+                'message': f'⏹ 停止フラグ検知 — Epoch {epoch} 完了でトレーニング停止',
+            })
+            break
+
         stop_reason = None
         if no_imp_val >= patience_ov:
             stop_reason = f'過学習検知: val_loss が {patience_ov} epoch 連続悪化'
@@ -595,14 +618,23 @@ def train(args):
             print(f"  [EARLY STOP] {stop_reason}", flush=True)
             break
 
-    # 最良アダプターを確定保存
-    if BEST_DIR.exists():
-        import shutil
-        ADAPTER_DIR.mkdir(parents=True, exist_ok=True)
-        for f in BEST_DIR.iterdir():
-            shutil.copy(f, ADAPTER_DIR)
-    model.save_pretrained(str(ADAPTER_DIR))
-    tokenizer.save_pretrained(str(ADAPTER_DIR))
+    # ── 最良アダプターを確定保存 ─────────────────────────────────────────────
+    # _best_dir に best が入っている。_adapter_dir にもコピーして後続ステップが参照できるようにする。
+    import shutil
+    if _best_dir.exists():
+        _adapter_dir.mkdir(parents=True, exist_ok=True)
+        for fn in _best_dir.iterdir():
+            shutil.copy2(fn, _adapter_dir)
+        print(f"  [SAVE] ベストモデルを {_adapter_dir} にコピー完了", flush=True)
+    else:
+        # best が一度も更新されなかった場合は現在のモデルを保存
+        model.save_pretrained(str(_adapter_dir))
+        tokenizer.save_pretrained(str(_adapter_dir))
+        print(f"  [SAVE] (best未更新) 現モデルを {_adapter_dir} に保存", flush=True)
+
+    # 停止フラグを削除（後続パイプラインが正常終了できるよう）
+    if STOP_FLAG.exists():
+        STOP_FLAG.unlink()
 
     total_elapsed = time.time() - train_start
     result = {
@@ -663,6 +695,10 @@ def parse_args():
     p.add_argument('--compile',      action='store_true', default=True,
                    help='torch.compile 有効化 (H100 推奨)')
     p.add_argument('--resume',       action='store_true')
+    p.add_argument('--train_jsonl',  type=str, default='',
+                   help='訓練データ JSONL パス (省略時はデフォルト)')
+    p.add_argument('--adapter_out',  type=str, default='',
+                   help='ベストアダプター出力先ディレクトリ (省略時はデフォルト)')
     return p.parse_args()
 
 
