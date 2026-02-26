@@ -1,9 +1,10 @@
 """
-FX AI EA 自動トレーニング v7 - 並列ランダムサーチ
+FX AI EA 自動トレーニング v8 - ハイブリッド遺伝的アルゴリズム
+  ・最初の 500 件: ランダムサーチ (探索フェーズ)
+  ・501 件以降: 75% 遺伝的アルゴリズム (TOP 結果を交叉・突然変異) + 25% ランダム
   ・VRAM / GPU 使用率を監視して動的に並列数を決定
   ・停止条件なし (stop.flag が置かれるまで無限継続)
   ・TOP100 モデル保存 + SR / DD / 資産曲線レポート
-  ・H100_MODE=1 で大型モデル / 大バッチ
 """
 import os, subprocess, sys, json, shutil, time, random, threading
 from pathlib import Path
@@ -26,7 +27,10 @@ BEST_ONNX     = OUT_DIR / 'fx_model_best.onnx'
 BEST_NORM     = OUT_DIR / 'norm_params_best.json'
 BEST_JSON     = OUT_DIR / 'best_result.json'
 
-TOP_N         = 100
+TOP_N              = 100
+RANDOM_PHASE_LIMIT = 500    # この件数までは純ランダム、以降は GA 主体
+GA_RATIO           = 0.75   # GA の割合 (残りはランダム)
+GA_PARENT_POOL     = 20     # 親候補を上位何件から選ぶか
 H100_MODE     = os.environ.get('H100_MODE', '0') == '1'
 MAX_PARALLEL  = int(os.environ.get('MAX_PARALLEL', '3' if H100_MODE else '1'))
 VRAM_PER_TRIAL= float(os.environ.get('VRAM_PER_TRIAL', '10'))   # GB
@@ -105,6 +109,108 @@ def sample_params(rng: random.Random) -> dict:
         seed=seed, timeframe='H1', epochs=EPOCH_COUNT,
         label_type='triple_barrier',
     )
+
+
+# ── 遺伝的アルゴリズム ────────────────────────────────────────────────────────
+def _mutate(params: dict, rng: random.Random) -> dict:
+    """1 パラメータをランダムに突然変異させる"""
+    p = dict(params)
+    key = rng.choice([
+        'arch', 'hidden', 'layers', 'dropout', 'lr', 'batch',
+        'tp', 'sl', 'forward', 'threshold', 'seq_len',
+        'scheduler', 'wd', 'train_months',
+    ])
+    if key == 'arch':
+        p['arch']    = rng.choice(ARCHS)
+        p['hidden']  = rng.choice(HIDDEN_MAP[p['arch']])
+    elif key == 'hidden':
+        p['hidden']  = rng.choice(HIDDEN_MAP[p['arch']])
+    elif key == 'layers':
+        p['layers']  = rng.choice([1, 2, 3] if p['arch'] not in ('mlp','gru_attn') else [1,2])
+    elif key == 'dropout':
+        p['dropout'] = round(rng.uniform(0.3, 0.6), 1)
+    elif key == 'lr':
+        p['lr']      = rng.choice([1e-4, 3e-4, 5e-4, 8e-4, 1e-3, 2e-3]
+                                   if H100_MODE else [1e-4, 3e-4, 5e-4, 8e-4, 1e-3])
+    elif key == 'batch':
+        p['batch']   = (rng.choice([2048, 4096, 8192]) if H100_MODE and p['hidden'] >= 1024
+                        else rng.choice(BATCH_CHOICES))
+    elif key == 'tp':
+        p['tp']      = round(rng.uniform(1.5, 3.5), 1)
+    elif key == 'sl':
+        p['sl']      = round(rng.uniform(0.5, 1.5), 1)
+    elif key == 'forward':
+        p['forward'] = rng.choice([10, 15, 20, 25, 30])
+    elif key == 'threshold':
+        p['threshold'] = round(rng.uniform(0.33, 0.50), 2)
+    elif key == 'seq_len':
+        p['seq_len'] = rng.choice(SEQ_CHOICES)
+    elif key == 'scheduler':
+        p['sched']   = rng.choice(['onecycle', 'cosine'])
+    elif key == 'wd':
+        p['wd']      = rng.choice([1e-3, 1e-2, 5e-2, 1e-1])
+    elif key == 'train_months':
+        p['train_months'] = rng.choice([0, 0, 0, 12, 18, 12])
+    p['seed'] = rng.randint(0, 9999)
+    return p
+
+
+def _crossover(p1: dict, p2: dict, rng: random.Random) -> dict:
+    """2 つの親パラメータを 1 点交叉で混合"""
+    keys = [
+        'arch', 'hidden', 'layers', 'dropout', 'lr', 'batch',
+        'tp', 'sl', 'forward', 'threshold', 'seq_len',
+        'scheduler', 'wd', 'train_months', 'feat_set', 'n_features',
+    ]
+    child = dict(p1)
+    for k in keys:
+        if rng.random() < 0.5 and k in p2:
+            child[k] = p2[k]
+    # arch と hidden の組み合わせが崩れていたら修正
+    if child['hidden'] not in HIDDEN_MAP.get(child['arch'], [child['hidden']]):
+        child['hidden'] = rng.choice(HIDDEN_MAP[child['arch']])
+    child['seed'] = rng.randint(0, 9999)
+    child['epochs'] = EPOCH_COUNT
+    child['timeframe'] = 'H1'
+    child['label_type'] = 'triple_barrier'
+    return child
+
+
+def _tournament_select(pool: list, rng: random.Random, k: int = 4) -> dict:
+    """トーナメント選択: pool から k 件を引いて PF 最大を返す"""
+    candidates = rng.sample(pool, min(k, len(pool)))
+    return max(candidates, key=lambda r: r['pf'])
+
+
+def ga_sample(results: list, rng: random.Random) -> dict:
+    """遺伝的アルゴリズムでパラメータを生成する (突然変異か交叉を確率的に選択)"""
+    valid = [r for r in results if r.get('pf', 0) > 0 and r.get('trades', 0) >= 200]
+    if len(valid) < 2:
+        return sample_params(rng)   # 候補不足ならランダムにフォールバック
+
+    pool = sorted(valid, key=lambda x: -x['pf'])[:GA_PARENT_POOL]
+
+    if rng.random() < 0.5:
+        # 交叉: 親 2 体を選んでパラメータを混合
+        p1 = _tournament_select(pool, rng)
+        p2 = _tournament_select(pool, rng)
+        child = _crossover(p1, p2, rng)
+    else:
+        # 突然変異: 親 1 体から 1 パラメータを変える
+        p1    = _tournament_select(pool, rng)
+        child = _mutate(p1, rng)
+
+    return child
+
+
+def next_params(results: list, rng: random.Random) -> tuple[dict, str]:
+    """完了件数に応じて GA / ランダムを切り替えてパラメータと戦略名を返す"""
+    n = len(results)
+    if n < RANDOM_PHASE_LIMIT:
+        return sample_params(rng), 'random'
+    if rng.random() < GA_RATIO:
+        return ga_sample(results, rng), 'GA'
+    return sample_params(rng), 'random'
 
 
 # ── GPU 情報取得 ─────────────────────────────────────────────────────────────
@@ -193,6 +299,7 @@ def write_progress(running: dict, results: list, best_pf: float, start: float) -
             'val_loss':    tp.get('val_loss', 0.0),
             'accuracy':    tp.get('accuracy', 0.0),
             'phase':       tp.get('phase', 'running'),
+            'strategy':    info.get('strategy', 'random'),
             'elapsed_sec': round(time.time() - info['start_time'], 0),
         })
 
@@ -207,9 +314,14 @@ def write_progress(running: dict, results: list, best_pf: float, start: float) -
             except Exception:
                 pass
 
+    n_done    = len(results)
+    search_phase = ('random' if n_done < RANDOM_PHASE_LIMIT
+                    else f'GA {int(GA_RATIO*100)}% + random {int((1-GA_RATIO)*100)}%')
     progress = {
         'phase':           'training' if running else 'waiting',
-        'completed_count': len(results),
+        'search_phase':    search_phase,
+        'completed_count': n_done,
+        'random_phase_limit': RANDOM_PHASE_LIMIT,
         'running_count':   len(running),
         'running_trials':  running_info,
         'best_pf':         best_pf,
@@ -221,8 +333,8 @@ def write_progress(running: dict, results: list, best_pf: float, start: float) -
         'gpu_pct':         gi['gpu_pct'],
         'vram_used_gb':    round(gi['used_gb'], 1),
         'vram_total_gb':   round(gi['total_gb'], 1),
-        'message': (f"実行中: {len(running)}並列  完了: {len(results)}件  "
-                    f"ベスト PF: {best_pf:.4f}  "
+        'message': (f"実行中: {len(running)}並列  完了: {n_done}件  "
+                    f"ベスト PF: {best_pf:.4f}  [{search_phase}]  "
                     f"GPU: {gi['gpu_pct']}%  VRAM: {gi['used_gb']:.1f}/{gi['total_gb']:.0f}GB"),
     }
     try:
@@ -239,7 +351,8 @@ class ParallelTrainer:
         self.running: dict = {}   # trial_no -> {proc, params, start_time, trial_dir, log_fh}
         self.lock = threading.Lock()
 
-    def launch(self, trial_no: int, params: dict, best_pf: float, start_time: float):
+    def launch(self, trial_no: int, params: dict, best_pf: float, start_time: float,
+               strategy: str = 'random'):
         trial_dir = TRIALS_DIR / f'trial_{trial_no:06d}'
         trial_dir.mkdir(parents=True, exist_ok=True)
 
@@ -263,10 +376,12 @@ class ParallelTrainer:
                 'start_time': time.time(),
                 'trial_dir':  trial_dir,
                 'log_fh':     log_fh,
+                'strategy':   strategy,
             }
         feat_info = (f"set#{params['feat_set']}"
                      if params.get('feat_set', -1) >= 0 else f"rand{params['n_features']}")
-        print(f"  [LAUNCH] 試行#{trial_no:4d}  {params['arch']:12s}  "
+        tag = '🧬GA' if strategy == 'GA' else '🎲Rnd'
+        print(f"  [LAUNCH] 試行#{trial_no:4d} {tag}  {params['arch']:12s}  "
               f"h={params['hidden']:4d}  feat={feat_info}  PID={proc.pid}")
 
     def poll_completed(self) -> list:
@@ -365,6 +480,7 @@ def main():
             record = {
                 'trial':     tno,
                 'timestamp': time.strftime('%Y-%m-%d %H:%M:%S'),
+                'strategy':  info.get('strategy', 'random'),
                 'pf':        pf,
                 'trades':    trades,
                 'win_rate':  r.get('win_rate',      0.0),
@@ -418,8 +534,8 @@ def main():
         while len(trainer) < max_par:
             if STOP_FLAG.exists():
                 break
-            p = sample_params(rng)
-            trainer.launch(trial_no, p, best_pf, start)
+            p, strategy = next_params(results, rng)
+            trainer.launch(trial_no, p, best_pf, start, strategy)
             trial_no += 1
             time.sleep(2)   # 連続起動の間隔
 
