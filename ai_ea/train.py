@@ -41,7 +41,7 @@ import random as _random
 from model    import build_model, FXPredictorWithNorm, export_onnx, verify_onnx, ARCH_MAP
 from dashboard import update_dashboard
 
-_DEFAULT_DATA = str(Path(__file__).parent.parent / 'USDJPY_M1_202301012206_202602250650.csv')
+_DEFAULT_DATA = str(Path(__file__).parent.parent / 'USDJPY_M1_202301020700_202602262003.csv')
 DATA_PATH = Path(os.environ.get('DATA_PATH', _DEFAULT_DATA))
 OUT_DIR   = Path(__file__).parent
 ONNX_PATH = OUT_DIR / 'fx_model.onnx'
