@@ -7,9 +7,27 @@ CUDA GPU 学習スクリプト v3
 使用方法:
     py -3.12 train.py [オプション]
 """
-import os, sys, json, argparse, time
+import os, sys, json, argparse, time, threading
 from pathlib import Path
 from datetime import timedelta
+
+# ── 非同期ファイル書き込みエグゼキューター ─────────────────────────────────────
+# GPU訓練ループをブロックしないよう、ファイルI/OはバックグラウンドスレッドでOK
+_last_write_thread: threading.Thread | None = None
+
+def _async_write(path: Path, text: str) -> None:
+    """ノンブロッキング: バックグラウンドで tmp→rename アトミック書き込み"""
+    global _last_write_thread
+    def _do():
+        try:
+            tmp = path.with_suffix('.tmp')
+            tmp.write_text(text, encoding='utf-8')
+            tmp.replace(path)
+        except Exception:
+            pass
+    # 前のスレッドが生きていてもスキップせず新スレッドで上書き
+    _last_write_thread = threading.Thread(target=_do, daemon=True)
+    _last_write_thread.start()
 
 import numpy as np
 import torch
@@ -337,13 +355,19 @@ def train(args, X_tr, y_tr, X_te, y_te, mean, std, n_feat=None):
         ).to(device)
 
     # H100: torch.compile で GPU カーネル効率を向上
-    # reduce-overhead: 並列サーチに最適 (初回コンパイル ~30秒)
-    # max-autotune: 初回コンパイル10-30分のためシングルモードのみ
+    # reduce-overhead: CUDAグラフキャプチャで各バッチのPythonオーバーヘッドをほぼゼロ化
     if is_h100:
         compile_mode = 'max-autotune' if not getattr(args, 'out_dir', '') else 'reduce-overhead'
         try:
             model = torch.compile(model, mode=compile_mode)
-            print(f"  torch.compile({compile_mode}) 有効")
+            print(f"  torch.compile({compile_mode}) 有効 → ウォームアップ実行中...")
+            # 訓練ループ前にコンパイルを完了させる (初回run時に発生する遅延を除去)
+            _wup_x, _wup_y = next(iter(tr_dl))
+            with torch.amp.autocast('cuda', enabled=use_amp, dtype=amp_dtype):
+                _ = model(_wup_x)       # forward: グラフキャプチャ
+            del _wup_x, _wup_y
+            torch.cuda.synchronize()
+            print(f"  torch.compile ウォームアップ完了")
         except Exception as e:
             print(f"  torch.compile スキップ: {e}")
 
@@ -400,9 +424,12 @@ def train(args, X_tr, y_tr, X_te, y_te, mean, std, n_feat=None):
     recent_gaps    = []
     prev_v_loss    = float('inf')    # val_loss の前エポック値 (下降判定用)
     # バリデーション頻度: エポック数に応じて調整 (GPU稼働率向上)
-    # 2000ep → 5ep毎, 800ep → 3ep毎
-    val_every = max(1, args.epochs // 400)
-    print(f"  early_stop: ep{min_epochs}～, patience={patience}, wd={wd}, val_every={val_every}")
+    # 2000ep → 10ep毎 (200回), 800ep → 4ep毎
+    val_every    = max(1, args.epochs // 200)
+    # 進捗JSON書き込み頻度 (非同期だが頻度を下げることで辞書更新コストも削減)
+    progress_every = max(5, args.epochs // 100)
+    print(f"  early_stop: ep{min_epochs}～, patience={patience}, wd={wd}"
+          f"  val_every={val_every}  progress_every={progress_every}")
 
     v_loss = float('inf')   # 最初のvalidationまでの初期値
     acc    = 0.0
@@ -448,8 +475,8 @@ def train(args, X_tr, y_tr, X_te, y_te, mean, std, n_feat=None):
                   f"tr={t_loss:.4f}  va={v_loss:.4f}  "
                   f"gap={gap:+.4f}  acc={acc:.3f}  lr={lr_now:.2e}")
 
-        # 進捗更新 (3エポックごと)
-        if epoch % 3 == 0 or epoch <= 5:
+        # 進捗更新 (progress_every エポックごと / 非同期書き込み)
+        if epoch % progress_every == 0 or epoch <= 5:
             _dash['epoch']       = epoch
             _dash['total_epochs']= args.epochs
             _dash['train_loss']  = round(t_loss, 5)
@@ -458,7 +485,7 @@ def train(args, X_tr, y_tr, X_te, y_te, mean, std, n_feat=None):
             _dash.setdefault('epoch_log', []).append(
                 {'epoch': epoch, 'train_loss': round(t_loss,6),
                  'val_loss': round(v_loss,6), 'acc': round(acc,4)})
-            # 並列モード: trial_progress.json に書く
+            # 並列モード: trial_progress.json に非同期書き込み (GPUをブロックしない)
             _write_trial_progress(OUT_DIR, {
                 'trial': args.trial, 'arch': getattr(args, 'arch', '?'),
                 'hidden': getattr(args, 'hidden', 0),
@@ -884,12 +911,10 @@ def backtest(onnx_path, X_te, df_te, threshold, tp_mult, sl_mult,
 
 
 def _write_trial_progress(out_dir: Path, data: dict) -> None:
-    """並列モード: 試行固有の進捗を trial_progress.json に書く"""
+    """並列モード: 試行固有の進捗を trial_progress.json に非同期で書く (GPU待機なし)"""
     try:
-        path = out_dir / 'trial_progress.json'
-        tmp  = path.with_suffix('.tmp')
-        tmp.write_text(json.dumps(data, ensure_ascii=False), encoding='utf-8')
-        tmp.replace(path)
+        _async_write(out_dir / 'trial_progress.json',
+                     json.dumps(data, ensure_ascii=False))
     except Exception:
         pass
 
