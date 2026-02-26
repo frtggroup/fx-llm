@@ -588,52 +588,119 @@ if(dChart)dChart.data.datasets[0].backgroundColor=dlc,dChart.update('none');
         print(f"  [WARN] レポート生成失敗: {e}")
 
 
-_BT_PROVIDERS: list | None = None  # キャッシュ: 初回ベンチで決定
+_BT_MODE: str | None = None  # キャッシュ: 'cpu' / 'cuda_iobind' / 'cuda'
 
-def _bench_onnx_providers(onnx_path: str, sample: np.ndarray) -> list:
-    """CPU vs CUDA でONNX推論速度を計測し、速い方のproviderリストを返す。
-    結果はグローバルキャッシュ _BT_PROVIDERS に保存して再利用。"""
-    global _BT_PROVIDERS
-    if _BT_PROVIDERS is not None:
-        return _BT_PROVIDERS
+def _bench_onnx_providers(onnx_path: str, full_data: np.ndarray) -> str:
+    """CPU / CUDA / CUDA+IOBinding の3パターンで全データ推論速度を比較し
+    最速モードを返す。結果は _BT_MODE にキャッシュして再利用。"""
+    global _BT_MODE
+    if _BT_MODE is not None:
+        return _BT_MODE
 
     import onnxruntime as ort
     import time
 
     available = ort.get_available_providers()
     if 'CUDAExecutionProvider' not in available:
-        _BT_PROVIDERS = ['CPUExecutionProvider']
+        _BT_MODE = 'cpu'
         print('  [BT-bench] CUDA unavailable → CPU')
-        return _BT_PROVIDERS
+        return _BT_MODE
 
-    x = sample[:min(512, len(sample))]  # ウォームアップ用サンプル
+    x = np.ascontiguousarray(full_data)   # 全データで計測（実運用と同条件）
     results = {}
-    for name, pvd in [('CPU', ['CPUExecutionProvider']),
-                      ('CUDA', ['CUDAExecutionProvider', 'CPUExecutionProvider'])]:
-        try:
-            s = ort.InferenceSession(onnx_path, providers=pvd)
-            s.run(None, {'input': x})      # ウォームアップ
-            t0 = time.perf_counter()
-            for _ in range(5):
-                s.run(None, {'input': x})
-            results[name] = (time.perf_counter() - t0) / 5
-        except Exception as e:
-            print(f'  [BT-bench] {name} error: {e}')
-            results[name] = float('inf')
 
-    faster = min(results, key=results.get)
-    print(f'  [BT-bench] CPU={results.get("CPU",999)*1000:.1f}ms  '
-          f'CUDA={results.get("CUDA",999)*1000:.1f}ms  → {faster} を採用')
-    _BT_PROVIDERS = (['CUDAExecutionProvider', 'CPUExecutionProvider']
-                     if faster == 'CUDA' else ['CPUExecutionProvider'])
-    return _BT_PROVIDERS
+    # ── CPU ────────────────────────────────────────────────────────────
+    try:
+        s = ort.InferenceSession(onnx_path, providers=['CPUExecutionProvider'])
+        s.run(None, {'input': x[:512]})   # ウォームアップ
+        t0 = time.perf_counter()
+        for _ in range(3):
+            s.run(None, {'input': x})
+        results['cpu'] = (time.perf_counter() - t0) / 3
+    except Exception as e:
+        print(f'  [BT-bench] CPU error: {e}')
+        results['cpu'] = float('inf')
+
+    cuda_pvd = ['CUDAExecutionProvider', 'CPUExecutionProvider']
+
+    # ── CUDA (通常バッチ転送) ───────────────────────────────────────────
+    try:
+        s = ort.InferenceSession(onnx_path, providers=cuda_pvd)
+        s.run(None, {'input': x[:512]})
+        t0 = time.perf_counter()
+        for _ in range(3):
+            bs = 512
+            out = np.zeros((len(x), 3), dtype=np.float32)
+            for i in range(0, len(x), bs):
+                out[i:i+bs] = s.run(None, {'input': x[i:i+bs]})[0]
+        results['cuda'] = (time.perf_counter() - t0) / 3
+    except Exception as e:
+        print(f'  [BT-bench] CUDA error: {e}')
+        results['cuda'] = float('inf')
+
+    # ── CUDA + IOBinding (データをGPUメモリに常駐) ─────────────────────
+    try:
+        import ctypes
+        s = ort.InferenceSession(onnx_path, providers=cuda_pvd)
+        io = s.io_binding()
+        # 全データを一括でGPU常駐テンソルとしてバインド
+        x_ort = ort.OrtValue.ortvalue_from_numpy(x, 'cuda', 0)
+        out_shape = (len(x), 3)
+        out_ort = ort.OrtValue.ortvalue_from_shape_and_type(out_shape, np.float32, 'cuda', 0)
+        io.bind_ortvalue_input('input', x_ort)
+        io.bind_ortvalue_output('output', out_ort)
+        s.run_with_iobinding(io)  # ウォームアップ
+        t0 = time.perf_counter()
+        for _ in range(3):
+            s.run_with_iobinding(io)
+        _ = out_ort.numpy()       # GPU→CPU (計測に含める)
+        results['cuda_iobind'] = (time.perf_counter() - t0) / 3
+    except Exception as e:
+        print(f'  [BT-bench] CUDA+IOBind error: {e}')
+        results['cuda_iobind'] = float('inf')
+
+    _BT_MODE = min(results, key=results.get)
+    print(f'  [BT-bench] CPU={results.get("cpu",99)*1000:.1f}ms  '
+          f'CUDA={results.get("cuda",99)*1000:.1f}ms  '
+          f'CUDA+IOBind={results.get("cuda_iobind",99)*1000:.1f}ms  '
+          f'→ {_BT_MODE} を採用')
+    return _BT_MODE
+
+
+def _run_inference(sess, x: np.ndarray, mode: str) -> np.ndarray:
+    """採用モードに応じて全データ一括推論し確率配列を返す"""
+    import onnxruntime as ort
+    n = len(x)
+
+    if mode == 'cuda_iobind':
+        try:
+            io = sess.io_binding()
+            x_ort   = ort.OrtValue.ortvalue_from_numpy(
+                          np.ascontiguousarray(x), 'cuda', 0)
+            out_ort = ort.OrtValue.ortvalue_from_shape_and_type(
+                          (n, 3), np.float32, 'cuda', 0)
+            io.bind_ortvalue_input('input', x_ort)
+            io.bind_ortvalue_output('output', out_ort)
+            sess.run_with_iobinding(io)
+            return out_ort.numpy()
+        except Exception:
+            pass   # フォールバック
+
+    # CPU / CUDA 通常バッチ
+    probs = np.zeros((n, 3), dtype=np.float32)
+    bs = 4096 if mode == 'cpu' else 512
+    for i in range(0, n, bs):
+        probs[i:i+bs] = sess.run(None, {'input': x[i:i+bs]})[0]
+    return probs
 
 
 def backtest(onnx_path, X_te, df_te, threshold, tp_mult, sl_mult,
              seq_len=20, report_dir: Path = None, trial_no: int = 0):
     import onnxruntime as ort
-    _providers = _bench_onnx_providers(str(onnx_path), X_te)
-    sess = ort.InferenceSession(str(onnx_path), providers=_providers)
+    mode = _bench_onnx_providers(str(onnx_path), X_te)
+    pvd  = (['CUDAExecutionProvider', 'CPUExecutionProvider']
+            if mode in ('cuda', 'cuda_iobind') else ['CPUExecutionProvider'])
+    sess = ort.InferenceSession(str(onnx_path), providers=pvd)
     close = df_te['close'].values
     atr   = df_te['atr14'].values
     high  = df_te['high'].values
@@ -641,11 +708,8 @@ def backtest(onnx_path, X_te, df_te, threshold, tp_mult, sl_mult,
     dates = df_te.index
     n     = len(X_te)
 
-    # バッチ推論
-    probs = np.zeros((n, 3), dtype=np.float32)
-    bs    = 512
-    for i in range(0, n, bs):
-        probs[i:i+bs] = sess.run(None, {'input': X_te[i:i+bs]})[0]
+    # 全データ一括推論 (採用モードで最適化)
+    probs = _run_inference(sess, X_te, mode)
 
     HOLD_BARS = 48  # 最大保有 (H1×48=2日)
     trades = []
