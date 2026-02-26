@@ -8,6 +8,11 @@ LLM データセット v2 — 改善版プロンプト生成
   5. 市場レジーム分類（トレンド/レンジ/高ボラ）
   6. RSIを0-100スケールに変換
   7. Chain-of-Thought ラベル（オプション）
+  8. RSI/MACD ダイバージェンス検知（追加）
+  9. 直近20本レンジの主要レベル + 累積リターン（追加）
+ 10. スイング反応・騙しブレイク検知（追加）
+ 11. 直近3本ローソク足ナラティブ（追加）
+ 12. 高インパクト時間帯警告（追加）
 """
 import sys, json, time, re
 from pathlib import Path
@@ -248,6 +253,263 @@ def describe_candle_sequence(seq: np.ndarray) -> str:
 
 
 # ──────────────────────────────────────────────────────────────────────────────
+# ① RSI / MACD ダイバージェンス検知
+# ──────────────────────────────────────────────────────────────────────────────
+def detect_divergence(seq: np.ndarray) -> str:
+    """
+    価格（body累積）vs RSI / MACD の乖離を検知。
+    +25トークン程度。
+    例: "BEARISH RSI DIVERGENCE: price making higher high but RSI making lower high"
+    """
+    if seq is None or len(seq) < 10:
+        return ''
+
+    n    = len(seq)
+    mid  = n // 2
+    early = seq[:mid]
+    late  = seq[mid:]
+
+    # 価格の高値・安値（body累積でhigh/low方向を近似）
+    # ret1を使って前半・後半の最高値・最安値を判定
+    ret1  = seq[:, _IDX['ret1']]
+    cum   = np.cumsum(ret1)
+    high_e, low_e = np.max(cum[:mid]),  np.min(cum[:mid])
+    high_l, low_l = np.max(cum[mid:]),  np.min(cum[mid:])
+
+    rsi   = seq[:, _IDX['rsi14']] * 100
+    rsi_e_max = np.max(rsi[:mid]); rsi_e_min = np.min(rsi[:mid])
+    rsi_l_max = np.max(rsi[mid:]); rsi_l_min = np.min(rsi[mid:])
+
+    macd  = seq[:, _IDX['macd_hist']]
+    macd_e_max = np.max(macd[:mid]); macd_e_min = np.min(macd[:mid])
+    macd_l_max = np.max(macd[mid:]); macd_l_min = np.min(macd[mid:])
+
+    findings = []
+
+    # 弱気ダイバージェンス: 価格が高値更新 → RSI/MACDは更新せず
+    if high_l > high_e + 0.0003:
+        if rsi_l_max < rsi_e_max - 3:
+            findings.append('BEARISH RSI DIVERGENCE: price making higher high but RSI making lower high (reversal risk)')
+        if macd_l_max < macd_e_max - 0.05:
+            findings.append('BEARISH MACD DIVERGENCE: price higher but MACD momentum declining')
+
+    # 強気ダイバージェンス: 価格が安値更新 → RSI/MACDは更新せず
+    if low_l < low_e - 0.0003:
+        if rsi_l_min > rsi_e_min + 3:
+            findings.append('BULLISH RSI DIVERGENCE: price making lower low but RSI making higher low (reversal potential)')
+        if macd_l_min > macd_e_min + 0.05:
+            findings.append('BULLISH MACD DIVERGENCE: price lower but MACD momentum improving')
+
+    return ' | '.join(findings) if findings else ''
+
+
+# ──────────────────────────────────────────────────────────────────────────────
+# ② 直近20本レンジの主要レベル + ③ スイング反応 + ④ 騙しブレイク検知
+# ──────────────────────────────────────────────────────────────────────────────
+def describe_key_levels(feat: np.ndarray, seq: np.ndarray) -> str:
+    """
+    ② 直近レンジのH/L/midと現在価格の位置
+    ③ 直近スイング高値/安値での価格反応（pin bar / rejection）
+    ④ 騙しブレイクアウト（20本高値超え後に戻った等）
+    合計 +60トークン程度。
+    """
+    if seq is None or len(seq) < 5:
+        return ''
+
+    atr_r    = _f(feat, 'atr_ratio')           # ATR/price
+    don_pos  = _f(feat, 'donchian_pos')
+    sw_hi    = _f(feat, 'swing_hi_dist')       # ATR単位の距離
+    sw_lo    = _f(feat, 'swing_lo_dist')
+    daily_rp = _f(feat, 'daily_range_pos')     # 0=当日安値, 1=当日高値
+    wk_pos   = _f(feat, 'weekly_pos')
+
+    lines = []
+
+    # ── ② レンジ内ポジションを明示 ─────────────────────────────────────
+    if daily_rp > 0.8:
+        lines.append(f'Today\'s range: price near top of day ({daily_rp*100:.0f}%) — potential intraday resistance')
+    elif daily_rp < 0.2:
+        lines.append(f'Today\'s range: price near bottom of day ({daily_rp*100:.0f}%) — potential intraday support')
+    else:
+        lines.append(f'Today\'s range: price at {daily_rp*100:.0f}% of today\'s range (mid-range)')
+
+    # スイング距離を明示（近い場合は警告）
+    if sw_hi < 0.5:
+        lines.append(f'Resistance CLOSE: swing high only {sw_hi:.2f}ATR above — may cap upside')
+    if sw_lo < 0.5:
+        lines.append(f'Support CLOSE: swing low only {sw_lo:.2f}ATR below — may limit downside')
+
+    # ── ③ スイング反応検知（seqのpin_bull/pin_bearをスキャン） ──────────
+    pin_bull_seq = seq[:, _IDX['pin_bull']]
+    pin_bear_seq = seq[:, _IDX['pin_bear']]
+    don_seq      = seq[:, _IDX['donchian_pos']]
+
+    # 直近5本以内に高値付近でpin_bear → rejection
+    for i in range(-5, 0):
+        if pin_bear_seq[i] > 0.5 and don_seq[i] > 0.75:
+            bars_ago = abs(i)
+            lines.append(f'Swing rejection: shooting star at 20-bar high area {bars_ago}b ago — resistance confirmed')
+            break
+    for i in range(-5, 0):
+        if pin_bull_seq[i] > 0.5 and don_seq[i] < 0.25:
+            bars_ago = abs(i)
+            lines.append(f'Swing rejection: hammer at 20-bar low area {bars_ago}b ago — support confirmed')
+            break
+
+    # ── ④ 騙しブレイク検知 ────────────────────────────────────────────
+    # 過去5本以内にDonchian>0.95だったが現在0.6未満 → 騙しブレイク上
+    past_don_max = np.max(don_seq[-5:])
+    if past_don_max > 0.92 and don_pos < 0.65:
+        lines.append('FALSE BREAKOUT (bearish): price broke 20-bar high recently but pulled back — bull trap likely')
+    # 過去5本以内にDonchian<0.05だったが現在0.4超 → 騙しブレイク下
+    past_don_min = np.min(don_seq[-5:])
+    if past_don_min < 0.08 and don_pos > 0.35:
+        lines.append('FALSE BREAKOUT (bullish): price broke 20-bar low recently but recovered — bear trap likely')
+
+    return '\n'.join(lines) if lines else ''
+
+
+# ──────────────────────────────────────────────────────────────────────────────
+# ⑤ 直近3本ローソク足ナラティブ
+# ──────────────────────────────────────────────────────────────────────────────
+def describe_last3_candles(seq: np.ndarray) -> str:
+    """
+    直近3本を具体的に記述。複合パターン名も付与。
+    +40トークン程度。
+    例: "Last 3 candles: strong bull (+0.18ATR) → doji (indecision) → bearish close → potential reversal sequence"
+    """
+    if seq is None or len(seq) < 3:
+        return ''
+
+    body_vals = seq[-3:, _IDX['body']]
+    ret1_vals = seq[-3:, _IDX['ret1']]
+    uw_vals   = seq[-3:, _IDX['upper_w']]
+    lw_vals   = seq[-3:, _IDX['lower_w']]
+    doji_vals = seq[-3:, _IDX['is_doji']]
+
+    def candle_desc(body, ret1, uw, lw, doji) -> str:
+        r = f'{ret1*100:+.2f}%'
+        if doji > 0.5:
+            return f'doji ({r}, indecision)'
+        size = abs(body)
+        if size > 0.15:
+            strength = 'strong '
+        elif size > 0.05:
+            strength = ''
+        else:
+            return f'small candle ({r})'
+        direction = 'bull' if body > 0 else 'bear'
+        tail = ''
+        if lw > 0.15 and body > 0:
+            tail = ' with lower shadow (tested lower, rejected)'
+        elif uw > 0.15 and body < 0:
+            tail = ' with upper shadow (tested higher, rejected)'
+        return f'{strength}{direction} ({r}){tail}'
+
+    parts = [candle_desc(body_vals[i], ret1_vals[i], uw_vals[i], lw_vals[i], doji_vals[i])
+             for i in range(3)]
+
+    desc = ' → '.join(parts)
+
+    # 複合パターン名付与
+    b0, b1, b2 = body_vals[0], body_vals[1], body_vals[2]
+    pattern = ''
+    if b0 < -0.1 and abs(b1) < 0.05 and b2 > 0.1:
+        pattern = 'morning star (bullish reversal pattern)'
+    elif b0 > 0.1 and abs(b1) < 0.05 and b2 < -0.1:
+        pattern = 'evening star (bearish reversal pattern)'
+    elif b0 < -0.1 and b1 < -0.05 and b2 > 0.1:
+        pattern = 'three-bar reversal (bullish)'
+    elif b0 > 0.1 and b1 > 0.05 and b2 < -0.1:
+        pattern = 'three-bar reversal (bearish)'
+    elif b0 > 0.05 and b1 > 0.05 and b2 > 0.05:
+        pattern = 'three consecutive bull bars (momentum continuation)'
+    elif b0 < -0.05 and b1 < -0.05 and b2 < -0.05:
+        pattern = 'three consecutive bear bars (momentum continuation)'
+
+    result = f'Last 3 candles: {desc}'
+    if pattern:
+        result += f' [{pattern}]'
+    return result
+
+
+# ──────────────────────────────────────────────────────────────────────────────
+# ⑥ 高インパクト時間帯警告
+# ──────────────────────────────────────────────────────────────────────────────
+# UTC時刻: 経済指標の定番時間帯
+_HIGH_IMPACT_WINDOWS = [
+    (13, 30, 'US economic data (CPI/NFP/Retail Sales typical release time)'),
+    (14,  0, 'US economic data release window'),
+    (14, 30, 'US economic data release window'),
+    (18,  0, 'Fed speakers / FOMC statements typical window'),
+    (19,  0, 'Fed speakers / US market close volatility'),
+    ( 1, 30, 'BOJ/Tokyo economic data release typical window'),
+    ( 6,  0, 'European open — potential gap/spike'),
+    ( 7,  0, 'EUR economic data typical release time'),
+]
+
+def describe_time_risk(feat: np.ndarray) -> str:
+    """
+    ⑥ 高インパクト時間帯の警告。+15トークン程度。
+    曜日リスクも付与（月曜オープン・金曜クローズ）。
+    """
+    hour_sin = _f(feat, 'hour_sin'); hour_cos = _f(feat, 'hour_cos')
+    dow_sin  = _f(feat, 'dow_sin');  dow_cos  = _f(feat, 'dow_cos')
+    hour = int(round(np.arctan2(hour_sin, hour_cos) * 24 / (2 * np.pi))) % 24
+    dow  = int(round(np.arctan2(dow_sin,  dow_cos)  *  5 / (2 * np.pi))) % 5
+
+    warnings = []
+
+    for wh, wm, label in _HIGH_IMPACT_WINDOWS:
+        diff = abs(hour - wh)
+        if diff <= 1:
+            warnings.append(f'⚠ HIGH-IMPACT WINDOW: ~{wh:02d}:00 UTC — {label}')
+            break
+
+    if dow == 4:  # Friday
+        warnings.append('⚠ FRIDAY: reduced liquidity into weekend close — avoid late entries')
+    elif dow == 0:  # Monday
+        warnings.append('Note: Monday open — watch for weekend gap')
+
+    return '\n'.join(warnings) if warnings else ''
+
+
+# ──────────────────────────────────────────────────────────────────────────────
+# ⑦ 累積リターン（5 / 10 / 20本）
+# ──────────────────────────────────────────────────────────────────────────────
+def describe_cumulative_returns(feat: np.ndarray, seq: np.ndarray) -> str:
+    """
+    ⑦ 直近5/10/20本の累積リターンで「どれだけ動いたか」を明示。
+    過熱・疲弊感の判断に有効。+20トークン程度。
+    例: "Cumulative returns: 5h=+0.31%, 10h=-0.12%, 20h=+0.44% [net bullish but recent pullback]"
+    """
+    ret5  = _f(feat, 'ret5')   * 100   # %
+    ret20 = _f(feat, 'ret20')  * 100
+
+    # 10本分はseqから計算
+    ret10 = 0.0
+    if seq is not None and len(seq) >= 10:
+        ret10 = float(np.sum(seq[-10:, _IDX['ret1']])) * 100
+
+    parts = [f'5h={ret5:+.2f}%', f'10h={ret10:+.2f}%', f'20h={ret20:+.2f}%']
+
+    # 過熱感コメント
+    comment = ''
+    if abs(ret5) > 0.4:
+        comment = ' [EXTENDED — mean reversion risk]'
+    elif ret5 > 0.15 and ret20 > 0.3:
+        comment = ' [consistent bullish move]'
+    elif ret5 < -0.15 and ret20 < -0.3:
+        comment = ' [consistent bearish move]'
+    elif ret5 > 0.1 and ret20 < -0.1:
+        comment = ' [counter-trend bounce — caution]'
+    elif ret5 < -0.1 and ret20 > 0.1:
+        comment = ' [pullback in uptrend]'
+
+    return f'Cumulative returns: {", ".join(parts)}{comment}'
+
+
+# ──────────────────────────────────────────────────────────────────────────────
 # メインプロンプト生成 v2
 # ──────────────────────────────────────────────────────────────────────────────
 def bar_to_text_v2(feat: np.ndarray, seq: np.ndarray,
@@ -436,6 +698,31 @@ def bar_to_text_v2(feat: np.ndarray, seq: np.ndarray,
     sess_str = ' + '.join(sessions) if sessions else 'off-hours'
 
     lines.append(f'Session: {dow_names[dow]} {hour:02d}:00 UTC — {sess_str}.')
+
+    # ── ① ダイバージェンス ────────────────────────────────────────────────────
+    div_str = detect_divergence(seq)
+    if div_str:
+        lines.append(f'Divergence: {div_str}')
+
+    # ── ②③④ 主要レベル / スイング反応 / 騙しブレイク ──────────────────────────
+    levels_str = describe_key_levels(feat, seq)
+    if levels_str:
+        lines.append(levels_str)
+
+    # ── ⑤ 直近3本ローソクナラティブ ──────────────────────────────────────────
+    last3_str = describe_last3_candles(seq)
+    if last3_str:
+        lines.append(last3_str)
+
+    # ── ⑦ 累積リターン ────────────────────────────────────────────────────────
+    cum_str = describe_cumulative_returns(feat, seq)
+    if cum_str:
+        lines.append(cum_str)
+
+    # ── ⑥ 高インパクト時間帯警告（末尾に配置） ──────────────────────────────
+    time_risk = describe_time_risk(feat)
+    if time_risk:
+        lines.append(time_risk)
 
     # ── CoT プレースホルダー ──────────────────────────────────────────────────
     if use_cot:
