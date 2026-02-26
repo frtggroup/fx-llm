@@ -503,8 +503,11 @@ def train(args):
                 torch.cuda.empty_cache()
                 _watchdog_paused = False
 
-            entry = {'step': global_step, 'train_loss': round(loss.item(), 4)}
+            # 評価ポイントはエポック平均 train_loss を記録（単バッチ瞬間値ではない）
+            batch_train_loss = round(loss.item(), 4)
+            entry = {'step': global_step, 'train_loss': batch_train_loss}
             if cur_val_loss is not None:
+                entry['train_loss'] = round(ep_loss / bi, 4)  # 平均値で上書き
                 entry['val_loss'] = cur_val_loss
                 entry['acc']      = cur_acc
             batch_log.append(entry)

@@ -506,6 +506,7 @@ def train(args):
             # バッチ loss / val_loss / accuracy を蓄積
             entry = {'step': global_step, 'train_loss': round(loss.item(), 4)}
             if cur_val_loss is not None:
+                entry['train_loss'] = round(ep_loss / bi, 4)  # 評価時はエポック平均に上書き
                 entry['val_loss'] = cur_val_loss
                 entry['acc']      = cur_acc
             batch_log.append(entry)
