@@ -32,6 +32,7 @@ BEST_JSON     = OUT_DIR / 'best_result.json'
 # S3: 環境変数 S3_* が設定されていれば Sakura オブジェクトストレージにも保存
 CHECKPOINT_DIR      = _WORKSPACE / 'data' / 'checkpoint'
 CHECKPOINT_INTERVAL = 600   # 秒 (10分ごとに保存)
+CHECKPOINT_EVERY_N  = 10    # 件 (10試行完了ごとに保存)
 
 S3_ENDPOINT  = os.environ.get('S3_ENDPOINT',   '')   # 例: https://s3.isk01.sakurastorage.jp
 S3_ACCESS_KEY= os.environ.get('S3_ACCESS_KEY',  '')
@@ -711,7 +712,8 @@ def main():
         except Exception:
             pass
 
-    last_checkpoint = time.time()
+    last_checkpoint        = time.time()
+    completed_since_ckpt   = 0   # チェックポイント後の完了件数カウンタ
 
     write_progress(trainer.running, results, best_pf, start)
 
@@ -724,7 +726,9 @@ def main():
             break
 
         # ── 完了した試行を回収 ──────────────────────────────────────────────
-        for tno, info in trainer.poll_completed():
+        newly_done = trainer.poll_completed()
+        completed_since_ckpt += len(newly_done)
+        for tno, info in newly_done:
             result_path = info['trial_dir'] / 'last_result.json'
             r = {}
             if result_path.exists():
@@ -804,10 +808,13 @@ def main():
         # ── 進捗 JSON 書き込み (5秒ごと) ───────────────────────────────────
         write_progress(trainer.running, results, best_pf, start)
 
-        # ── チェックポイント定期保存 ────────────────────────────────────────
-        if time.time() - last_checkpoint >= CHECKPOINT_INTERVAL:
+        # ── チェックポイント保存: 10試行ごと or 10分ごと ────────────────────
+        should_ckpt = (completed_since_ckpt >= CHECKPOINT_EVERY_N or
+                       time.time() - last_checkpoint >= CHECKPOINT_INTERVAL)
+        if should_ckpt:
             save_checkpoint(results, best_pf)
-            last_checkpoint = time.time()
+            last_checkpoint      = time.time()
+            completed_since_ckpt = 0
 
         time.sleep(5)
 
