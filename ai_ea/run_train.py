@@ -94,6 +94,15 @@ TOP_N              = 100
 RANDOM_PHASE_LIMIT = 200    # この件数までは純ランダム、以降は GA 主体
 GA_RATIO           = 0.75   # GA の割合 (残りはランダム)
 GA_PARENT_POOL     = 20     # 親候補を上位何件から選ぶか
+
+# ── 2フェーズGA の割合 (GA_RATIO 内の内訳) ─────────────────────────────────
+# GA_feat : feat_set のみ変えてアーキテクチャ固定で特徴量を探索
+# GA_param: feat_set 固定でハイパラのみ微調整
+# GA_cross: 2親の交叉 (多様性維持)
+# 合計 = 1.0
+GA_FEAT_RATIO  = 0.40   # 特徴量探索フェーズ
+GA_PARAM_RATIO = 0.40   # パラメータチューニングフェーズ
+GA_CROSS_RATIO = 0.20   # 交叉フェーズ
 H100_MODE     = os.environ.get('H100_MODE', '0') == '1'
 MAX_PARALLEL  = int(os.environ.get('MAX_PARALLEL', '3' if H100_MODE else '1'))
 VRAM_PER_TRIAL= float(os.environ.get('VRAM_PER_TRIAL', '10'))   # GB
@@ -275,15 +284,11 @@ def _tournament_select(pool: list, rng: random.Random, k: int = 4) -> dict:
     return max(candidates, key=lambda r: r['pf'])
 
 
-def ga_sample(results: list, rng: random.Random) -> dict:
-    """遺伝的アルゴリズムでパラメータを生成する"""
+def _build_parent_pool(results: list) -> list:
+    """有効な結果から親プールを構築 (arch×feat_set の多様性を確保)"""
     valid = [r for r in results if r.get('pf', 0) > 0 and r.get('trades', 0) >= 200]
-    if len(valid) < 2:
-        return sample_params(rng)   # 候補不足ならランダムにフォールバック
-
-    # ── 親プール: 上位 GA_PARENT_POOL 件 (多様性のため arch・feat_set が被らないよう調整) ──
     sorted_valid = sorted(valid, key=lambda x: -x['pf'])
-    pool = []
+    pool: list = []
     seen_arch_feat: set = set()
     for r in sorted_valid:
         key = (r.get('arch', '?'), r.get('feat_set', -1))
@@ -292,29 +297,88 @@ def ga_sample(results: list, rng: random.Random) -> dict:
             seen_arch_feat.add(key)
         if len(pool) >= GA_PARENT_POOL:
             break
+    return pool
+
+
+_GA_HP_KEYS = ('arch', 'hidden', 'layers', 'dropout', 'lr', 'batch',
+               'tp', 'sl', 'forward', 'threshold', 'seq_len',
+               'scheduler', 'sched', 'wd', 'train_months', 'feat_set', 'n_features',
+               'seed', 'epochs', 'timeframe', 'label_type')
+
+
+def ga_feat_explore(results: list, rng: random.Random) -> dict:
+    """フェーズ1 ─ 特徴量探索
+    親の arch/hidden/lr/dropout 等を固定し feat_set だけを別のものに変える。
+    同じアーキテクチャで最良の特徴量セットを探索する。
+    """
+    pool = _build_parent_pool(results)
+    if not pool:
+        return sample_params(rng)
+
+    parent = _tournament_select(pool, rng)
+    child  = {k: parent[k] for k in _GA_HP_KEYS if k in parent}
+
+    # feat_set だけを別の値に変える (元と被らないよう最大3回リトライ)
+    orig_feat = parent.get('feat_set', -1)
+    for _ in range(3):
+        new_feat = rng.randint(0, len(FEATURE_SETS) - 1)
+        if new_feat != orig_feat:
+            break
+    child['feat_set']   = new_feat
+    child['n_features'] = len(FEATURE_SETS[new_feat])
+    child['seed']       = rng.randint(0, 9999)
+    return child
+
+
+def ga_param_tune(results: list, rng: random.Random) -> dict:
+    """フェーズ2 ─ パラメータチューニング
+    親の feat_set を固定し、lr/dropout/tp/sl/threshold 等のハイパラのみ変える。
+    良い特徴量セットを保持したまま細かい最適化を行う。
+    """
+    pool = _build_parent_pool(results)
+    if not pool:
+        return sample_params(rng)
+
+    parent = _tournament_select(pool, rng)
+    child  = {k: parent[k] for k in _GA_HP_KEYS if k in parent}
+
+    # feat_set・arch は固定、ハイパラのみ 1〜2 個変更
+    tune_keys = ['lr', 'dropout', 'tp', 'sl', 'threshold',
+                 'batch', 'wd', 'forward', 'seq_len', 'layers',
+                 'train_months', 'scheduler']
+    n_mut  = rng.choices([1, 2, 3], weights=[0.45, 0.40, 0.15])[0]
+    chosen = rng.sample(tune_keys, min(n_mut, len(tune_keys)))
+    for key in chosen:
+        _apply_one_mutation(child, key, rng)
+
+    # arch と hidden の組み合わせ整合性を保証
+    if child.get('hidden') not in HIDDEN_MAP.get(child.get('arch', ''), [child.get('hidden')]):
+        child['hidden'] = rng.choice(HIDDEN_MAP[child['arch']])
+    child['seed'] = rng.randint(0, 9999)
+    return child
+
+
+def ga_sample(results: list, rng: random.Random) -> tuple[dict, str]:
+    """2フェーズGA: 特徴量探索 → パラメータチューニング → 交叉 の3サブ戦略を返す"""
+    valid = [r for r in results if r.get('pf', 0) > 0 and r.get('trades', 0) >= 200]
+    if len(valid) < 2:
+        return sample_params(rng), 'random'
 
     r_val = rng.random()
-    if r_val < 0.5:
-        # 交叉: 親 2 体を選んでパラメータを混合
+    if r_val < GA_FEAT_RATIO:
+        # フェーズ1: 特徴量探索 (feat_set だけ変える)
+        return ga_feat_explore(results, rng), 'GA_feat'
+    elif r_val < GA_FEAT_RATIO + GA_PARAM_RATIO:
+        # フェーズ2: パラメータチューニング (feat_set 固定でハイパラ変更)
+        return ga_param_tune(results, rng), 'GA_param'
+    else:
+        # 交叉: 2 親から多様性を生成
+        pool = _build_parent_pool(results)
+        if len(pool) < 2:
+            return sample_params(rng), 'random'
         p1 = _tournament_select(pool, rng)
         p2 = _tournament_select(pool, rng)
-        child = _crossover(p1, p2, rng)
-    elif r_val < 0.85:
-        # 突然変異: 親 1 体から複数パラメータを変える
-        p1    = _tournament_select(pool, rng)
-        child = _mutate(p1, rng)
-    else:
-        # 15%: 上位から親を選んでランダム大変異 (exploration)
-        p1 = pool[0]  # best parent
-        child = _mutate(p1, rng)
-        # さらに追加で 1〜2 パラメータをランダムに再変異
-        extra = rng.sample(['arch', 'tp', 'sl', 'threshold', 'feat_set', 'forward'], 2)
-        for k in extra:
-            _apply_one_mutation(child, k, rng)
-        if child['hidden'] not in HIDDEN_MAP.get(child['arch'], [child['hidden']]):
-            child['hidden'] = rng.choice(HIDDEN_MAP[child['arch']])
-
-    return child
+        return _crossover(p1, p2, rng), 'GA_cross'
 
 
 def next_params(results: list, rng: random.Random) -> tuple[dict, str]:
@@ -323,7 +387,7 @@ def next_params(results: list, rng: random.Random) -> tuple[dict, str]:
     if n < RANDOM_PHASE_LIMIT:
         return sample_params(rng), 'random'
     if rng.random() < GA_RATIO:
-        return ga_sample(results, rng), 'GA'
+        return ga_sample(results, rng)   # GA_feat / GA_param / GA_cross のいずれか
     return sample_params(rng), 'random'
 
 
@@ -447,8 +511,16 @@ def write_progress(running: dict, results: list, best_pf: float, start: float) -
                 pass
 
     n_done    = len(results)
-    search_phase = ('random' if n_done < RANDOM_PHASE_LIMIT
-                    else f'GA {int(GA_RATIO*100)}% + random {int((1-GA_RATIO)*100)}%')
+    if n_done < RANDOM_PHASE_LIMIT:
+        search_phase = 'random'
+    else:
+        ga_pct   = int(GA_RATIO * 100)
+        rnd_pct  = 100 - ga_pct
+        f_pct    = int(GA_RATIO * GA_FEAT_RATIO  * 100)
+        p_pct    = int(GA_RATIO * GA_PARAM_RATIO * 100)
+        c_pct    = int(GA_RATIO * GA_CROSS_RATIO * 100)
+        search_phase = (f'GA {ga_pct}% [feat={f_pct}% param={p_pct}% cross={c_pct}%]'
+                        f' + random {rnd_pct}%')
     progress = {
         'phase':           'training' if running else 'waiting',
         'search_phase':    search_phase,
@@ -512,7 +584,13 @@ class ParallelTrainer:
             }
         feat_info = (f"set#{params['feat_set']}"
                      if params.get('feat_set', -1) >= 0 else f"rand{params['n_features']}")
-        tag = '🧬GA' if strategy == 'GA' else '🎲Rnd'
+        _TAG_MAP = {
+            'GA_feat':  '🔍GA_feat ',   # 特徴量探索
+            'GA_param': '🔧GA_param',   # パラメータ調整
+            'GA_cross': '🧬GA_cross',   # 交叉
+            'random':   '🎲Rnd     ',   # ランダム
+        }
+        tag = _TAG_MAP.get(strategy, f'?{strategy}')
         print(f"  [LAUNCH] 試行#{trial_no:4d} {tag}  {params['arch']:12s}  "
               f"h={params['hidden']:4d}  feat={feat_info}  PID={proc.pid}")
 
