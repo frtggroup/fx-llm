@@ -27,15 +27,17 @@ ENV DEBIAN_FRONTEND=noninteractive \
     # H100 80GB: 6並列 × 6GB = 36GB使用, 残44GBはバッファ
     MAX_PARALLEL=6 \
     VRAM_PER_TRIAL=6 \
-    # データパス (DATA_URL で上書き可能)
-    DATA_PATH=/workspace/data/USDJPY_M1.csv \
+    # データパス (H1 CSV 直接使用 → M1リサンプル不要で高速)
+    DATA_PATH=/workspace/data/USDJPY_H1.csv \
     WORKSPACE=/workspace \
+    # Sakura DOK の nginx は port 7860 に転送する
+    DASHBOARD_PORT=7860 \
     # Sakura オブジェクトストレージ (docker-compose未使用時のフォールバック)
     S3_ENDPOINT=https://s3.isk01.sakurastorage.jp \
     S3_REGION=jp-north-1 \
     S3_ACCESS_KEY=9LZ71SXF347BKM7MEPPM \
     S3_BUCKET=fxea \
-    S3_PREFIX=checkpoint
+    S3_PREFIX=mix
 
 # S3_SECRET_KEY は = で始まるため別行で定義
 ENV S3_SECRET_KEY="=u/j64oP8sQvtRXjjNY33jF2S/gOY5WMVgYcdnqG"
@@ -100,7 +102,7 @@ RUN mkdir -p /workspace/data \
 
 WORKDIR /workspace
 
-# 22=SSH  8080=Dashboard
-EXPOSE 22 8080
+# 22=SSH  7860=Dashboard (Sakura DOK nginx → port 7860)  8080=ローカル開発用
+EXPOSE 22 7860 8080
 
 ENTRYPOINT ["/workspace/entrypoint.sh"]

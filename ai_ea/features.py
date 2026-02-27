@@ -82,21 +82,32 @@ assert N_FEATURES == 70, f"N_FEATURES={N_FEATURES} (期待値70)"
 
 # ─── データ読み込み ───────────────────────────────────────────────────────
 def load_data(csv_path: str, timeframe: str = 'H1') -> pd.DataFrame:
-    """MetaTrader M1 CSV → 指定タイムフレームにリサンプル"""
+    """MetaTrader CSV → 指定タイムフレームにリサンプル (H1 CSV も直接読み込み可)
+
+    MT5 から直接エクスポートした H1 CSV (M1 の代わり) を使うと
+    バックテストの H1 バーと完全に一致する精度で学習できます。
+    H1 CSV を使う場合は timeframe='H1' のまま csv_path に H1 CSV を指定してください。
+    ファイル名に 'H1' が含まれていれば自動でリサンプルをスキップします。
+    """
     print(f"  CSV読込: {Path(csv_path).name}")
     df = pd.read_csv(csv_path, sep='\t')
     df.columns = [c.strip('<>') for c in df.columns]
     df['datetime'] = pd.to_datetime(df['DATE'] + ' ' + df['TIME'])
     df.set_index('datetime', inplace=True)
-    df = df[['OPEN', 'HIGH', 'LOW', 'CLOSE', 'TICKVOL']].copy()
+    vol_col = 'TICKVOL' if 'TICKVOL' in df.columns else ('VOL' if 'VOL' in df.columns else 'REAL_VOLUME')
+    df = df[['OPEN', 'HIGH', 'LOW', 'CLOSE', vol_col]].copy()
     df.columns = ['open', 'high', 'low', 'close', 'volume']
     df = df.astype(float)
     df.sort_index(inplace=True)
     df.dropna(inplace=True)
 
+    # H1 CSV が直接与えられた場合はリサンプルをスキップ
+    fname_upper = Path(csv_path).stem.upper()
+    already_h1 = ('_H1' in fname_upper or fname_upper.endswith('H1'))
+
     tf_map = {'M1': None, 'H1': '1h', 'H4': '4h', 'D1': '1D'}
     rule = tf_map.get(timeframe.upper())
-    if rule:
+    if rule and not already_h1:
         print(f"  {timeframe}へリサンプル中...")
         df = df.resample(rule).agg(
             open=('open', 'first'), high=('high', 'max'),
@@ -104,6 +115,10 @@ def load_data(csv_path: str, timeframe: str = 'H1') -> pd.DataFrame:
             volume=('volume', 'sum')
         ).dropna()
         df = df[df.index.dayofweek < 5]  # weekdays only (Mon=0,...,Fri=4)
+    elif already_h1:
+        # H1 CSV 直接使用: 週末バーのみ除去
+        df = df[df.index.dayofweek < 5]
+        print(f"  H1 CSV を直接使用 (リサンプルなし)")
 
     print(f"  {timeframe}: {len(df):,}本  {df.index[0]} ～ {df.index[-1]}")
     return df

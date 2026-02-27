@@ -38,18 +38,45 @@ S3_ENDPOINT  = os.environ.get('S3_ENDPOINT',   '')   # 例: https://s3.isk01.sak
 S3_ACCESS_KEY= os.environ.get('S3_ACCESS_KEY',  '')
 S3_SECRET_KEY= os.environ.get('S3_SECRET_KEY',  '')
 S3_BUCKET    = os.environ.get('S3_BUCKET',      'fxea')
-S3_PREFIX    = os.environ.get('S3_PREFIX',      'checkpoint')
+S3_PREFIX    = os.environ.get('S3_PREFIX',      'mix')   # 両ノード共有フォルダ
 S3_ENABLED   = bool(S3_ENDPOINT and S3_ACCESS_KEY and S3_SECRET_KEY)
+
+# ── ノードID (GTX / H100 / CPU) ─────────────────────────────────────────────
+# S3 上でノードごとにファイルを分離することで競合を回避する
+def _detect_node_id() -> str:
+    """GPU名からノードIDを自動決定。環境変数 NODE_ID で上書き可能"""
+    nid = os.environ.get('NODE_ID', '').strip()
+    if nid:
+        return nid.lower()
+    try:
+        import torch
+        if torch.cuda.is_available():
+            name = torch.cuda.get_device_name(0).lower()
+            if 'h100' in name:     return 'h100'
+            if 'a100' in name:     return 'a100'
+            if '3090' in name:     return 'rtx3090'
+            if '4090' in name:     return 'rtx4090'
+            if '1080' in name:     return 'gtx1080ti'
+            return name.replace(' ', '_')[:12]
+    except Exception:
+        pass
+    return 'h100' if os.environ.get('H100_MODE', '0') == '1' else 'gtx1080ti'
+
+NODE_ID = _detect_node_id()   # このノードの識別子 (例: 'h100', 'gtx1080ti')
+GPU_NAME = os.environ.get("GPU_NAME", NODE_ID.upper())  # GPU display name for dashboard
 
 
 def _s3_client():
     import boto3
+    from botocore.config import Config
     return boto3.client(
         's3',
         endpoint_url      = S3_ENDPOINT,
         aws_access_key_id = S3_ACCESS_KEY,
         aws_secret_access_key = S3_SECRET_KEY,
         region_name       = os.environ.get('S3_REGION', 'jp-north-1'),
+        config            = Config(connect_timeout=10, read_timeout=60,
+                                   retries={'max_attempts': 2}),
     )
 
 
@@ -90,10 +117,32 @@ def s3_list_keys(prefix: str = '') -> list:
         print(f'  [S3] list失敗: {e}')
         return []
 
+
+def s3_node_key(name: str) -> str:
+    """このノード専用の S3 キーを返す (例: 'results_h100.json')"""
+    return name.replace('NODE_ID', NODE_ID)
+
+
+def s3_list_node_keys(glob_prefix: str) -> list[str]:
+    """全ノードの同種ファイル一覧 (例: glob_prefix='results_') → ['results_h100.json', 'results_gtx1080ti.json']"""
+    all_keys = s3_list_keys('')
+    prefix_full = f'{S3_PREFIX}/{glob_prefix}'
+    return [k[len(S3_PREFIX)+1:] for k in all_keys if k.startswith(prefix_full)]
+
 TOP_N              = 100
-RANDOM_PHASE_LIMIT = 200    # この件数までは純ランダム、以降は GA 主体
-GA_RATIO           = 0.75   # GA の割合 (残りはランダム)
+RANDOM_PHASE_LIMIT = 30     # この件数までは純ランダム、以降は 10分交互モード
 GA_PARENT_POOL     = 20     # 親候補を上位何件から選ぶか
+
+# ── 10分交互モード ─────────────────────────────────────────────────────────
+# ランダムサーチ 10分 → GA 10分 → ランダム 10分 → ... を繰り返す
+MODE_SWITCH_SEC    = 600    # 10分 = 600秒
+_mode_start_time   = 0.0    # main() で time.time() を設定
+
+# 重要特徴量 GA フェーチャ: 上位モデルから重視特徴量を収集して GA に使用
+IMP_FEAT_TOP_K     = 15     # 各モデルから取り出す重要特徴量数
+IMP_FEAT_POOL_SIZE = 30     # 重要特徴量プールサイズ (多めに持つ)
+_important_features: list[str] = []   # 集計した重要特徴量名リスト (更新される)
+_important_scores: dict = {}          # 特徴量名 → 重要度スコア (重み付きサンプリング用)
 
 # ── 2フェーズGA の割合 (GA_RATIO 内の内訳) ─────────────────────────────────
 # GA_feat : feat_set のみ変えてアーキテクチャ固定で特徴量を探索
@@ -308,8 +357,8 @@ _GA_HP_KEYS = ('arch', 'hidden', 'layers', 'dropout', 'lr', 'batch',
 
 def ga_feat_explore(results: list, rng: random.Random) -> dict:
     """フェーズ1 ─ 特徴量探索
-    親の arch/hidden/lr/dropout 等を固定し feat_set だけを別のものに変える。
-    同じアーキテクチャで最良の特徴量セットを探索する。
+    親の arch/hidden/lr/dropout 等を固定し feat_set だけを変える。
+    重要特徴量プールがあれば、重複度の高い feat_set を優先して選ぶ。
     """
     pool = _build_parent_pool(results)
     if not pool:
@@ -317,13 +366,35 @@ def ga_feat_explore(results: list, rng: random.Random) -> dict:
 
     parent = _tournament_select(pool, rng)
     child  = {k: parent[k] for k in _GA_HP_KEYS if k in parent}
-
-    # feat_set だけを別の値に変える (元と被らないよう最大3回リトライ)
     orig_feat = parent.get('feat_set', -1)
-    for _ in range(3):
-        new_feat = rng.randint(0, len(FEATURE_SETS) - 1)
-        if new_feat != orig_feat:
-            break
+
+    # 重要特徴量と重複度が高い feat_set を優先
+    if _important_features:
+        from features import FEATURE_COLS
+        imp_set = set(_important_features)
+        # 各 feat_set の重要特徴量重複スコアを計算
+        scores = []
+        for fi, fset in enumerate(FEATURE_SETS):
+            if fi == orig_feat:
+                scores.append(0.0)   # 親と同じは除外
+                continue
+            feat_names = set(FEATURE_COLS[j] for j in fset if j < len(FEATURE_COLS))
+            overlap = len(feat_names & imp_set)
+            scores.append(float(overlap) + 0.1)   # 0.1 はゼロ重みを防ぐ
+        total = sum(scores)
+        if total > 0:
+            weights = [s / total for s in scores]
+            new_feat = rng.choices(range(len(FEATURE_SETS)), weights=weights)[0]
+        else:
+            new_feat = rng.randint(0, len(FEATURE_SETS) - 1)
+    else:
+        # 重要特徴量未集計の場合はランダム
+        new_feat = orig_feat
+        for _ in range(3):
+            new_feat = rng.randint(0, len(FEATURE_SETS) - 1)
+            if new_feat != orig_feat:
+                break
+
     child['feat_set']   = new_feat
     child['n_features'] = len(FEATURE_SETS[new_feat])
     child['seed']       = rng.randint(0, 9999)
@@ -381,13 +452,122 @@ def ga_sample(results: list, rng: random.Random) -> tuple[dict, str]:
         return _crossover(p1, p2, rng), 'GA_cross'
 
 
+def _current_mode() -> str:
+    """10分ごとに 'random' / 'ga' を交互に返す"""
+    if _mode_start_time <= 0:
+        return 'random'
+    elapsed = time.time() - _mode_start_time
+    cycle   = int(elapsed // MODE_SWITCH_SEC)
+    return 'ga' if cycle % 2 == 1 else 'random'
+
+
+def _update_important_features(results: list) -> None:
+    """上位モデルの feature_importance から重要特徴量プールを更新。
+    PF 重み付きスコアを集計し、多様性のあるプールを構築する。
+    """
+    global _important_features, _important_scores
+    from collections import defaultdict
+    # PF > 0.9 のモデルを最大30件対象（PF閾値は緩め）
+    valid = [r for r in results
+             if r.get('pf', 0) > 0.9 and r.get('trades', 0) >= 200
+             and r.get('feature_importance')]
+    if not valid:
+        # PF > 0 でも試みる (序盤用フォールバック)
+        valid = [r for r in results
+                 if r.get('pf', 0) > 0 and r.get('trades', 0) >= 200
+                 and r.get('feature_importance')]
+    top30 = sorted(valid, key=lambda x: -x['pf'])[:30]
+    if not top30:
+        return
+
+    # PF で重み付けしてスコアを集計
+    scores: dict = defaultdict(float)
+    for rank_i, r in enumerate(top30):
+        pf_weight = r['pf'] ** 2   # PF が高いほど重みを大きく
+        for fname, score in (r.get('feature_importance') or [])[:IMP_FEAT_TOP_K]:
+            if isinstance(fname, str):
+                scores[fname] += score * pf_weight
+
+    if not scores:
+        return
+
+    # スコア降順でソート
+    sorted_feats = sorted(scores.items(), key=lambda x: -x[1])
+    _important_features = [f for f, _ in sorted_feats[:IMP_FEAT_POOL_SIZE]]
+    _important_scores   = {f: s for f, s in sorted_feats[:IMP_FEAT_POOL_SIZE]}
+
+
+def _ga_sample_with_important_features(results: list, rng: random.Random) -> tuple[dict, str]:
+    """重要特徴量プールを使って特徴量セットを構築し GA パラメータと組み合わせる。
+
+    3つのモード:
+      A (60%) imp_core   : 重要度上位を必ず含み、残りは重み付きサンプリング
+      B (25%) imp_wide   : 重要特徴量 + 多めのランダム追加 (多様性重視)
+      C (15%) imp_exploit: 最重要特徴量のみ絞り込み (特化型)
+    各モードに対して GA_param チューニングも適用する。
+    """
+    global _important_features, _important_scores
+    from features import FEATURE_COLS, N_FEATURES
+
+    if len(_important_features) < 5:
+        return ga_sample(results, rng)
+
+    # 重要特徴量のインデックスマップ
+    imp_idx  = [FEATURE_COLS.index(f) for f in _important_features if f in FEATURE_COLS]
+    all_idx  = list(range(N_FEATURES))
+    non_imp  = [i for i in all_idx if i not in imp_idx]
+
+    mode_r = rng.random()
+    if mode_r < 0.60:
+        # モード A: コア重要特徴量 (上位 10〜15) + 重み付き追加
+        core_n   = rng.randint(min(10, len(imp_idx)), min(15, len(imp_idx)))
+        core_idx = imp_idx[:core_n]
+        extra_n  = rng.randint(5, min(20, len(non_imp)))
+        extra    = rng.sample(non_imp, extra_n)
+        feat_idx = sorted(set(core_idx + extra))
+        mode_tag = 'imp_core'
+    elif mode_r < 0.85:
+        # モード B: 重要特徴量から重み付きサンプリング + 多めランダム
+        weights   = [_important_scores.get(FEATURE_COLS[i], 0.001) for i in imp_idx]
+        total_w   = sum(weights)
+        weights   = [w / total_w for w in weights]
+        k_imp     = rng.randint(max(5, len(imp_idx) // 2), len(imp_idx))
+        # 重みに基づくサンプリング
+        chosen_imp = []
+        pool_copy  = list(zip(imp_idx, weights))
+        for _ in range(k_imp):
+            if not pool_copy:
+                break
+            ws = [w for _, w in pool_copy]
+            pick = rng.choices(range(len(pool_copy)), weights=ws)[0]
+            chosen_imp.append(pool_copy[pick][0])
+            pool_copy.pop(pick)
+        extra_n  = rng.randint(10, min(30, len(non_imp)))
+        extra    = rng.sample(non_imp, extra_n)
+        feat_idx = sorted(set(chosen_imp + extra))
+        mode_tag = 'imp_wide'
+    else:
+        # モード C: 最重要特徴量のみ (絞り込み・特化)
+        top_n    = rng.randint(5, min(12, len(imp_idx)))
+        feat_idx = sorted(imp_idx[:top_n])
+        mode_tag = 'imp_exploit'
+
+    # GA パラメータも合わせて取得
+    p, strategy = ga_sample(results, rng)
+    p['feat_indices'] = feat_idx
+    p.pop('feat_set',   None)   # feat_set は feat_indices で上書き
+    p.pop('n_features', None)
+    return p, f'{strategy}_{mode_tag}'
+
+
 def next_params(results: list, rng: random.Random) -> tuple[dict, str]:
-    """完了件数に応じて GA / ランダムを切り替えてパラメータと戦略名を返す"""
+    """10分ごとにランダム↔GAを切り替えてパラメータと戦略名を返す"""
     n = len(results)
     if n < RANDOM_PHASE_LIMIT:
         return sample_params(rng), 'random'
-    if rng.random() < GA_RATIO:
-        return ga_sample(results, rng)   # GA_feat / GA_param / GA_cross のいずれか
+    mode = _current_mode()
+    if mode == 'ga':
+        return _ga_sample_with_important_features(results, rng)
     return sample_params(rng), 'random'
 
 
@@ -409,7 +589,21 @@ def _gpu_info() -> dict:
             'mem_pct':  round(m.used / m.total * 100),
         }
     except Exception:
-        return {'free_gb': 999, 'total_gb': 80, 'used_gb': 0, 'gpu_pct': 0, 'mem_pct': 0}
+        pass
+    # pynvml 失敗時 → torch から VRAM を取得
+    try:
+        import torch
+        if torch.cuda.is_available():
+            prop  = torch.cuda.get_device_properties(0)
+            total = prop.total_memory / 1e9
+            used  = (torch.cuda.memory_allocated(0) + torch.cuda.memory_reserved(0)) / 1e9
+            return {'free_gb': total - used, 'total_gb': total, 'used_gb': used,
+                    'gpu_pct': 0, 'mem_pct': round(used / max(total, 1) * 100)}
+    except Exception:
+        pass
+    fallback_total = 80.0 if H100_MODE else 11.0
+    return {'free_gb': fallback_total, 'total_gb': fallback_total, 'used_gb': 0,
+            'gpu_pct': 0, 'mem_pct': 0}
 
 
 def get_gpu_compute_pids() -> set:
@@ -434,6 +628,16 @@ def get_max_parallel(n_running: int) -> int:
     if not H100_MODE:
         return MAX_PARALLEL
     gi = _gpu_info()
+    total_gb = max(gi['total_gb'], 1)
+    used_gb  = gi['used_gb']
+    mem_pct  = used_gb / total_gb * 100
+
+    # VRAM使用率が90%超なら新規起動を抑制 (OOM防止)
+    if mem_pct > 90 and n_running > 0:
+        return n_running  # 現状維持、追加起動しない
+    # VRAM使用率が85%超なら保守的に並列数制限
+    if mem_pct > 85:
+        return max(1, min(n_running + 1, MAX_PARALLEL))
     # VRAM 空きから枠を計算
     vram_slots = max(1, int(gi['free_gb'] / VRAM_PER_TRIAL))
     # GPU が高負荷なら維持
@@ -445,9 +649,11 @@ def get_max_parallel(n_running: int) -> int:
 
 # ── TOP_N 管理 ────────────────────────────────────────────────────────────────
 def save_trial_model(trial_no: int) -> None:
-    """現在の ONNX と norm_params を top_cache に保存"""
+    """現在の ONNX と norm_params を top_cache に保存 (ノードIDプレフィックス付き)"""
     trial_dir = TRIALS_DIR / f'trial_{trial_no:06d}'
-    dest = TOP_CACHE_DIR / f'trial_{trial_no:06d}'
+    # キャッシュキー: trial_{node_id}_{trial_no} で全ノード間でユニーク
+    cache_key = f'trial_{NODE_ID}_{trial_no:06d}'
+    dest = TOP_CACHE_DIR / cache_key
     dest.mkdir(parents=True, exist_ok=True)
     for fname in ['fx_model.onnx', 'norm_params.json', 'report.html']:
         src = trial_dir / fname
@@ -456,14 +662,18 @@ def save_trial_model(trial_no: int) -> None:
 
 
 def rebuild_top_n(results: list) -> None:
-    """all_results から TOP_N を計算して top100/rank_XXX/ を再構築"""
+    """全ノードの results から TOP_N を計算して top100/rank_XXX/ を再構築"""
     valid = [r for r in results
              if r.get('pf', 0) > 0 and r.get('trades', 0) >= 200]
     top_n = sorted(valid, key=lambda x: -x['pf'])[:TOP_N]
     TOP_DIR.mkdir(parents=True, exist_ok=True)
     for rank, r in enumerate(top_n, 1):
-        tno = r.get('trial', 0)
-        src = TOP_CACHE_DIR / f'trial_{tno:06d}'
+        tno  = r.get('trial', 0)
+        nid  = r.get('node_id', NODE_ID)
+        # ノードIDつきキャッシュキーで検索 (旧形式にもフォールバック)
+        src = TOP_CACHE_DIR / f'trial_{nid}_{tno:06d}'
+        if not src.exists():
+            src = TOP_CACHE_DIR / f'trial_{tno:06d}'   # 旧形式フォールバック
         dst = TOP_DIR / f'rank_{rank:03d}'
         if src.exists():
             if dst.exists():
@@ -512,15 +722,27 @@ def write_progress(running: dict, results: list, best_pf: float, start: float) -
 
     n_done    = len(results)
     if n_done < RANDOM_PHASE_LIMIT:
-        search_phase = 'random'
+        search_phase = 'random (初期フェーズ)'
     else:
-        ga_pct   = int(GA_RATIO * 100)
-        rnd_pct  = 100 - ga_pct
-        f_pct    = int(GA_RATIO * GA_FEAT_RATIO  * 100)
-        p_pct    = int(GA_RATIO * GA_PARAM_RATIO * 100)
-        c_pct    = int(GA_RATIO * GA_CROSS_RATIO * 100)
-        search_phase = (f'GA {ga_pct}% [feat={f_pct}% param={p_pct}% cross={c_pct}%]'
-                        f' + random {rnd_pct}%')
+        mode    = _current_mode()
+        elapsed = time.time() - _mode_start_time if _mode_start_time > 0 else 0
+        cycle   = int(elapsed // MODE_SWITCH_SEC)
+        remain  = int(MODE_SWITCH_SEC - (elapsed % MODE_SWITCH_SEC))
+        imp_tag = f' 🎯重要特徴量{len(_important_features)}個活用' if _important_features else ''
+        if mode == 'ga':
+            search_phase = f'🔍 GA モード (残{remain}秒→ランダム切替){imp_tag}'
+        else:
+            search_phase = f'🎲 ランダム モード (残{remain}秒→GA切替){imp_tag}'
+    # 全ノードの結果集計
+    nodes_summary = {}
+    for r in results:
+        nid = r.get('node_id', NODE_ID)
+        if nid not in nodes_summary:
+            nodes_summary[nid] = {'count': 0, 'best_pf': 0.0}
+        nodes_summary[nid]['count'] += 1
+        if r.get('pf', 0) > nodes_summary[nid]['best_pf'] and r.get('trades', 0) >= 200:
+            nodes_summary[nid]['best_pf'] = r.get('pf', 0)
+
     progress = {
         'phase':           'training' if running else 'waiting',
         'search_phase':    search_phase,
@@ -537,7 +759,11 @@ def write_progress(running: dict, results: list, best_pf: float, start: float) -
         'gpu_pct':         gi['gpu_pct'],
         'vram_used_gb':    round(gi['used_gb'], 1),
         'vram_total_gb':   round(gi['total_gb'], 1),
-        'message': (f"実行中: {len(running)}並列  完了: {n_done}件  "
+        'gpu_name':        GPU_NAME,
+        'node_id':         NODE_ID,
+        'nodes_summary':   nodes_summary,
+        'important_features': _important_features[:10],   # 上位10件を表示
+        'message': (f"[{NODE_ID.upper()}] 実行中: {len(running)}並列  完了: {n_done}件  "
                     f"ベスト PF: {best_pf:.4f}  [{search_phase}]  "
                     f"GPU: {gi['gpu_pct']}%  VRAM: {gi['used_gb']:.1f}/{gi['total_gb']:.0f}GB"),
     }
@@ -754,6 +980,11 @@ class WorkerPool:
     def __len__(self):
         return len(self._futures)
 
+    @property
+    def n_active_workers(self) -> int:
+        """実際にワーカーで実行中の数 (キュー待ちを除く)"""
+        return min(len(self._futures), self._max_workers)
+
 
 def _worker_init_proxy(train_py_dir: str, cache_pkl_path: str) -> None:
     """spawn ワーカーの初期化 (pickleできる関数でなければならない)"""
@@ -778,52 +1009,68 @@ def _run_trial_proxy(train_py_dir: str, trial_no: int, params: dict,
 
 
 # ── チェックポイント保存・復元 ────────────────────────────────────────────────
+# S3 mix フォルダ共有設計:
+#   各ノードは自分のファイルだけを書き込む → 競合ゼロ
+#   mix/results_<NODE_ID>.json    : このノードの全試行結果
+#   mix/top100_<NODE_ID>/         : このノードの top100 モデル
+#   mix/best_<NODE_ID>/           : このノードのベストモデル
+#   mix/meta_<NODE_ID>.json       : このノードのメタ情報
+#   読み込み時は全ノードのファイルをマージして統合 top100 を再構築する
+
 def save_checkpoint(results: list, best_pf: float) -> None:
-    """all_results + best model + top100 をローカル & S3 に保存"""
+    """自ノードの結果を S3 mix/<NODE_ID>/* に保存 (競合なし)"""
+    # 自ノードの結果のみ (node_id が自分 or node_id フィールドなし) を保存
+    own = [r for r in results if r.get('node_id', NODE_ID) == NODE_ID]
     try:
         CHECKPOINT_DIR.mkdir(parents=True, exist_ok=True)
-        # all_results.json
-        tmp = CHECKPOINT_DIR / 'all_results.json.tmp'
-        tmp.write_text(json.dumps(results, indent=2, ensure_ascii=False), encoding='utf-8')
-        tmp.replace(CHECKPOINT_DIR / 'all_results.json')
+        own_key = f'results_{NODE_ID}.json'
+        tmp = CHECKPOINT_DIR / f'{own_key}.tmp'
+        tmp.write_text(json.dumps(own, indent=2, ensure_ascii=False), encoding='utf-8')
+        tmp.replace(CHECKPOINT_DIR / own_key)
+
         # best model ファイル
-        for src, name in [(BEST_ONNX, 'fx_model_best.onnx'),
-                          (BEST_NORM, 'norm_params_best.json'),
-                          (BEST_JSON, 'best_result.json')]:
+        for src, name in [(BEST_ONNX, f'best_{NODE_ID}/fx_model_best.onnx'),
+                          (BEST_NORM, f'best_{NODE_ID}/norm_params_best.json'),
+                          (BEST_JSON, f'best_{NODE_ID}/best_result.json')]:
             if src.exists():
-                shutil.copy2(src, CHECKPOINT_DIR / name)
-        # top100 ディレクトリ
-        top_dst = CHECKPOINT_DIR / 'top100'
+                dst = CHECKPOINT_DIR / name
+                dst.parent.mkdir(parents=True, exist_ok=True)
+                shutil.copy2(src, dst)
+
+        # top100 (自ノード分のみ)
+        top_dst = CHECKPOINT_DIR / f'top100_{NODE_ID}'
         if TOP_DIR.exists():
             if top_dst.exists():
                 shutil.rmtree(top_dst)
             shutil.copytree(TOP_DIR, top_dst)
-        # メタ情報
-        meta = {'saved_at': time.strftime('%Y-%m-%d %H:%M:%S'),
-                'completed': len(results), 'best_pf': best_pf,
-                's3': S3_ENABLED}
-        (CHECKPOINT_DIR / 'meta.json').write_text(
-            json.dumps(meta, ensure_ascii=False), encoding='utf-8')
-        print(f'  [CKPT] ローカル保存完了 ({len(results)}件 / bestPF={best_pf:.4f})')
 
-        # S3 アップロード
+        meta = {'saved_at': time.strftime('%Y-%m-%d %H:%M:%S'),
+                'node_id': NODE_ID, 'completed': len(own), 'best_pf': best_pf}
+        meta_name = f'meta_{NODE_ID}.json'
+        (CHECKPOINT_DIR / meta_name).write_text(
+            json.dumps(meta, ensure_ascii=False), encoding='utf-8')
+        print(f'  [CKPT] ローカル保存完了 node={NODE_ID} ({len(own)}件 / bestPF={best_pf:.4f})')
+
         if S3_ENABLED:
-            upload_files = ['all_results.json', 'meta.json',
-                            'fx_model_best.onnx', 'norm_params_best.json', 'best_result.json']
             ok = 0
-            for name in upload_files:
+            # 結果 JSON
+            if s3_upload(CHECKPOINT_DIR / own_key, own_key): ok += 1
+            if s3_upload(CHECKPOINT_DIR / meta_name, meta_name): ok += 1
+            # best model
+            for name in [f'best_{NODE_ID}/fx_model_best.onnx',
+                         f'best_{NODE_ID}/norm_params_best.json',
+                         f'best_{NODE_ID}/best_result.json']:
                 p = CHECKPOINT_DIR / name
-                if p.exists() and s3_upload(p, name):
-                    ok += 1
-            # top100 を S3 に同期
+                if p.exists() and s3_upload(p, name): ok += 1
+            # top100 モデルをアップロード
             top100_ok = 0
             if top_dst.exists():
                 for f in top_dst.rglob('*'):
                     if f.is_file():
-                        rel = f.relative_to(CHECKPOINT_DIR)
-                        if s3_upload(f, str(rel).replace('\\', '/')):
-                            top100_ok += 1
-            print(f'  [S3]  アップロード完了 ({ok}/{len(upload_files)}件 + top100:{top100_ok}件) '
+                        rel = str(f.relative_to(CHECKPOINT_DIR)).replace('\\', '/')
+                        s3_rel = f'top100_{NODE_ID}/{f.relative_to(top_dst)}'.replace('\\', '/')
+                        if s3_upload(f, s3_rel): top100_ok += 1
+            print(f'  [S3]  アップロード完了 node={NODE_ID} ({ok}件 + top100:{top100_ok}件) '
                   f'→ s3://{S3_BUCKET}/{S3_PREFIX}/')
         else:
             print(f'  [CKPT] S3未設定 → ローカルのみ保存 ({CHECKPOINT_DIR})')
@@ -831,58 +1078,195 @@ def save_checkpoint(results: list, best_pf: float) -> None:
         print(f'  [CKPT] 保存失敗: {e}')
 
 
+def _merge_results_files(result_files: list[Path]) -> list:
+    """複数ノードの results_*.json を読み込んでマージ・重複排除"""
+    merged: dict = {}  # key: (node_id, trial) → result
+    for f in result_files:
+        if not f.exists():
+            continue
+        try:
+            data = json.loads(f.read_text(encoding='utf-8'))
+            for r in data:
+                nid = r.get('node_id', NODE_ID)
+                tno = r.get('trial', 0)
+                key = (nid, tno)
+                if key not in merged or r.get('pf', 0) > merged[key].get('pf', 0):
+                    merged[key] = r
+        except Exception as e:
+            print(f'  [WARN] 結果ファイル読込失敗 {f}: {e}')
+    return sorted(merged.values(), key=lambda x: x.get('trial', 0))
+
+
+def fetch_other_nodes_results() -> list:
+    """S3 から他ノードの結果をダウンロードして返す (ノンブロッキング用)"""
+    if not S3_ENABLED:
+        return []
+    other_files = s3_list_node_keys('results_')
+    results_all = []
+    for rel_key in other_files:
+        # 自ノードはスキップ (すでにローカルにある)
+        if f'results_{NODE_ID}.json' == rel_key:
+            continue
+        local = CHECKPOINT_DIR / rel_key
+        if s3_download(rel_key, local):
+            try:
+                data = json.loads(local.read_text(encoding='utf-8'))
+                results_all.extend(data)
+            except Exception:
+                pass
+    return results_all
+
+
 def restore_checkpoint() -> bool:
-    """S3 → ローカル → 作業ディレクトリ の順にチェックポイントを復元"""
-    # S3 から先にダウンロードを試みる
+    """S3 mix/ から全ノードのチェックポイントをダウンロードしてマージ復元"""
+    CHECKPOINT_DIR.mkdir(parents=True, exist_ok=True)
+
     if S3_ENABLED:
-        print(f'  [S3]  チェックポイント確認中 s3://{S3_BUCKET}/{S3_PREFIX}/ ...')
-        dl_files = ['all_results.json', 'meta.json',
-                    'fx_model_best.onnx', 'norm_params_best.json', 'best_result.json']
-        downloaded = 0
-        for name in dl_files:
-            if s3_download(name, CHECKPOINT_DIR / name):
-                downloaded += 1
-        # top100 は result.json のみダウンロード (ONNXは大きいので起動時はスキップ)
-        top100_json_count = 0
-        for key in s3_list_keys('top100'):
-            if not key.endswith('result.json'):
-                continue   # ONNX / norm_params / report.html はスキップ
-            rel  = key[len(S3_PREFIX)+1:]
+        print(f'  [S3]  mix チェックポイント確認中 s3://{S3_BUCKET}/{S3_PREFIX}/ ...')
+        # 全ノードの results_*.json をダウンロード
+        result_keys = s3_list_node_keys('results_')
+        if not result_keys:
+            print('  [S3]  チェックポイントなし (全ノード)')
+        else:
+            for rk in result_keys:
+                s3_download(rk, CHECKPOINT_DIR / rk)
+                print(f'  [S3]  取得: {rk}')
+        # 全ノードの meta_*.json をダウンロード
+        for mk in s3_list_node_keys('meta_'):
+            s3_download(mk, CHECKPOINT_DIR / mk)
+        # このノード + 他ノードの best モデルをダウンロード
+        for bk in s3_list_node_keys('best_'):
+            s3_download(bk, CHECKPOINT_DIR / bk)
+        # 全ノードの top100 をダウンロード (ONNX含む全ファイル)
+        top100_count = 0
+        for key in s3_list_keys('top100_'):
+            rel = key[len(S3_PREFIX)+1:]   # 例: top100_h100/rank_001/fx_model.onnx
             dest = CHECKPOINT_DIR / rel
             dest.parent.mkdir(parents=True, exist_ok=True)
-            if s3_download(key[len(S3_PREFIX)+1:], dest):
-                top100_json_count += 1
-        if top100_json_count:
-            print(f'  [S3]  top100 result.json {top100_json_count}件 取得 (ONNX はスキップ)')
-        if downloaded == 0:
-            print('  [S3]  チェックポイントなし')
+            if s3_download(rel, dest):
+                top100_count += 1
+        if top100_count:
+            print(f'  [S3]  top100 {top100_count}ファイル取得 (全ノード)')
 
-    # ローカルから復元
-    meta_path = CHECKPOINT_DIR / 'meta.json'
-    ar_path   = CHECKPOINT_DIR / 'all_results.json'
-    if not ar_path.exists():
+    # ── 全ノードの results_*.json をマージ ───────────────────────────────────
+    result_files = list(CHECKPOINT_DIR.glob('results_*.json'))
+    if not result_files:
         return False
     try:
-        meta = json.loads(meta_path.read_text(encoding='utf-8')) if meta_path.exists() else {}
-        print(f'  [CKPT] チェックポイント発見: {meta.get("saved_at","?")}  '
-              f'{meta.get("completed","?")}件  bestPF={meta.get("best_pf","?")}')
-        shutil.copy2(ar_path, ALL_RESULTS)
-        for name, dst in [('fx_model_best.onnx',   BEST_ONNX),
-                          ('norm_params_best.json', BEST_NORM),
-                          ('best_result.json',       BEST_JSON)]:
-            src = CHECKPOINT_DIR / name
-            if src.exists():
-                shutil.copy2(src, dst)
-        top_src = CHECKPOINT_DIR / 'top100'
-        if top_src.exists():
-            if TOP_DIR.exists():
-                shutil.rmtree(TOP_DIR)
-            shutil.copytree(top_src, TOP_DIR)
-        print('  [CKPT] 復元完了 → 前回の続きから再開します')
+        merged = _merge_results_files(result_files)
+        if not merged:
+            return False
+        # ノードID付与 (古いデータで欠落している場合の補完)
+        own_key = f'results_{NODE_ID}.json'
+        for r in merged:
+            if 'node_id' not in r:
+                # どのファイルから来たか特定
+                r['node_id'] = NODE_ID  # デフォルト
+        best_pf_all = max((r.get('pf', 0) for r in merged if r.get('trades', 0) >= 200), default=0.0)
+        print(f'  [CKPT] 全ノードマージ: {len(merged)}件  bestPF={best_pf_all:.4f}  '
+              f'ノード: {sorted({r.get("node_id","?") for r in merged})}')
+        tmp = ALL_RESULTS.with_suffix('.tmp')
+        tmp.write_text(json.dumps(merged, indent=2, ensure_ascii=False), encoding='utf-8')
+        tmp.replace(ALL_RESULTS)
+
+        # このノードのベストモデルを復元
+        best_dir = CHECKPOINT_DIR / f'best_{NODE_ID}'
+        if best_dir.exists():
+            for src_name, dst in [('fx_model_best.onnx',   BEST_ONNX),
+                                   ('norm_params_best.json', BEST_NORM),
+                                   ('best_result.json',       BEST_JSON)]:
+                src = best_dir / src_name
+                if src.exists():
+                    shutil.copy2(src, dst)
+        else:
+            # 旧形式 (node_id なし) のフォールバック
+            for src_name, dst in [('fx_model_best.onnx',   BEST_ONNX),
+                                   ('norm_params_best.json', BEST_NORM),
+                                   ('best_result.json',       BEST_JSON)]:
+                src = CHECKPOINT_DIR / src_name
+                if src.exists():
+                    shutil.copy2(src, dst)
+
+        # top100 を全ノード分まとめて合成 → TOP_DIR に展開
+        _restore_merged_top100()
+        print('  [CKPT] 復元完了 → 全ノードの結果を統合して再開します')
+
+        # 復元後に特徴量重要度バックフィルをバックグラウンド実行
+        def _run_backfill():
+            import importlib.util, time as _t
+            _t.sleep(2)
+            try:
+                spec = importlib.util.spec_from_file_location(
+                    'backfill_top100', str(OUT_DIR / 'backfill_top100.py'))
+                mod = importlib.util.module_from_spec(spec)
+                spec.loader.exec_module(mod)
+                mod.main()
+            except Exception as _e:
+                print(f'  [BACKFILL] エラー: {_e}')
+        threading.Thread(target=_run_backfill, daemon=True).start()
+
         return True
     except Exception as e:
         print(f'  [CKPT] 復元失敗: {e}')
         return False
+
+
+def _restore_merged_top100() -> None:
+    """全ノードの top100_<NODE_ID>/ をマージして TOP_DIR に展開"""
+    # ノードごとの top100 ディレクトリを収集
+    top_dirs = [d for d in CHECKPOINT_DIR.iterdir()
+                if d.is_dir() and d.name.startswith('top100_')]
+    # 旧形式 (top100/) も考慮
+    legacy = CHECKPOINT_DIR / 'top100'
+    if legacy.exists() and legacy.is_dir():
+        top_dirs.append(legacy)
+    if not top_dirs:
+        return
+
+    # 全モデルを PF 降順でソートして上位 TOP_N を TOP_DIR に展開
+    all_models: list[tuple[float, Path]] = []
+    for td in top_dirs:
+        for rank_dir in td.iterdir():
+            if not rank_dir.is_dir():
+                continue
+            rf = rank_dir / 'result.json'
+            if rf.exists():
+                try:
+                    r = json.loads(rf.read_text(encoding='utf-8'))
+                    all_models.append((r.get('pf', 0), rank_dir))
+                except Exception:
+                    pass
+    all_models.sort(key=lambda x: -x[0])
+
+    TOP_DIR.mkdir(parents=True, exist_ok=True)
+    TOP_CACHE_DIR.mkdir(parents=True, exist_ok=True)
+    cache_restored = 0
+    for rank_i, (pf, src_dir) in enumerate(all_models[:TOP_N], 1):
+        rank_dst = TOP_DIR / f'rank_{rank_i:03d}'
+        if rank_dst.exists():
+            shutil.rmtree(rank_dst)
+        shutil.copytree(src_dir, rank_dst)
+        # top_cache にも trial 番号でコピー
+        rf = rank_dst / 'result.json'
+        if rf.exists():
+            try:
+                r = json.loads(rf.read_text(encoding='utf-8'))
+                tno = r.get('trial', 0)
+                nid = r.get('node_id', NODE_ID)
+                if tno > 0:
+                    cache_key = f'trial_{nid}_{tno:06d}'
+                    cache_dst = TOP_CACHE_DIR / cache_key
+                    if not cache_dst.exists():
+                        cache_dst.mkdir(parents=True, exist_ok=True)
+                        for fn in ['fx_model.onnx', 'norm_params.json', 'report.html']:
+                            fs = rank_dst / fn
+                            if fs.exists():
+                                shutil.copy2(fs, cache_dst / fn)
+                        cache_restored += 1
+            except Exception:
+                pass
+    if cache_restored:
+        print(f'  [CKPT] top_cache に {cache_restored}件 復元 (全ノード合算)')
 
 
 # ── メイン ────────────────────────────────────────────────────────────────────
@@ -925,6 +1309,8 @@ def _precache_data() -> bool:
 
 
 def main():
+    global _mode_start_time, _important_features
+
     # SIGTERM (コンテナ停止時) を受け取ったら stop.flag を置いてgraceful shutdown
     def _sigterm_handler(signum, frame):
         print('\n[SIGNAL] SIGTERM 受信 → チェックポイント保存して停止します...')
@@ -936,10 +1322,11 @@ def main():
     TOP_CACHE_DIR.mkdir(parents=True, exist_ok=True)
     TOP_DIR.mkdir(parents=True, exist_ok=True)
 
-    mode_str = f'H100 80GB  並列={MAX_PARALLEL}  VRAM/試行={VRAM_PER_TRIAL}GB' \
-               if H100_MODE else 'GTX 1080 Ti  シングル'
+    gpu_name = NODE_ID.upper()
+    mode_str = f'{gpu_name}  並列={MAX_PARALLEL}  VRAM/試行={VRAM_PER_TRIAL}GB' \
+               if H100_MODE else f'{gpu_name}  並列={MAX_PARALLEL}'
     print('=' * 60)
-    print(f'FX AI EA v8 - 並列ランダムサーチ [{mode_str}]')
+    print(f'FX AI EA v8 - 並列ランダムサーチ [{mode_str}]  S3: mix/{NODE_ID}')
     print(f'  TOP {TOP_N} 保存  タイムアウト {TRIAL_TIMEOUT//60}分  stop.flag: {STOP_FLAG}')
     print(f'  GPU無使用タイムアウト: {NO_GPU_TIMEOUT//60}分  データ準備猶予: {DATA_PREP_BUDGET//60}分')
     print('=' * 60)
@@ -981,44 +1368,70 @@ def main():
     best_pf  = 0.0
     trial_no = 1
     start    = time.time()
+    _mode_start_time = start   # 10分モード切り替えの基準時刻
 
     # ── チェックポイントから復元 (ディスクマウント時は自動継続) ──────────────
     if not ALL_RESULTS.exists():
         restore_checkpoint()
 
+    # ── 他ノード結果の定期マージスレッド (5分ごと) ─────────────────────────
+    _other_merge_stop = threading.Event()
+    def _other_nodes_merge_loop():
+        """バックグラウンドで他ノードの新着結果を取り込んでマージ"""
+        while not _other_merge_stop.wait(300):   # 5分ごと
+            if not S3_ENABLED:
+                continue
+            try:
+                other = fetch_other_nodes_results()
+                if not other:
+                    continue
+                new_count = 0
+                for r in other:
+                    nid  = r.get('node_id', '?')
+                    tno  = r.get('trial', 0)
+                    key  = (nid, tno)
+                    if not any(x.get('node_id') == nid and x.get('trial') == tno
+                               for x in results):
+                        results.append(r)
+                        new_count += 1
+                if new_count:
+                    results.sort(key=lambda x: x.get('trial', 0))
+                    print(f'  [SYNC] 他ノード結果を {new_count}件 取り込み '
+                          f'(合計 {len(results)}件)')
+                    try:
+                        rebuild_top_n(results)
+                    except Exception:
+                        pass
+            except Exception as e:
+                print(f'  [SYNC] 他ノードマージ失敗: {e}')
+    _sync_thread = threading.Thread(target=_other_nodes_merge_loop, daemon=True, name='NodeSync')
+    _sync_thread.start()
+
     # 既存結果を引き継ぐ
     if ALL_RESULTS.exists():
         try:
             raw = json.loads(ALL_RESULTS.read_text(encoding='utf-8'))
-            # ── 重複排除 ステップ1: 同じ trial 番号は最初の1件のみ残す ──────
-            seen_trial: set = set()
+            # ── 重複排除: (node_id, trial) でユニーク ───────────────────────
+            seen_key: set = set()
             results = []
             for r in raw:
+                nid_r = r.get('node_id', NODE_ID)
                 tno_r = r.get('trial', -1)
-                if tno_r not in seen_trial:
-                    seen_trial.add(tno_r)
+                key_r = (nid_r, tno_r)
+                if key_r not in seen_key:
+                    seen_key.add(key_r)
                     results.append(r)
-
-            # ── 重複排除 ステップ2: 結果が同一なレコードも除去 ────────────
-            # (arch・feat_set・pf・trades が一致 → 同じモデルが別trial番号で登録されたケース)
-            seen_result: set = set()
-            deduped: list = []
-            for r in results:
-                sig = (r.get('arch'), r.get('feat_set', -1),
-                       round(r.get('pf', 0), 4), r.get('trades', 0))
-                if sig not in seen_result or sig == (None, -1, 0.0, 0):
-                    seen_result.add(sig)
-                    deduped.append(r)
-            results = deduped
 
             if len(raw) != len(results):
                 print(f"  [DEDUP] 重複除去: {len(raw)} → {len(results)} 件")
-                # クリーンなデータで上書き保存
                 tmp = ALL_RESULTS.with_suffix('.tmp')
                 tmp.write_text(json.dumps(results, indent=2, ensure_ascii=False),
                                encoding='utf-8')
                 tmp.replace(ALL_RESULTS)
-            trial_no = max((r.get('trial', 0) for r in results), default=0) + 1
+            # 自ノードの最大 trial 番号から次の trial 番号を決定
+            own_trials = [r.get('trial', 0) for r in results
+                          if r.get('node_id', NODE_ID) == NODE_ID]
+            trial_no = max(own_trials, default=0) + 1
             valid    = [r for r in results if r.get('pf', 0) > 0]
             if valid:
                 best_r  = max(valid, key=lambda r: r['pf'])
@@ -1061,10 +1474,12 @@ def main():
             # ハイパーパラメータのみ展開 (trial/pf 等の結果メタデータは除外して上書きを防ぐ)
             _meta_keys = {'trial', 'pf', 'trades', 'sr', 'max_dd', 'win_rate',
                           'net_pnl', 'gross_profit', 'gross_loss', 'elapsed_sec',
-                          'timestamp', 'strategy'}
+                          'timestamp', 'strategy', 'node_id'}
             record = {
                 **{k: v for k, v in info['params'].items() if k not in _meta_keys},
                 'trial':     tno,
+                'node_id':   NODE_ID,          # ノードID (マージ時の識別子)
+                'gpu_name':  GPU_NAME,
                 'timestamp': time.strftime('%Y-%m-%d %H:%M:%S'),
                 'strategy':  info.get('strategy', 'random'),
                 'pf':        pf,
@@ -1076,9 +1491,11 @@ def main():
                 'sr':        sr,
                 'max_dd':    max_dd,
                 'elapsed_sec': elapsed,
+                'feature_importance': r.get('feature_importance', []),
             }
-            # 重複防止: 同じ trial_no がすでにあれば上書き、なければ追加
-            existing_idx = next((i for i, r in enumerate(results) if r['trial'] == tno), None)
+            # 重複防止: 同じ (node_id, trial) がすでにあれば上書き、なければ追加
+            existing_idx = next((i for i, r in enumerate(results)
+                                 if r['trial'] == tno and r.get('node_id', NODE_ID) == NODE_ID), None)
             if existing_idx is not None:
                 results[existing_idx] = record
             else:
@@ -1102,6 +1519,24 @@ def main():
                 except Exception as e:
                     print(f"  [WARN] TOP{TOP_N} 更新失敗: {e}")
 
+            # 重要特徴量プールを更新 (5件ごと)
+            if len(results) % 5 == 0:
+                try:
+                    _update_important_features(results)
+                    if _important_features:
+                        print(f"  [IMP] 重要特徴量TOP5: {_important_features[:5]}")
+                except Exception as e:
+                    print(f"  [WARN] 重要特徴量更新失敗: {e}")
+
+            # 10分モード切り替えログ
+            if _mode_start_time > 0:
+                elapsed_total = time.time() - _mode_start_time
+                cycle   = int(elapsed_total // MODE_SWITCH_SEC)
+                remain  = int(MODE_SWITCH_SEC - (elapsed_total % MODE_SWITCH_SEC))
+                if remain <= 5:   # 切り替え直前に通知
+                    next_mode = 'GA' if cycle % 2 == 0 else 'ランダム'
+                    print(f"  [MODE] まもなく {next_mode} モードに切り替え...")
+
             # ベスト更新 (200取引以上のみ対象)
             if pf > best_pf and trades >= 200:
                 best_pf = pf
@@ -1113,6 +1548,13 @@ def main():
                     json.dumps({**info['params'], 'pf': best_pf,
                                 'sr': sr, 'max_dd': max_dd, 'trial': tno},
                                indent=2, ensure_ascii=False), encoding='utf-8')
+                # ベスト更新時に重要特徴量プールも即時更新
+                try:
+                    _update_important_features(results)
+                    if _important_features:
+                        print(f"  [IMP] ベスト更新 → 重要特徴量更新: {_important_features[:5]}")
+                except Exception:
+                    pass
                 print(f"  [BEST] 試行#{tno}  PF={pf:.4f}  SR={sr:.3f}  MaxDD={max_dd:.4f}")
             else:
                 print(f"  [DONE] 試行#{tno:4d}  PF={pf:.4f}  SR={sr:.3f}  "
@@ -1120,14 +1562,21 @@ def main():
                       f"{elapsed/60:.1f}分  (ベスト={best_pf:.4f})")
 
         # ── 新規試行を投入 ──────────────────────────────────────────────────
-        max_par = get_max_parallel(len(trainer))
-        while len(trainer) < max_par:
+        n_active = trainer.n_active_workers if isinstance(trainer, WorkerPool) else len(trainer)
+        max_par = get_max_parallel(n_active)
+        # WorkerPool (ProcessPoolExecutor) の場合はダブルバッファリング:
+        # ワーカー数×2 をキューに保持 → ワーカーが終わった瞬間に次ジョブ開始
+        submit_limit = max_par * 2 if isinstance(trainer, WorkerPool) else max_par
+        while len(trainer) < submit_limit:
             if STOP_FLAG.exists():
                 break
             p, strategy = next_params(results, rng)
             trainer.launch(trial_no, p, best_pf, start, strategy)
             trial_no += 1
-            time.sleep(LAUNCH_INTERVAL)   # 連続起動の間隔 (CUDA初期化の重複を防ぐ)
+            if isinstance(trainer, WorkerPool):
+                time.sleep(0.1)   # キュー投入は高速でOK (CUDA初期化済み)
+            else:
+                time.sleep(LAUNCH_INTERVAL)
 
         # ── 進捗 JSON 書き込み (5秒ごと) ───────────────────────────────────
         write_progress(trainer.running, results, best_pf, start)
@@ -1140,7 +1589,7 @@ def main():
             last_checkpoint      = time.time()
             completed_since_ckpt = 0
 
-        time.sleep(5)
+        time.sleep(1 if isinstance(trainer, WorkerPool) else 5)
 
     # ── 終了処理 ────────────────────────────────────────────────────────────
     write_progress({}, results, best_pf, start)

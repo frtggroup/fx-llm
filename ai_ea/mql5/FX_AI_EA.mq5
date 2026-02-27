@@ -738,7 +738,8 @@ bool RunInference(float &probs[])
          for(int k=0; k<5; k++)
          {
             int k1=MathMin(i+k,n_total-1), k2=MathMin(i+k+1,n_total-1);
-            obv5 += (c[k1]>=c[k2]?1.0:-1.0)*vol[k1];
+            double sg = (c[k1] > c[k2]) ? 1.0 : (c[k1] < c[k2] ? -1.0 : 0.0);  // np.sign()と同一
+            obv5 += sg * vol[k1];
          }
          feat[58] = obv5 / (vm20*5.0 + 1e-9);
 

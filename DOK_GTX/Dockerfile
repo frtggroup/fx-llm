@@ -25,18 +25,18 @@ ENV DEBIAN_FRONTEND=noninteractive \
     PYTORCH_CUDA_ALLOC_CONF=expandable_segments:True,max_split_size_mb:256 \
     # GTX 1080 Ti (Pascal CC6.1): TF32/BF16非対応 → FP16 AMPのみ
     H100_MODE=0 \
-    # GTX 1080 Ti VRAM 11GB → 1〜2並列
-    MAX_PARALLEL=1 \
-    VRAM_PER_TRIAL=8 \
-    # データパス
-    DATA_PATH=/workspace/data/USDJPY_M1.csv \
+    # GTX 1080 Ti VRAM 11GB → 2並列 × 5GB = 10GB
+    MAX_PARALLEL=2 \
+    VRAM_PER_TRIAL=5 \
+    # データパス (H1 CSV 直接使用 → M1リサンプル不要で高速)
+    DATA_PATH=/workspace/data/USDJPY_H1.csv \
     WORKSPACE=/workspace \
     # Sakura オブジェクトストレージ
     S3_ENDPOINT=https://s3.isk01.sakurastorage.jp \
     S3_REGION=jp-north-1 \
     S3_ACCESS_KEY=9LZ71SXF347BKM7MEPPM \
     S3_BUCKET=fxea \
-    S3_PREFIX=checkpoint_gtx
+    S3_PREFIX=mix
 
 # S3_SECRET_KEY は = で始まるため別行で定義
 ENV S3_SECRET_KEY="=u/j64oP8sQvtRXjjNY33jF2S/gOY5WMVgYcdnqG"

@@ -118,9 +118,9 @@ FEATURE_SETS = [
     # 33: 価格アクション + トレンド
     _s(PRICE_ACT, TREND),
     # 34: リターン系のみ
-    [33, 34, 35, 36, 39],  # ret1,ret5,ret20,close_pct_range,ret_accel
+    [34, 35, 36, 37, 40],  # ret1,ret5,ret20,close_pct_range,ret_accel
     # 35: ローソク足形状 (実体・ひげ)
-    [31, 32, 33, 36, 37, 38],  # body,upper_w,lower_w,ret1,consec_up,consec_dn
+    [31, 32, 33, 34, 38, 39],  # body,upper_w,lower_w,ret1,consec_up,consec_dn
     # 36: 価格アクション + サポレジ
     _s(PRICE_ACT, STRUCTURE),
     # 37: 価格アクション + モメンタム
@@ -216,7 +216,7 @@ FEATURE_SETS = [
     # 74: OBV + 価格 + RSI
     [11, 20, 57, 58, 59, 33, 34, 35],
     # 75: VWAP系 (機関投資家の参照点)
-    [60, 11, 13, 22, 33, 34, 46, 57],  # VWAP+RSI+MACD+BB+ret+Donchian+OBV
+    [60, 11, 13, 22, 34, 35, 46, 58],  # VWAP+RSI+MACD+BB+ret1+ret5+Donchian+OBV
     # 76: 加速度・変化率特化
     [19, 20, 21, 36, 39],  # roc20,rsi_slope,macd_slope,close_pct_range,ret_accel
     # 77: 週次・日次構造

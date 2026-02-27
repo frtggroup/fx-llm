@@ -13,12 +13,22 @@ echo "======================================================"
 echo "  FX AI EA 並列ランダムサーチ on Sakura DOK / H100"
 echo "======================================================"
 
-# ── 1. GPU 確認 ────────────────────────────────────────────────────────────
+# ── 1. GPU 確認 + CUDA MPS 起動 ────────────────────────────────────────────
 echo "[*] GPU 確認..."
 nvidia-smi --query-gpu=name,memory.total,driver_version \
            --format=csv,noheader 2>/dev/null \
   && echo "[OK] GPU 検出" \
   || echo "[WARN] nvidia-smi 使用不可 (CPU モードで続行)"
+
+# CUDA MPS: 複数プロセスがGPUカーネルを並行実行できるようにする
+# → ProcessPoolExecutor の 6並列が真のGPU並列になりスループット向上
+echo "[*] CUDA MPS デーモン起動..."
+export CUDA_MPS_PIPE_DIRECTORY=/tmp/nvidia-mps
+export CUDA_MPS_LOG_DIRECTORY=/tmp/nvidia-log
+mkdir -p /tmp/nvidia-mps /tmp/nvidia-log
+nvidia-cuda-mps-control -d 2>/dev/null \
+  && echo "[OK] CUDA MPS 起動完了" \
+  || echo "[WARN] CUDA MPS 起動失敗 (非特権モードまたは未対応GPU — 続行)"
 
 # ── 2. SSH サーバー ────────────────────────────────────────────────────────
 echo "[*] SSH サーバー起動..."
@@ -29,9 +39,15 @@ if [ ! -s /root/.ssh/authorized_keys ]; then
     echo "[WARN] docker exec <container> sh -c 'echo \"<pubkey>\" >> /root/.ssh/authorized_keys'"
 fi
 chmod 600 /root/.ssh/authorized_keys 2>/dev/null || true
+ssh-keygen -A 2>/dev/null || true   # ホスト鍵が未生成の場合に生成
 /usr/sbin/sshd -D &
 SSH_PID=$!
-echo "[OK] SSH サーバー起動 (PID: $SSH_PID)"
+sleep 1
+if kill -0 "$SSH_PID" 2>/dev/null; then
+    echo "[OK] SSH サーバー起動 (PID: $SSH_PID)"
+else
+    echo "[WARN] SSH サーバー起動失敗 (続行)"
+fi
 
 # ── 3. /opt/artifact 永続ストレージのセットアップ (Sakura DOK) ──────────────
 echo "[*] /opt/artifact 永続ストレージをセットアップ..."
@@ -82,33 +98,51 @@ echo "    MAX_PARALLEL : ${MAX_PARALLEL} 並列"
 echo "    VRAM/試行    : ${VRAM_PER_TRIAL} GB"
 echo "    DATA_PATH    : ${DATA_PATH}"
 
-# ── 5. CSV データ自動ダウンロード ──────────────────────────────────────────
-if [ ! -f "${DATA_PATH}" ] || [ ! -s "${DATA_PATH}" ]; then
-    if [ -n "${DATA_URL}" ]; then
-        echo "[*] CSV ダウンロード中: ${DATA_URL}"
-        wget -q --show-progress -O "${DATA_PATH}" "${DATA_URL}" \
-          && echo "[OK] CSV ダウンロード完了 $(du -h ${DATA_PATH} | cut -f1)" \
-          || echo "[ERROR] CSV ダウンロード失敗 — /workspace/data に手動でコピーしてください"
-    else
-        echo "[WARN] DATA_URL 未設定"
-        echo "[WARN] ${DATA_PATH} を手動で配置してください"
-        echo "[WARN] docker cp USDJPY_M1.csv <container>:/workspace/data/"
-    fi
-else
-    echo "[*] CSV 既存: $(du -h ${DATA_PATH} | cut -f1)"
-fi
-
-# ── 6. ダッシュボードサーバー起動 (バックグラウンド) ─────────────────────
+# ── 5. ダッシュボードサーバーを先に起動 (CSV待ちで502にならないよう) ──────
 echo "[*] ダッシュボード起動 (port 8080)..."
 python /workspace/ai_ea/server.py > /workspace/dashboard.log 2>&1 &
 DASH_PID=$!
-sleep 2
+sleep 3
 if kill -0 "$DASH_PID" 2>/dev/null; then
     echo "[OK] ダッシュボード起動 (PID: $DASH_PID)"
     echo "     -> http://0.0.0.0:8080"
 else
     echo "[WARN] ダッシュボード起動失敗 — ログ: /workspace/dashboard.log"
     cat /workspace/dashboard.log 2>/dev/null | tail -20
+fi
+
+# ── 6. CSV データ自動ダウンロード (ダッシュボードと並行) ───────────────────
+mkdir -p "$(dirname ${DATA_PATH})"
+if [ ! -f "${DATA_PATH}" ] || [ ! -s "${DATA_PATH}" ]; then
+    if [ -n "${DATA_URL}" ]; then
+        echo "[*] CSV ダウンロード中 (DATA_URL): ${DATA_URL}"
+        wget -q --show-progress -O "${DATA_PATH}" "${DATA_URL}" \
+          && echo "[OK] CSV ダウンロード完了 $(du -h ${DATA_PATH} | cut -f1)" \
+          || echo "[ERROR] CSV ダウンロード失敗 — /workspace/data に手動でコピーしてください"
+    elif [ -n "${S3_ENDPOINT}" ] && [ -n "${S3_BUCKET}" ]; then
+        echo "[*] CSV を S3 から自動ダウンロード中..."
+        python -c "
+import boto3, os, sys
+s3 = boto3.client('s3',
+    endpoint_url=os.environ['S3_ENDPOINT'],
+    region_name=os.environ.get('S3_REGION','jp-north-1'),
+    aws_access_key_id=os.environ['S3_ACCESS_KEY'],
+    aws_secret_access_key=os.environ['S3_SECRET_KEY']
+)
+dst = os.environ.get('DATA_PATH','/workspace/data/USDJPY_M1.csv')
+fname = os.path.basename(dst)
+try:
+    s3.download_file(os.environ['S3_BUCKET'], fname, dst)
+    print(f'[OK] S3からCSVダウンロード完了: {fname} ({os.path.getsize(dst)/1e6:.1f}MB)')
+except Exception as e:
+    print(f'[WARN] S3 CSVダウンロード失敗: {e}')
+    sys.exit(1)
+" && echo "[OK] CSVダウンロード完了" || echo "[WARN] S3にCSVなし — 手動でコピーしてください"
+    else
+        echo "[WARN] DATA_URL / S3 未設定 — ${DATA_PATH} を手動で配置してください"
+    fi
+else
+    echo "[*] CSV 既存: $(du -h ${DATA_PATH} | cut -f1)"
 fi
 
 # ── 7. stop.flag をクリア ──────────────────────────────────────────────────

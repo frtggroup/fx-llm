@@ -1,6 +1,6 @@
 """
 FX AI EA 並列ランダムサーチ ダッシュボードサーバー v2
-Sakura DOK / H100 対応  ─  FastAPI  port 8080
+GTX 1080 Ti / ローカル対応  ─  FastAPI  port 8080
 
 エンドポイント:
   GET  /                      → ダッシュボード HTML
@@ -14,7 +14,7 @@ Sakura DOK / H100 対応  ─  FastAPI  port 8080
   GET  /download/log          → 学習ログ
   GET  /health                → ヘルスチェック
 """
-import io, json, os, zipfile
+import io, json, os, threading, zipfile
 from datetime import datetime
 from pathlib import Path
 
@@ -36,6 +36,24 @@ LOG_FILE      = WORKSPACE / 'train_run.log'
 app = FastAPI(title="FX AI EA Dashboard v2")
 app.add_middleware(CORSMiddleware, allow_origins=["*"],
                    allow_methods=["*"], allow_headers=["*"])
+
+
+@app.on_event('startup')
+def _startup_backfill():
+    """起動時にバックグラウンドでバックフィルを実行"""
+    def _run():
+        import time as _time
+        _time.sleep(5)          # run_train.py のデータ復元を待つ
+        try:
+            import importlib.util
+            spec = importlib.util.spec_from_file_location(
+                'backfill_top100', str(AI_EA_DIR / 'backfill_top100.py'))
+            mod  = importlib.util.module_from_spec(spec)
+            spec.loader.exec_module(mod)
+            mod.main()
+        except Exception as e:
+            print(f'[startup_backfill] エラー: {e}')
+    threading.Thread(target=_run, daemon=True).start()
 
 
 def _read_progress() -> dict:
@@ -64,7 +82,29 @@ def _gpu_stats() -> dict:
             'gpu_name':     n,
         }
     except Exception:
-        return {'gpu_pct': 0, 'vram_used_gb': 0, 'vram_total_gb': 80, 'gpu_name': 'H100'}
+        try:
+            import torch
+            if torch.cuda.is_available():
+                prop  = torch.cuda.get_device_properties(0)
+                total = round(prop.total_memory / 1e9, 1)
+                used  = round((torch.cuda.memory_allocated(0) + torch.cuda.memory_reserved(0)) / 1e9, 1)
+                name  = prop.name
+                return {'gpu_pct': 0, 'vram_used_gb': used, 'vram_total_gb': total, 'gpu_name': name}
+        except Exception:
+            pass
+        return {'gpu_pct': 0, 'vram_used_gb': 0, 'vram_total_gb': 11, 'gpu_name': 'GTX 1080 Ti'}
+
+
+def _find_model_dir(rank: int, trial_no: int) -> Path | None:
+    """rank_XXX → TRIALS_DIR/trial_XXXXXX の順でモデルディレクトリを探す"""
+    rank_dir = TOP_DIR / f'rank_{rank:03d}'
+    if (rank_dir / 'fx_model.onnx').exists():
+        return rank_dir
+    # TRIALS_DIR にフォールバック (rebuild_top_n がキャッシュミスした場合)
+    trial_dir = TRIALS_DIR / f'trial_{trial_no:06d}'
+    if (trial_dir / 'fx_model.onnx').exists():
+        return trial_dir
+    return None
 
 
 def _get_top_n(n: int = 100) -> list:
@@ -74,11 +114,28 @@ def _get_top_n(n: int = 100) -> list:
                    if r.get('pf', 0) > 0 and r.get('trades', 0) >= 200]
         top     = sorted(valid, key=lambda x: -x['pf'])[:n]
         for i, r in enumerate(top):
-            rank = i + 1
+            rank     = i + 1
+            trial_no = r.get('trial', 0)
             r['rank']       = rank
             rank_dir        = TOP_DIR / f'rank_{rank:03d}'
-            r['has_model']  = (rank_dir / 'fx_model.onnx').exists()
-            r['has_report'] = (rank_dir / 'report.html').exists()
+            model_dir       = _find_model_dir(rank, trial_no)
+            r['has_model']  = model_dir is not None
+            r['has_report'] = (rank_dir / 'report.html').exists() or (
+                model_dir is not None and (model_dir / 'report.html').exists())
+            # 特徴量重要度: all_results.json → rank_dir/result.json の順に取得
+            imp = r.get('feature_importance')
+            if not imp:
+                for res_f in [rank_dir / 'result.json',
+                              TRIALS_DIR / f'trial_{trial_no:06d}' / 'last_result.json']:
+                    if res_f.exists():
+                        try:
+                            rd = json.loads(res_f.read_text(encoding='utf-8'))
+                            imp = rd.get('feature_importance', [])
+                            if imp:
+                                break
+                        except Exception:
+                            pass
+            r['feature_importance'] = imp or []
         return top
     except Exception:
         return []
@@ -104,6 +161,24 @@ def api_status():
 @app.get('/api/top100')
 def api_top100():
     return _get_top_n(100)
+
+
+@app.post('/api/backfill')
+def api_backfill():
+    """不足データ（feature_importance 等）をバックグラウンドで補完する"""
+    def _run():
+        try:
+            import importlib.util, sys as _sys
+            spec = importlib.util.spec_from_file_location(
+                'backfill_top100', str(AI_EA_DIR / 'backfill_top100.py'))
+            mod  = importlib.util.module_from_spec(spec)
+            spec.loader.exec_module(mod)
+            mod.main()
+        except Exception as e:
+            print(f'[backfill] エラー: {e}')
+    t = threading.Thread(target=_run, daemon=True)
+    t.start()
+    return {'ok': True, 'message': 'バックフィルをバックグラウンドで開始しました'}
 
 
 @app.post('/api/stop')
@@ -145,9 +220,19 @@ def get_report(trial_no: int):
 
 @app.get('/download/model/{rank}')
 def download_model(rank: int):
-    model_dir = TOP_DIR / f'rank_{rank:03d}'
-    if not model_dir.exists():
-        raise HTTPException(404, f'rank {rank} のモデルがまだ生成されていません')
+    # top100 テーブルから trial_no を逆引き
+    trial_no = 0
+    try:
+        top = _get_top_n(100)
+        for r in top:
+            if r.get('rank') == rank:
+                trial_no = r.get('trial', 0)
+                break
+    except Exception:
+        pass
+    model_dir = _find_model_dir(rank, trial_no)
+    if model_dir is None:
+        raise HTTPException(404, f'rank {rank} のモデルがまだ生成されていません (ONNX未出力 or PF<1.2)')
     buf = io.BytesIO()
     with zipfile.ZipFile(buf, 'w', zipfile.ZIP_DEFLATED) as zf:
         for f in sorted(model_dir.iterdir()):
@@ -242,7 +327,7 @@ DASHBOARD_HTML = r"""<!DOCTYPE html>
 <head>
 <meta charset="UTF-8">
 <meta name="viewport" content="width=device-width,initial-scale=1">
-<title>FX AI EA H100 並列サーチ</title>
+<title>FX AI EA 並列ランダムサーチ</title>
 <script src="https://cdn.jsdelivr.net/npm/chart.js@4/dist/chart.umd.min.js"></script>
 <style>
 *{box-sizing:border-box;margin:0;padding:0}
@@ -308,7 +393,12 @@ tr:hover td{background:#1c2128}
 
 <div class="header">
   <span class="live-dot" id="dot"></span>
-  <h1>FX AI EA H100 並列ランダムサーチ ダッシュボード</h1>
+  <h1>FX AI EA 並列ランダムサーチ ダッシュボード
+    <span id="gpu-name-badge" style="font-size:.55em;background:#21262d;border:1px solid #30363d;
+      border-radius:6px;padding:2px 8px;vertical-align:middle;color:#79c0ff;font-weight:400;
+      margin-left:10px">GPU: ...</span>
+  </h1>
+  <span id="nodes-info" style="font-size:.72em;color:#8b949e;margin-right:12px"></span>
   <span class="badge badge-wait" id="phase-badge">待機中</span>
 </div>
 
@@ -317,6 +407,7 @@ tr:hover td{background:#1c2128}
   <a class="btn btn-gray" href="/download/best"    target="_blank">💾 ベスト DL</a>
   <a class="btn btn-gray" href="/download/results" target="_blank">📊 全結果 JSON</a>
   <a class="btn btn-gray" href="/download/log"     target="_blank">📋 ログ</a>
+  <button class="btn btn-gray" onclick="runBackfill()" id="backfill-btn" title="特徴量重要度など不足データを補完">🔄 データ補完</button>
   <span style="flex:1"></span>
   <span style="font-size:.74em;color:#8b949e" id="stop-status"></span>
 </div>
@@ -352,7 +443,7 @@ tr:hover td{background:#1c2128}
     <div class="big" id="m-gpu" style="color:#3fb950">0%</div>
     <div class="bar-wrap"><div id="bar-gpu" class="bar" style="background:#3fb950;width:0%"></div></div>
     <div class="lrow" style="margin-top:6px"><span>VRAM</span>
-      <span id="m-vram" style="color:#79c0ff">0 / 80 GB</span></div>
+      <span id="m-vram" style="color:#79c0ff">0 / 11 GB</span></div>
     <div class="bar-wrap"><div id="bar-vram" class="bar" style="background:#2196f3;width:0%"></div></div>
   </div>
 
@@ -403,6 +494,7 @@ tr:hover td{background:#1c2128}
           <th>Rank</th><th>Trial#</th>
           <th>PF</th><th>純利益</th><th>SR</th><th>MaxDD</th>
           <th>取引</th><th>勝率</th><th>Arch</th><th>Hidden</th><th>Feat#</th>
+          <th style="min-width:180px">重要特徴量 TOP10</th>
           <th>Report</th><th>DL</th>
         </tr>
       </thead>
@@ -462,6 +554,20 @@ function pct(a,b){ return b>0?Math.min(100,Math.round(a/b*100)):0; }
 function fmtN(v, d=4){ return v == null ? '-' : (+v).toFixed(d); }
 function openStopModal()  { document.getElementById('stop-modal').classList.add('show'); }
 function closeStopModal() { document.getElementById('stop-modal').classList.remove('show'); }
+async function runBackfill() {
+  const btn = document.getElementById('backfill-btn');
+  btn.disabled = true;
+  btn.textContent = '⏳ 補完中...';
+  try {
+    const res = await fetch('/api/backfill', {method:'POST'});
+    const d   = await res.json();
+    btn.textContent = '✅ 開始しました';
+    setTimeout(() => { btn.disabled = false; btn.textContent = '🔄 データ補完'; }, 10000);
+  } catch(e) {
+    btn.textContent = '❌ 失敗: '+e.message;
+    setTimeout(() => { btn.disabled = false; btn.textContent = '🔄 データ補完'; }, 5000);
+  }
+}
 async function confirmStop() {
   closeStopModal();
   try {
@@ -616,10 +722,10 @@ async function updateTop100() {
       document.getElementById('m-top-pf').textContent = `TOP1 PF: ${(best.pf??0).toFixed(4)}`;
     }
     if (!data.length) {
-      tbody.innerHTML='<tr><td colspan="13" style="text-align:center;color:#8b949e">まだ有効な試行がありません (取引数≥200)</td></tr>';
+      tbody.innerHTML='<tr><td colspan="14" style="text-align:center;color:#8b949e">まだ有効な試行がありません (取引数≥200)</td></tr>';
       return;
     }
-    tbody.innerHTML = data.map(r => {
+      tbody.innerHTML = data.map(r => {
       const pf  = r.pf??0;
       const pfC = pf>=2?'#f0883e':pf>=1.5?'#3fb950':pf>=1.2?'#ffa657':'#79c0ff';
       const sr  = r.sr??0;
@@ -631,6 +737,25 @@ async function updateTop100() {
       const rpBtn = r.has_report
         ? `<a class="btn btn-blue btn-sm" href="/report/${r.trial}" target="_blank">📊</a>`
         : `<span style="color:#484f58;font-size:.7em">-</span>`;
+      // 特徴量重要度TOP10
+      const imp = (r.feature_importance || []).filter(fi => Array.isArray(fi) && fi.length >= 2 && fi[0] && typeof fi[0]==='string');
+      const maxScore = imp.length && imp[0][1] > 0 ? imp[0][1] : 1;
+      const impHtml = imp.length
+        ? imp.slice(0,10).map((fi,idx) => {
+            const fname = String(fi[0]);
+            const score = Number(fi[1]) || 0;
+            const pct = Math.round((score / maxScore) * 100);
+            const col = pct>80?'#f0883e':pct>50?'#ffa657':'#79c0ff';
+            const barW = Math.max(2, pct);
+            return `<span style="display:inline-block;margin:1px 2px;padding:2px 6px;`
+              +`border-radius:3px;background:#21262d;font-size:.68em;color:${col};`
+              +`border-left:${barW/10+1}px solid ${col}" `
+              +`title="${fname}: ${score.toFixed(5)} (${pct}%)">`
+              +`<b>${idx+1}.</b>${fname}</span>`;
+          }).join('')
+        : r.has_model
+          ? '<span style="color:#58a6ff;font-size:.75em">⏳ 解析中</span>'
+          : '<span style="color:#484f58;font-size:.75em">—</span>';
       return `<tr>
         <td style="font-weight:${r.rank<=3?'700':'400'}">${rkMd}</td>
         <td style="color:#8b949e">#${r.trial??'-'}</td>
@@ -643,6 +768,7 @@ async function updateTop100() {
         <td style="color:#79c0ff;font-size:.8em">${r.arch??'-'}</td>
         <td style="font-size:.8em">${r.hidden??'-'}×${r.layers??1}</td>
         <td style="font-size:.8em">${r.n_features??'-'}</td>
+        <td style="text-align:left;max-width:220px">${impHtml}</td>
         <td>${rpBtn}</td>
         <td>${dlBtn}</td>
       </tr>`;
@@ -693,7 +819,7 @@ async function poll() {
     // GPU
     const gpuP  = d.gpu_pct??0;
     const vramU = d.vram_used_gb??0;
-    const vramT = d.vram_total_gb??80;
+    const vramT = d.vram_total_gb??11;
     const gpuC  = gpuP>90?'#f44336':gpuP>75?'#3fb950':'#58a6ff';
     document.getElementById('m-gpu').textContent         = gpuP+'%';
     document.getElementById('m-gpu').style.color         = gpuC;
@@ -701,6 +827,19 @@ async function poll() {
     document.getElementById('bar-gpu').style.background  = gpuC;
     document.getElementById('m-vram').textContent        = `${vramU.toFixed(1)} / ${vramT.toFixed(0)} GB`;
     document.getElementById('bar-vram').style.width      = pct(vramU,vramT)+'%';
+
+    // GPU名 & ノード情報
+    const gpuLabel = d.gpu_name || (d.node_id ? d.node_id.toUpperCase() : null);
+    if (gpuLabel) {
+      document.getElementById('gpu-name-badge').textContent = gpuLabel;
+    }
+    if (d.nodes_summary) {
+      const ns = d.nodes_summary;
+      const parts = Object.entries(ns).map(([nid,info]) =>
+        `<span style="color:#79c0ff">${nid.toUpperCase()}</span>: ${info.count}件 PF=${(info.best_pf||0).toFixed(3)}`
+      );
+      document.getElementById('nodes-info').innerHTML = '🖥 ' + parts.join('&nbsp;│&nbsp;');
+    }
 
     // 並列試行状態
     updateRunningTrials(d.running_trials);
@@ -730,4 +869,5 @@ setInterval(poll, 1000);
 
 if __name__ == '__main__':
     import uvicorn
-    uvicorn.run(app, host='0.0.0.0', port=8080, log_level='info')
+    _port = int(os.environ.get('DASHBOARD_PORT', '8080'))
+    uvicorn.run(app, host='0.0.0.0', port=_port, log_level='info')

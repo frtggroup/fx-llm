@@ -221,12 +221,17 @@ def prepare(args):
     print(f"  ラベル生成中... (triple_barrier)")
     seq_len   = args.seq_len
 
-    # 特徴量セット選択 (優先順: feat_set > n_features > feat_frac > 全部)
+    # 特徴量セット選択 (優先順: feat_indices(直接指定) > feat_set > n_features > feat_frac > 全部)
     feat_set_id = getattr(args, 'feat_set', -2)
     n_feat_arg  = getattr(args, 'n_features', 0)
     feat_frac   = getattr(args, 'feat_frac', 1.0)
+    feat_indices_direct = getattr(args, 'feat_indices', None)
 
-    if 0 <= feat_set_id <= 99:
+    if feat_indices_direct and isinstance(feat_indices_direct, list):
+        # GAが重要特徴量から直接指定したインデックスリスト
+        feat_indices = sorted(int(i) for i in feat_indices_direct if 0 <= int(i) < N_FEATURES)
+        print(f"  特徴量直指定: {len(feat_indices)}個 (重要特徴量GAモード)")
+    elif 0 <= feat_set_id <= 99:
         # 設計済みセットを使用
         feat_indices = FEATURE_SETS[feat_set_id]
         print(f"  特徴量セット#{feat_set_id+1}: {len(feat_indices)}特徴量")
@@ -425,9 +430,9 @@ def train(args, X_tr, y_tr, X_te, y_te, mean, std, n_feat=None):
     best_loss      = float('inf')
     best_state     = None
     warmup_end     = max(20, int(args.epochs * 0.05))  # 5% warmup
-    patience       = max(50, int(args.epochs * 0.15))  # 15% (緩和)
-    overfit_pat    = 20                                 # 20ep連続で判定
-    min_epochs     = warmup_end + 10
+    patience       = max(30, int(args.epochs * 0.08))  # 8% → 800ep=64 (旧15%=120)
+    overfit_pat    = 15                                 # 15ep連続で判定
+    min_epochs     = warmup_end + 5
     no_imp         = 0
     overfit_count  = 0
     stop_reason    = ''
@@ -792,6 +797,72 @@ def _run_inference(sess, x: np.ndarray, mode: str) -> np.ndarray:
     return probs
 
 
+def calc_feature_importance(model, X_te: np.ndarray,
+                            feat_indices: list | None,
+                            n_samples: int = 300) -> list[tuple[str, float]]:
+    """Permutation Importance: 各特徴量をシャッフルして予測変化量を測定。
+    Returns: [(feat_name, importance_score), ...] 降順ソート済み
+    """
+    import torch
+    from features import FEATURE_COLS
+    device = next(model.parameters()).device
+    model.eval()
+    n = min(n_samples, len(X_te))
+    X_s = np.ascontiguousarray(X_te[:n])   # (n, seq, feat)
+    n_feat = X_s.shape[2]
+
+    with torch.no_grad():
+        xb = torch.from_numpy(X_s).to(device)
+        base_probs = model(xb).float().cpu().numpy()   # (n, 3)
+
+    # baseline: 予測エントロピー (確信度の逆)
+    base_ent = float(-np.mean(base_probs * np.log(base_probs + 1e-9)))
+
+    rng = np.random.default_rng(42)
+    importances = []
+    for i in range(n_feat):
+        X_p = X_s.copy()
+        X_p[:, :, i] = X_p[rng.permutation(n), :, i]   # shuffle feature i
+        with torch.no_grad():
+            xb = torch.from_numpy(np.ascontiguousarray(X_p)).to(device)
+            perm_probs = model(xb).float().cpu().numpy()
+        perm_ent = float(-np.mean(perm_probs * np.log(perm_probs + 1e-9)))
+        score = abs(perm_ent - base_ent)
+        global_idx = feat_indices[i] if feat_indices else i
+        fname = FEATURE_COLS[global_idx] if global_idx < len(FEATURE_COLS) else f'feat_{global_idx}'
+        importances.append((fname, round(score, 6)))
+
+    importances.sort(key=lambda x: -x[1])
+    return importances
+
+
+def backtest_torch(model, X_te, df_te, threshold, tp_mult, sl_mult,
+                   seq_len=20, hold_bars=48, report_dir: Path = None, trial_no: int = 0):
+    """PyTorchモデルで直接推論するバックテスト。
+    ONNX エクスポート/ロードを省略して高速化。ゴミモデル1試行あたり約2秒節約。"""
+    import torch
+    device = next(model.parameters()).device
+    model.to(device).eval()   # パラメータ + バッファを同じデバイスに揃える
+    n = len(X_te)
+    probs = np.zeros((n, 3), dtype=np.float32)
+    bs = 1024
+    with torch.no_grad():
+        for i in range(0, n, bs):
+            xb = torch.from_numpy(np.ascontiguousarray(X_te[i:i+bs])).to(device)
+            with torch.amp.autocast('cuda', enabled=device.type == 'cuda', dtype=torch.float16):
+                out = model(xb)
+            probs[i:i+bs] = out.float().cpu().numpy()
+    close    = df_te['close'].values
+    atr      = df_te['atr14'].values
+    high     = df_te['high'].values
+    low      = df_te['low'].values
+    open_arr = df_te['open'].values
+    dates    = df_te.index
+    trades = _simulate_trades(probs, close, high, low, open_arr, atr,
+                              n, seq_len, hold_bars, threshold, tp_mult, sl_mult, dates)
+    return _backtest_evaluate(trades, dates, report_dir, trial_no)
+
+
 def backtest(onnx_path, X_te, df_te, threshold, tp_mult, sl_mult,
              seq_len=20, hold_bars=48, report_dir: Path = None, trial_no: int = 0):
     import onnxruntime as ort
@@ -1022,22 +1093,34 @@ def main():
     n_feat = X_tr.shape[2]
     model = train(args, X_tr, y_tr, X_te, y_te, mean, std, n_feat=n_feat)
 
-    print("\n=== ONNX エクスポート ===")
     wrapped = FXPredictorWithNorm(model, mean, std)
-    export_onnx(wrapped, seq_len, n_feat, str(ONNX_PATH), opset=12)
-    verify_onnx(str(ONNX_PATH), seq_len, n_feat)
 
     print("\n=== バックテスト (テスト期間) ===")
-    r = backtest(ONNX_PATH, X_te, df_te, args.threshold, args.tp, args.sl,
-                 seq_len=seq_len,
-                 hold_bars=args.forward,
-                 report_dir=OUT_DIR,
-                 trial_no=args.trial)
+    r = backtest_torch(wrapped, X_te, df_te, args.threshold, args.tp, args.sl,
+                       seq_len=seq_len,
+                       hold_bars=args.forward,
+                       report_dir=OUT_DIR,
+                       trial_no=args.trial)
+
+    if r['trades'] >= 200:
+        print(f"\n=== ONNX エクスポート (取引{r['trades']}件) ===")
+        export_onnx(wrapped, seq_len, n_feat, str(ONNX_PATH), opset=12)
     print(f"  PF={r['pf']}  取引={r['trades']}  勝率={r['win_rate']:.1%}  "
           f"SR={r.get('sr',0):.3f}  MaxDD={r.get('max_dd',0):.4f}")
 
+    # 特徴量重要度 (PF > 0 で取引があれば計算)
+    feat_imp = []
+    if r['trades'] >= 10:
+        try:
+            feat_imp = calc_feature_importance(wrapped, X_te, feat_indices, n_samples=300)
+            top5 = ', '.join(f'{n}({s:.4f})' for n, s in feat_imp[:5])
+            print(f"  特徴量重要度 TOP5: {top5}")
+        except Exception as e:
+            print(f"  [WARN] 特徴量重要度計算失敗: {e}")
+
     # 結果保存
     full = {**{k: v for k, v in vars(args).items() if k != 'out_dir'}, **r}
+    full['feature_importance'] = feat_imp
     (OUT_DIR / 'last_result.json').write_text(
         json.dumps(full, indent=2, ensure_ascii=False), encoding='utf-8')
 
@@ -1149,12 +1232,28 @@ def run_trial_worker(trial_no: int, params: dict, trial_dir_str: str,
         model = train(args, X_tr, y_tr, X_te, y_te, mean, std, n_feat=n_feat)
 
         wrapped = FXPredictorWithNorm(model, mean, std)
-        export_onnx(wrapped, seq_len, n_feat, str(ONNX_PATH), opset=12)
-        verify_onnx(str(ONNX_PATH), seq_len, n_feat)
 
-        r = backtest(ONNX_PATH, X_te, df_te, args.threshold, args.tp, args.sl,
-                     seq_len=seq_len, hold_bars=args.forward,
-                     report_dir=trial_dir, trial_no=trial_no)
+        # ── PyTorch で直接バックテスト (ONNX エクスポート/ロード不要 → 2〜3秒節約) ──
+        r = backtest_torch(wrapped, X_te, df_te, args.threshold, args.tp, args.sl,
+                           seq_len=seq_len, hold_bars=args.forward,
+                           report_dir=trial_dir, trial_no=trial_no)
+
+        # ── ONNX エクスポート (採用基準 trades >= 200 のモデルのみ) ─────────────
+        if r['trades'] >= 200:
+            try:
+                export_onnx(wrapped, seq_len, n_feat, str(ONNX_PATH), opset=12)
+            except Exception as _e:
+                print(f"  [WARN] ONNX エクスポート失敗: {_e}")
+
+        # ── 特徴量重要度 (取引 >= 10 で計算) ────────────────────────────────────
+        feat_imp = []
+        if r['trades'] >= 10:
+            try:
+                feat_imp = calc_feature_importance(wrapped, X_te, feat_indices, n_samples=200)
+                top5 = ', '.join(f'{n}({s:.4f})' for n, s in feat_imp[:5])
+                print(f"  特徴量重要度 TOP5: {top5}")
+            except Exception as _e:
+                print(f"  [WARN] 特徴量重要度計算失敗: {_e}")
 
         # norm_params に EA 用パラメータを追記
         try:
@@ -1169,6 +1268,7 @@ def run_trial_worker(trial_no: int, params: dict, trial_dir_str: str,
         # last_result.json 保存 (メインプロセスが読み取る)
         full = {**{k: v for k, v in vars(args).items()
                    if k not in ('out_dir', 'total_trials', 'best_pf', 'start_time')}, **r}
+        full['feature_importance'] = feat_imp
         (trial_dir / 'last_result.json').write_text(
             json.dumps(full, indent=2, ensure_ascii=False), encoding='utf-8')
 
