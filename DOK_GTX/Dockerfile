@@ -81,6 +81,14 @@ RUN chmod 600 /root/.ssh/authorized_keys
 
 # ── Source files ─────────────────────────────────────────────────────────────
 COPY ai_ea/ /workspace/ai_ea/
+# 学習実行時に生成されるランタイムファイルをイメージから除去
+RUN rm -f /workspace/ai_ea/all_results.json \
+          /workspace/ai_ea/best_result.json \
+          /workspace/ai_ea/last_result.json \
+          /workspace/ai_ea/progress.json \
+          /workspace/ai_ea/llm_progress.json \
+          /workspace/ai_ea/norm_params.json \
+          /workspace/ai_ea/norm_params_best.json
 COPY DOK_GTX/entrypoint.sh /workspace/entrypoint.sh
 RUN chmod +x /workspace/entrypoint.sh
 
