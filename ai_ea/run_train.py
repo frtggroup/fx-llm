@@ -655,6 +655,128 @@ class ParallelTrainer:
         return len(self.running)
 
 
+# ── 常駐ワーカープール (ProcessPoolExecutor) ─────────────────────────────────
+# サブプロセス起動コスト (~8秒/試行) を初回起動1回に圧縮する。
+# workers stay alive → Python/torch/CUDA init は1ワーカー当たり1回のみ。
+class WorkerPool:
+    """ProcessPoolExecutor ベースの常駐ワーカープール。
+    ParallelTrainer と同一インターフェースを持ち差し替え可能。
+    """
+    def __init__(self, max_workers: int, cache_pkl_path):
+        import concurrent.futures as _cf
+        import multiprocessing as _mp
+        import sys as _sys
+        _sys.path.insert(0, str(TRAIN_PY.parent))
+        from train import worker_init  # noqa: 存在確認
+        self._max_workers   = max_workers
+        self._cache_path    = str(cache_pkl_path)
+        self._futures: dict = {}   # trial_no -> Future
+        self._meta:    dict = {}   # trial_no -> {params, strategy, start_time, trial_dir}
+        self.lock           = threading.Lock()
+        print(f"  [WorkerPool] {max_workers}ワーカー起動中... (初回のみ数秒かかります)")
+        self._executor = _cf.ProcessPoolExecutor(
+            max_workers=max_workers,
+            mp_context=_mp.get_context('spawn'),
+            initializer=_worker_init_proxy,
+            initargs=(str(TRAIN_PY.parent), self._cache_path),
+        )
+        # ウォームアップ: ワーカーを全部起こしてCUDAを初期化させる
+        import concurrent.futures as _cf2
+        warmup_futs = [self._executor.submit(_warmup_probe) for _ in range(max_workers)]
+        _cf2.wait(warmup_futs, timeout=120)
+        print(f"  [WorkerPool] 全{max_workers}ワーカー準備完了")
+
+    def launch(self, trial_no: int, params: dict, best_pf: float, start_time: float,
+               strategy: str = 'random'):
+        trial_dir = TRIALS_DIR / f'trial_{trial_no:06d}'
+        trial_dir.mkdir(parents=True, exist_ok=True)
+        future = self._executor.submit(
+            _run_trial_proxy,
+            str(TRAIN_PY.parent),
+            trial_no, params, str(trial_dir), best_pf, start_time,
+        )
+        with self.lock:
+            self._futures[trial_no] = future
+            self._meta[trial_no] = {
+                'params':     params,
+                'strategy':   strategy,
+                'start_time': time.time(),
+                'trial_dir':  trial_dir,
+            }
+        feat_info = (f"set#{params['feat_set']}"
+                     if params.get('feat_set', -1) >= 0 else f"rand{params['n_features']}")
+        _TAG_MAP = {
+            'GA_feat':  '🔍GA_feat ',
+            'GA_param': '🔧GA_param',
+            'GA_cross': '🧬GA_cross',
+            'random':   '🎲Rnd     ',
+        }
+        tag = _TAG_MAP.get(strategy, f'?{strategy}')
+        print(f"  [LAUNCH] 試行#{trial_no:4d} {tag}  {params['arch']:12s}  "
+              f"h={params['hidden']:4d}  feat={feat_info}")
+
+    def poll_completed(self) -> list:
+        done = []
+        now  = time.time()
+        with self.lock:
+            for tno in list(self._futures.keys()):
+                future = self._futures[tno]
+                meta   = self._meta[tno]
+                elapsed = now - meta['start_time']
+
+                if future.done():
+                    done.append((tno, meta))
+                    del self._futures[tno]
+                    del self._meta[tno]
+                elif elapsed > TRIAL_TIMEOUT:
+                    # タイムアウト: future をキャンセル (実行中なら無視され次の試行で上書き)
+                    future.cancel()
+                    print(f"  [TIMEOUT] 試行#{tno} ({elapsed/60:.0f}分超) → スキップ")
+                    done.append((tno, meta))
+                    del self._futures[tno]
+                    del self._meta[tno]
+        return done
+
+    def terminate_all(self):
+        with self.lock:
+            for f in self._futures.values():
+                f.cancel()
+        try:
+            self._executor.shutdown(wait=False, cancel_futures=True)
+        except Exception:
+            pass
+
+    @property
+    def running(self) -> dict:
+        """write_progress との互換性のため _meta を running として公開"""
+        return self._meta
+
+    def __len__(self):
+        return len(self._futures)
+
+
+def _worker_init_proxy(train_py_dir: str, cache_pkl_path: str) -> None:
+    """spawn ワーカーの初期化 (pickleできる関数でなければならない)"""
+    import sys as _sys
+    _sys.path.insert(0, train_py_dir)
+    from train import worker_init
+    worker_init(cache_pkl_path)
+
+
+def _warmup_probe() -> bool:
+    """ワーカーが起動済みか確認するだけのダミータスク"""
+    return True
+
+
+def _run_trial_proxy(train_py_dir: str, trial_no: int, params: dict,
+                     trial_dir_str: str, best_pf: float, start_time: float) -> dict:
+    """spawn ワーカーで run_trial_worker を呼ぶプロキシ (pickleできる関数)"""
+    import sys as _sys
+    _sys.path.insert(0, train_py_dir)
+    from train import run_trial_worker
+    return run_trial_worker(trial_no, params, trial_dir_str, best_pf, start_time)
+
+
 # ── チェックポイント保存・復元 ────────────────────────────────────────────────
 def save_checkpoint(results: list, best_pf: float) -> None:
     """all_results + best model + top100 をローカル & S3 に保存"""
@@ -843,8 +965,18 @@ def main():
     if STOP_FLAG.exists():
         STOP_FLAG.unlink()
 
-    rng      = random.Random()
-    trainer  = ParallelTrainer()
+    rng     = random.Random()
+    # データキャッシュが存在すれば常駐ワーカープールを使用 (サブプロセス起動コスト削減)
+    _cache_pkl = TRIALS_DIR.parent / 'df_cache_H1.pkl'
+    if _cache_pkl.exists():
+        try:
+            trainer = WorkerPool(MAX_PARALLEL, _cache_pkl)
+        except Exception as _e:
+            print(f"  [WARN] WorkerPool 初期化失敗 → subprocess フォールバック: {_e}")
+            trainer = ParallelTrainer()
+    else:
+        print("  [INFO] キャッシュなし → subprocess モードで起動 (PRE-CACHE後に自動切替なし)")
+        trainer = ParallelTrainer()
     results  = []
     best_pf  = 0.0
     trial_no = 1

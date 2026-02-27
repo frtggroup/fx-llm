@@ -123,12 +123,23 @@ def set_seed(seed):
 
 
 # ─── データ準備 ────────────────────────────────────────────────────────────
-_DF_CACHE: dict = {}   # {timeframe: (df_tr, df_te)} プロセス内キャッシュ
+_DF_CACHE: dict = {}        # {timeframe: (df_tr, df_te)} プロセス内キャッシュ
+_WORKER_STATE: dict = {}    # ProcessPoolExecutor ワーカーが保持する常駐データ
 
 
 def prepare(args):
     print(f"\n=== データ準備 [{args.timeframe}] ===")
     t0 = time.time()
+
+    # WorkerPool 常駐ワーカーならメモリ上のデータを直接使用 (ディスクI/Oゼロ)
+    if _WORKER_STATE.get('df_tr') is not None:
+        df_tr_raw = _WORKER_STATE['df_tr']
+        df_te     = _WORKER_STATE['df_te']
+        print(f"  [WORKER-CACHE HIT] {len(df_tr_raw):,} / {len(df_te):,}")
+        # 後続の train_months フィルタに備えてコピーを返す
+        df_tr = df_tr_raw
+        # → 以下のキャッシュ処理はスキップして train_months フィルタへ直行
+        _DF_CACHE[args.timeframe] = (df_tr_raw, df_te)  # 通常パスとの互換性
 
     # 同一プロセス内でのキャッシュ（シングルモード用）
     # 並列モードでは各サブプロセスが独自にキャッシュを持つ
@@ -1062,6 +1073,123 @@ def main():
         except Exception: pass
 
     return r['pf']
+
+
+# ─── ProcessPoolExecutor ワーカー API ────────────────────────────────────────
+
+def worker_init(cache_pkl_path: str) -> None:
+    """ワーカープロセス初期化。Python起動 + torch import + CUDA初期化を1回だけ行う。
+    以降は run_trial_worker() を何度呼んでもオーバーヘッドなし。
+    """
+    import pickle
+    global _WORKER_STATE
+    t0 = time.time()
+    with open(cache_pkl_path, 'rb') as f:
+        df_tr, df_te = pickle.load(f)
+    _WORKER_STATE['df_tr'] = df_tr
+    _WORKER_STATE['df_te'] = df_te
+    # CUDA ウォームアップ (以後の試行でCUDA初期化コストが発生しないよう)
+    if torch.cuda.is_available():
+        _dummy = torch.zeros(1, device='cuda')
+        del _dummy
+        torch.cuda.synchronize()
+        torch.cuda.empty_cache()
+    print(f"  [WORKER pid={os.getpid()}] 初期化完了 {time.time()-t0:.1f}秒  "
+          f"df_tr={len(df_tr):,}  df_te={len(df_te):,}", flush=True)
+
+
+def run_trial_worker(trial_no: int, params: dict, trial_dir_str: str,
+                     best_pf: float, start_time: float) -> dict:
+    """ProcessPoolExecutor ワーカーで1試行を実行する。
+    worker_init() が事前に呼ばれ _WORKER_STATE にデータが入っている前提。
+    サブプロセス版と同一の last_result.json を出力する。
+    """
+    global OUT_DIR, ONNX_PATH, NORM_PATH
+
+    trial_dir = Path(trial_dir_str)
+    trial_dir.mkdir(parents=True, exist_ok=True)
+    OUT_DIR   = trial_dir
+    ONNX_PATH = trial_dir / 'fx_model.onnx'
+    NORM_PATH = trial_dir / 'norm_params.json'
+
+    # argparse 相当のオブジェクトを params から構築
+    class _A:
+        pass
+    args = _A()
+    _defaults = dict(
+        epochs=800, seed=42, timeframe='H1', label_type='triple_barrier',
+        train_months=0, feat_frac=1.0, n_features=0, feat_set=-2,
+        scheduler='onecycle', wd=1e-2, seq_len=20, batch=256,
+        lr=5e-4, dropout=0.5, hidden=64, layers=1, arch='gru_attn',
+        tp=1.5, sl=1.0, forward=20, threshold=0.4,
+    )
+    for k, v in _defaults.items():
+        setattr(args, k, v)
+    for k, v in params.items():
+        setattr(args, k, v)
+    args.trial        = trial_no
+    args.total_trials = 99999
+    args.best_pf      = best_pf
+    args.start_time   = start_time
+    args.out_dir      = trial_dir_str
+
+    set_seed(args.seed)
+    _write_trial_progress(trial_dir, {
+        'trial': trial_no, 'arch': getattr(args, 'arch', '?'),
+        'hidden': getattr(args, 'hidden', 0),
+        'epoch': 0, 'total_epochs': args.epochs,
+        'train_loss': 0.0, 'val_loss': 0.0, 'accuracy': 0.0, 'phase': 'training',
+    })
+
+    try:
+        # prepare() は _WORKER_STATE を参照するのでディスクI/Oなし
+        X_tr, y_tr, X_te, y_te, mean, std, df_te, seq_len, feat_indices = prepare(args)
+        n_feat = X_tr.shape[2]
+
+        model = train(args, X_tr, y_tr, X_te, y_te, mean, std, n_feat=n_feat)
+
+        wrapped = FXPredictorWithNorm(model, mean, std)
+        export_onnx(wrapped, seq_len, n_feat, str(ONNX_PATH), opset=12)
+        verify_onnx(str(ONNX_PATH), seq_len, n_feat)
+
+        r = backtest(ONNX_PATH, X_te, df_te, args.threshold, args.tp, args.sl,
+                     seq_len=seq_len, hold_bars=args.forward,
+                     report_dir=trial_dir, trial_no=trial_no)
+
+        # norm_params に EA 用パラメータを追記
+        try:
+            nd = json.loads(NORM_PATH.read_text(encoding='utf-8'))
+            nd.update({'threshold': args.threshold, 'tp_atr': args.tp,
+                       'sl_atr': args.sl, 'hold_bars': args.forward})
+            NORM_PATH.write_text(json.dumps(nd, indent=2, ensure_ascii=False),
+                                 encoding='utf-8')
+        except Exception:
+            pass
+
+        # last_result.json 保存 (メインプロセスが読み取る)
+        full = {**{k: v for k, v in vars(args).items()
+                   if k not in ('out_dir', 'total_trials', 'best_pf', 'start_time')}, **r}
+        (trial_dir / 'last_result.json').write_text(
+            json.dumps(full, indent=2, ensure_ascii=False), encoding='utf-8')
+
+        _write_trial_progress(trial_dir, {
+            'trial': trial_no, 'arch': getattr(args, 'arch', '?'),
+            'hidden': getattr(args, 'hidden', 0),
+            'epoch': args.epochs, 'total_epochs': args.epochs,
+            'train_loss': 0.0, 'val_loss': 0.0, 'accuracy': 0.0,
+            'phase': 'done', 'pf': r['pf'], 'sr': r.get('sr', 0),
+            'max_dd': r.get('max_dd', 0),
+        })
+        print(f"  [WORKER #{trial_no}] PF={r['pf']:.4f}  取引={r['trades']}", flush=True)
+        return r
+
+    except Exception as e:
+        import traceback
+        print(f"  [WORKER ERROR] trial#{trial_no}: {e}\n{traceback.format_exc()}",
+              flush=True)
+        return {'pf': 0.0, 'trades': 0, 'error': str(e),
+                'sr': 0.0, 'max_dd': 0.0, 'win_rate': 0.0,
+                'net_pnl': 0.0, 'gross_profit': 0.0, 'gross_loss': 0.0}
 
 
 if __name__ == '__main__':
