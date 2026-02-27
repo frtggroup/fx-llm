@@ -104,15 +104,15 @@ GA_FEAT_RATIO  = 0.40   # 特徴量探索フェーズ
 GA_PARAM_RATIO = 0.40   # パラメータチューニングフェーズ
 GA_CROSS_RATIO = 0.20   # 交叉フェーズ
 H100_MODE     = os.environ.get('H100_MODE', '0') == '1'
-MAX_PARALLEL  = int(os.environ.get('MAX_PARALLEL', '3' if H100_MODE else '1'))
-VRAM_PER_TRIAL= float(os.environ.get('VRAM_PER_TRIAL', '10'))   # GB
+MAX_PARALLEL  = int(os.environ.get('MAX_PARALLEL', '6' if H100_MODE else '1'))
+VRAM_PER_TRIAL= float(os.environ.get('VRAM_PER_TRIAL', '6' if H100_MODE else '8'))  # GB
 
 # ── フリーズ検知: GPU無使用タイムアウト ──────────────────────────────────────
 # データロード・前処理フェーズに DATA_PREP_BUDGET 秒の猶予を与え、
 # それ以降も GPU を使っていなければ強制終了
 DATA_PREP_BUDGET  = 600    # 秒: データ準備の最大許容時間 (10分)
 NO_GPU_TIMEOUT    = 900    # 秒: GPU使用なしでこれ以上→強制終了 (15分)
-LAUNCH_INTERVAL   = 5      # 秒: 試行投入間隔 (CUDA初期化の重複を防ぐ)
+LAUNCH_INTERVAL   = 1      # 秒: 試行投入間隔 (CUDA初期化の重複を防ぐ)
 
 ARCHS = [
     'mlp', 'gru_attn', 'bigru', 'lstm_attn',
@@ -150,8 +150,8 @@ HIDDEN_MAP     = HIDDEN_MAP_H100  if H100_MODE else HIDDEN_MAP_LOCAL
 # データ13K件 / 512 = 25バッチ/ep → GPU稼働率 ~60-80%
 BATCH_CHOICES  = [256, 512, 1024, 2048] if H100_MODE else [256, 512, 1024, 2048]
 SEQ_CHOICES    = [10, 15, 20, 30, 40, 50]  if H100_MODE else [5, 8, 10, 15, 20]
-EPOCH_COUNT    = 2000 if H100_MODE else 800
-TRIAL_TIMEOUT  = 5400 if H100_MODE else 600   # 90分 (torch.compile考慮)
+EPOCH_COUNT    = 800   # H100/GTX 共通: モデルサイズが小さいので2000は過多
+TRIAL_TIMEOUT  = 1800 if H100_MODE else 600   # H100: 30分 / GTX: 10分
 
 
 # ── ハイパーパラメータサンプリング ───────────────────────────────────────────

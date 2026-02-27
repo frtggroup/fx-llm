@@ -424,16 +424,41 @@ def build_dataset(df: pd.DataFrame,
                   label_fn=None,
                   feat_indices=None) -> tuple:
     """X [N, seq_len, n_feat], y [N] を返す。
-    feat_indices: 使う特徴量のインデックスリスト (None=全70次元)
-    """
-    df2    = df[FEATURE_COLS].copy()
-    labels = make_labels(df, tp_atr=tp_atr, sl_atr=sl_atr,
-                         forward_bars=forward_bars)
+    feat_indices: 使う特徴量のインデックスリスト (None=全次元)
 
-    feat        = df2.values.astype(np.float32)
+    最適化:
+    - ラベルはディスクキャッシュ (tp/sl/forward が同じなら再計算なし)
+    - シーケンス構築は numpy stride_tricks でベクトル化 (Pythonループなし)
+    """
+    import hashlib, pickle
+
+    # ── ラベルキャッシュ (tp/sl/forward が同じなら再計算スキップ) ────────────
+    cache_dir  = Path(__file__).parent.parent / 'label_cache'
+    cache_dir.mkdir(exist_ok=True)
+    cache_key  = f"tp{tp_atr:.3f}_sl{sl_atr:.3f}_fwd{forward_bars}_n{len(df)}"
+    cache_file = cache_dir / f"labels_{hashlib.md5(cache_key.encode()).hexdigest()}.npy"
+
+    if cache_file.exists():
+        try:
+            labels = np.load(str(cache_file))
+        except Exception:
+            cache_file.unlink(missing_ok=True)
+            labels = make_labels(df, tp_atr=tp_atr, sl_atr=sl_atr,
+                                 forward_bars=forward_bars)
+            np.save(str(cache_file), labels)
+    else:
+        labels = make_labels(df, tp_atr=tp_atr, sl_atr=sl_atr,
+                             forward_bars=forward_bars)
+        try:
+            np.save(str(cache_file), labels)
+        except Exception:
+            pass
+
+    # ── 特徴量配列 ────────────────────────────────────────────────────────
+    feat = df[FEATURE_COLS].values.astype(np.float32)
     if feat_indices is not None:
         feat = feat[:, feat_indices]
-    n_feat      = feat.shape[1]
+    n_feat = feat.shape[1]
 
     n           = len(feat)
     valid_start = seq_len
@@ -445,11 +470,20 @@ def build_dataset(df: pd.DataFrame,
           f"BUY:{(labels[:valid_end]==1).sum():,} "
           f"SELL:{(labels[:valid_end]==2).sum():,})")
 
-    X = np.empty((n_samples, seq_len, n_feat), dtype=np.float32)
-    y = np.empty(n_samples, dtype=np.int64)
-    for i in range(n_samples):
-        idx  = valid_start + i
-        X[i] = feat[idx - seq_len: idx]
-        y[i] = labels[idx - 1]
+    # ── ベクトル化シーケンス構築 (stride_tricks, Pythonループなし) ──────────
+    # feat の shape: (N, n_feat)
+    # 目的: X[i] = feat[valid_start+i-seq_len : valid_start+i]  i=0..n_samples-1
+    # → sliding_window_view で (N-seq_len+1, seq_len, n_feat) を作り範囲スライス
+    stride     = feat.strides                           # (bytes_per_row, bytes_per_elem)
+    all_shape  = (n - seq_len + 1, seq_len, n_feat)
+    all_stride = (stride[0], stride[0], stride[1])
+    all_windows = np.lib.stride_tricks.as_strided(feat, shape=all_shape,
+                                                   strides=all_stride)
+    # valid_start - seq_len = 0 (seq_len == valid_start), 通常 seq_len == valid_start
+    w_start = valid_start - seq_len   # 0 の場合が多い
+    w_end   = valid_end   - seq_len   # = n_samples (w_start==0 のとき)
+    X = all_windows[w_start: w_end].copy()   # .copy() で連続メモリに変換
+
+    y = labels[valid_start - 1: valid_end - 1].copy().astype(np.int64)
 
     return X, y, labels

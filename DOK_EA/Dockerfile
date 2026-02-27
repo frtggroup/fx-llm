@@ -8,8 +8,8 @@
 #   docker run --gpus all -p 8080:8080 -p 2222:22 \
 #     -e DATA_URL="https://your-storage/USDJPY_M1.csv" \
 #     -e H100_MODE=1 \
-#     -e MAX_PARALLEL=3 \
-#     -e VRAM_PER_TRIAL=10 \
+#     -e MAX_PARALLEL=6 \
+#     -e VRAM_PER_TRIAL=6 \
 #     -v /host/output:/workspace/ai_ea \
 #     fx-ea:latest
 # ─────────────────────────────────────────────────────────────────────────────
@@ -24,8 +24,9 @@ ENV DEBIAN_FRONTEND=noninteractive \
     # H100 モード: 大型モデル・バッチサイズ・エポック数
     H100_MODE=1 \
     # 並列数 / 1試行あたりの最低 VRAM (GB)
-    MAX_PARALLEL=3 \
-    VRAM_PER_TRIAL=10 \
+    # H100 80GB: 6並列 × 6GB = 36GB使用, 残44GBはバッファ
+    MAX_PARALLEL=6 \
+    VRAM_PER_TRIAL=6 \
     # データパス (DATA_URL で上書き可能)
     DATA_PATH=/workspace/data/USDJPY_M1.csv \
     WORKSPACE=/workspace \
