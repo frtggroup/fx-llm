@@ -91,6 +91,10 @@ export H100_MODE="${H100_MODE:-1}"
 export MAX_PARALLEL="${MAX_PARALLEL:-3}"
 export VRAM_PER_TRIAL="${VRAM_PER_TRIAL:-10}"
 export DATA_PATH="${DATA_PATH:-/opt/artifact/data/USDJPY_M1.csv}"
+# torch.compile inductor キャッシュを永続ストレージに置く
+# → コンテナ再起動後も同アーキテクチャは再コンパイル不要
+export TORCHINDUCTOR_CACHE_DIR="${ARTIFACT}/torch_inductor_cache"
+mkdir -p "${TORCHINDUCTOR_CACHE_DIR}"
 
 echo "[*] 設定:"
 echo "    H100_MODE    : ${H100_MODE}"

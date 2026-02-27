@@ -15,12 +15,13 @@ services:
               capabilities: [gpu]
 
     ports:
-      - "7860:7860"   # ダッシュボード
+      - "8080:8080"   # ダッシュボード (server.py デフォルト 8080)
       - "2222:22"     # SSH
 
     environment:
       # GTX 1080 Ti モード (FP16 AMP, torch.compile無効)
       H100_MODE: "0"
+      DASHBOARD_PORT: "8080"
       # GTX 1080 Ti VRAM 11GB → 1並列 (余裕あれば2)
       MAX_PARALLEL: "1"
       VRAM_PER_TRIAL: "8"

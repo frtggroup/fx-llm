@@ -379,8 +379,12 @@ def train(args, X_tr, y_tr, X_te, y_te, mean, std, n_feat=None):
     # H100: torch.compile で GPU カーネル効率を向上
     # ONNX エクスポート用に compile 前のオリジナルモデルを保持
     model_for_export = model
-    if is_h100:
-        compile_mode = 'max-autotune' if not getattr(args, 'out_dir', '') else 'reduce-overhead'
+    # 並列ワーカーモード (out_dir が設定される) では compile をスキップ:
+    #   → アーキテクチャが試行ごとに変わるため毎回再コンパイルが発生し逆に遅くなる
+    #   → 探索フェーズは compile なしで高速に試行数を稼ぐ
+    _is_worker = bool(getattr(args, 'out_dir', ''))
+    if is_h100 and not _is_worker:
+        compile_mode = 'max-autotune'
         try:
             compiled_model = torch.compile(model, mode=compile_mode)
             print(f"  torch.compile({compile_mode}) 有効 → ウォームアップ実行中...")
@@ -396,6 +400,8 @@ def train(args, X_tr, y_tr, X_te, y_te, mean, std, n_feat=None):
         except Exception as e:
             print(f"  torch.compile スキップ: {e}")
             # model は compile 前のまま (model_for_export と同一)
+    elif is_h100 and _is_worker:
+        print(f"  torch.compile スキップ (並列ワーカーモード: 探索優先)")
 
     n_params = sum(p.numel() for p in model.parameters())
     ratio    = len(X_tr) / max(n_params, 1)
@@ -523,8 +529,9 @@ def train(args, X_tr, y_tr, X_te, y_te, mean, std, n_feat=None):
             no_imp += 1
 
         # ── 即時発散: val が爆発 かつ 下がっていない ────────────────────────
-        val_falling = v_loss < prev_v_loss          # 今エポックで val 下降中か
-        if epoch >= 10 and gap > 0.35 and v_loss > 1.30 and not val_falling:
+        # 意味のある改善 = 前エポック比で 1e-4 以上の減少 (微小ノイズを除外)
+        val_falling = v_loss < prev_v_loss - 1e-4
+        if epoch >= 10 and gap > 0.35 and v_loss > 1.30:
             stop_reason = f'即時発散 (ep{epoch}: gap={gap:+.4f}, val={v_loss:.4f})'
             break
         prev_v_loss = v_loss
@@ -535,7 +542,7 @@ def train(args, X_tr, y_tr, X_te, y_te, mean, std, n_feat=None):
             if len(recent_gaps) > overfit_pat:
                 recent_gaps.pop(0)
 
-            # 条件1: gap が大きく持続 かつ val が下がっていない
+            # 条件1: gap が大きく持続 かつ val が意味ある改善なし
             if (len(recent_gaps) == overfit_pat
                     and all(g > 0.20 for g in recent_gaps)
                     and not val_falling):
@@ -551,9 +558,14 @@ def train(args, X_tr, y_tr, X_te, y_te, mean, std, n_feat=None):
                 stop_reason = f'過学習早期終了 (gap={gap:+.4f}, no_imp={no_imp})'
                 break
 
-            # 条件3: val_loss 改善なし上限 (両方下がってる場合は免除)
+            # 条件3: patience 到達 (意味ある改善なし)
             if no_imp >= patience and not val_falling:
                 stop_reason = f'改善なし早期終了 (patience={patience})'
+                break
+
+            # 条件4: patience の2倍を超えたら val_falling 免除で強制終了
+            if no_imp >= patience * 2:
+                stop_reason = f'改善なし強制終了 (no_imp={no_imp} >= patience*2={patience*2})'
                 break
 
     if stop_reason:
