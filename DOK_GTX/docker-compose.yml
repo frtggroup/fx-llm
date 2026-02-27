@@ -5,8 +5,8 @@ services:
     image: frtggroup/fx-ea-gtx:latest
     container_name: fx-ea-gtx
 
-    # GTX GPU を使用 (NVIDIA Container Toolkit 必須)
-    runtime: nvidia
+    # GTX GPU を使用
+    # Windows Docker Desktop は runtime:nvidia 不要 → deploy.resources で渡す
     deploy:
       resources:
         reservations:
