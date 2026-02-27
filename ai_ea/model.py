@@ -388,14 +388,20 @@ def export_onnx(model: FXPredictorWithNorm,
                 seq_len: int, n_features: int,
                 out_path: str, opset: int = 14) -> None:
     model.eval().cpu()
+    # batch=1 固定: MQL5 は常に batch=1 で推論するため dynamic batch 不要
+    # dynamic_axes に batch を含めると GRU/LSTM で UserWarning が出るため除去
     dummy = torch.zeros(1, seq_len, n_features, dtype=torch.float32)
-    torch.onnx.export(
-        model, dummy, out_path,
-        export_params=True, opset_version=opset,
-        do_constant_folding=True,
-        input_names=['input'], output_names=['output'],
-        dynamic_axes={'input': {0: 'batch'}, 'output': {0: 'batch'}},
-    )
+    import warnings
+    with warnings.catch_warnings():
+        warnings.filterwarnings('ignore', category=UserWarning,
+                                module='torch.onnx')
+        torch.onnx.export(
+            model, dummy, out_path,
+            export_params=True, opset_version=opset,
+            do_constant_folding=True,
+            input_names=['input'], output_names=['output'],
+            dynamic_axes={},   # batch=1 固定 (GRU警告を回避)
+        )
     print(f"ONNX exported → {out_path}")
 
 
