@@ -5,7 +5,8 @@ services:
     image: frtggroup/fx-ea-gtx:latest
     container_name: fx-ea-gtx
 
-    # GTX GPU を使用
+    # GTX GPU を使用 (NVIDIA Container Toolkit 必須)
+    runtime: nvidia
     deploy:
       resources:
         reservations:
@@ -19,6 +20,9 @@ services:
       - "2222:22"     # SSH
 
     environment:
+      # GPU 認識 (runtime: nvidia と合わせて確実に GPU を渡す)
+      NVIDIA_VISIBLE_DEVICES: "all"
+      NVIDIA_DRIVER_CAPABILITIES: "compute,utility"
       # GTX 1080 Ti モード (FP16 AMP, torch.compile無効)
       H100_MODE: "0"
       DASHBOARD_PORT: "8080"
