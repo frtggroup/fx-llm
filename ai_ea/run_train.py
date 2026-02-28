@@ -832,8 +832,13 @@ def next_params(results: list, rng: random.Random) -> tuple[dict, str]:
     return sample_params(rng), 'random'
 
 
-# ── GPU 情報取得 ─────────────────────────────────────────────────────────────
+# ── GPU / TPU 情報取得 ───────────────────────────────────────────────────────
 def _gpu_info() -> dict:
+    # TPU モードではメモリ情報を仮想値で返す (pynvml/nvidia-smi 非対応)
+    if _TPU_AVAILABLE:
+        total = _GPU_VRAM_GB if _GPU_VRAM_GB > 0 else 128.0
+        return {'free_gb': total * 0.5, 'total_gb': total, 'used_gb': total * 0.5,
+                'gpu_pct': 0, 'mem_pct': 50}
     try:
         # nvidia-ml-py (pynvml の後継パッケージ)
         from pynvml import (nvmlInit, nvmlDeviceGetHandleByIndex,

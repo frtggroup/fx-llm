@@ -61,6 +61,13 @@ COPY DOK/requirements.txt /tmp/requirements.txt
 RUN pip install --upgrade pip && \
     pip install --no-cache-dir -r /tmp/requirements.txt
 
+# ── torch_xla (TPU サポート / オプション) ────────────────────────────────────
+# TPU 環境でのみ有効。インストール失敗はエラーとしない (GPU/CPU では不要)
+RUN pip install --no-cache-dir \
+        torch_xla[tpu]~=2.5.0 \
+        -f https://storage.googleapis.com/libtpu-releases/index.html \
+    2>/dev/null || echo "[INFO] torch_xla インストールスキップ (GPU/CPU 環境では不要)"
+
 # ── SSH setup ────────────────────────────────────────────────────────────────
 RUN mkdir -p /var/run/sshd /root/.ssh && \
     chmod 700 /root/.ssh && \
