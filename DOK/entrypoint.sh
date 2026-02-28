@@ -29,18 +29,17 @@ elif [ -e /dev/accel0 ] \
     TPU_TYPE="${TPU_ACCELERATOR_TYPE:-${TPU_NAME:-TPU}}"
     echo "[OK] TPU 検出: ${TPU_TYPE}"
 
-    # torch_xla がまだインストールされていなければ自動インストール
-    if ! python3 -c "import torch_xla" 2>/dev/null; then
-        echo "[*] torch_xla をインストール中 (初回のみ 2〜3 分かかります)..."
-        # PyTorch バージョンに合わせた torch_xla を取得
+    # torch_xla 確認 (イメージにビルド済みのはず / 未インストールならフォールバック)
+    if python3 -c "import torch_xla" 2>/dev/null; then
+        echo "[OK] torch_xla 利用可能"
+    else
+        echo "[*] torch_xla が見つかりません。インストール中..."
         TORCH_VER=$(python3 -c "import torch; print(torch.__version__.split('+')[0])" 2>/dev/null || echo "2.5.0")
         pip install --no-cache-dir \
-            "torch_xla[tpu]==${TORCH_VER}" \
+            "torch_xla==${TORCH_VER}" \
             -f https://storage.googleapis.com/libtpu-releases/index.html \
         && echo "[OK] torch_xla インストール完了" \
         || echo "[WARN] torch_xla インストール失敗 — CPU モードで続行"
-    else
-        echo "[OK] torch_xla インストール済み"
     fi
 
     GPU_NAME="TPU (${TPU_TYPE})"
