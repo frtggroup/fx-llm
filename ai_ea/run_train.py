@@ -2300,7 +2300,8 @@ def main():
             last_checkpoint      = time.time()
             completed_since_ckpt = 0
 
-        time.sleep(1 if isinstance(trainer, WorkerPool) else 5)
+        # TPU: 1チップ=1試行なので試行間ギャップを最小化するため poll を高頻度に
+        time.sleep(1 if isinstance(trainer, WorkerPool) else (1 if _is_tpu_env else 5))
         _loop_errors = 0  # 正常ループが回ればエラーカウントリセット
 
       except KeyboardInterrupt:

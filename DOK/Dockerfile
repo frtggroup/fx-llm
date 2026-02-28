@@ -16,7 +16,7 @@
 #   DATA_URL          CSVダウンロードURL (GDriveにない場合のフォールバック)
 #   DASHBOARD_PORT    ダッシュボードポート (デフォルト: 8080)
 # ─────────────────────────────────────────────────────────────────────────────
-FROM pytorch/pytorch:2.5.1-cuda12.4-cudnn9-runtime
+FROM pytorch/pytorch:2.6.0-cuda12.4-cudnn9-runtime
 
 ENV DEBIAN_FRONTEND=noninteractive \
     PYTHONUNBUFFERED=1 \
@@ -68,9 +68,10 @@ RUN pip install --upgrade pip && \
 # ・TPU VM 環境 : --net=host + tpu-runtime.service で XLA が有効化される
 # インストール失敗してもビルドを止めない (GPU のみ使用なら不要)
 RUN pip install --no-cache-dir \
-        "torch_xla[tpu]==2.5.1" \
+        "torch_xla[tpu]==2.6.0" \
         -f https://storage.googleapis.com/libtpu-releases/index.html \
-    && echo "[OK] torch_xla + libtpu インストール完了" \
+        -f https://storage.googleapis.com/libtpu-wheels/index.html \
+    && echo "[OK] torch_xla 2.6.0 + libtpu SDK インストール完了" \
     || echo "[WARN] torch_xla インストールスキップ (GPU/CPU イメージとして続行)"
 
 # ── SSH setup ────────────────────────────────────────────────────────────────

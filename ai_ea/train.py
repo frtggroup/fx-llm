@@ -607,10 +607,21 @@ def train(args, X_tr, y_tr, X_te, y_te, mean, std, n_feat=None):
             _n_samp = len(tr_dl) * tr_dl.bs
             _tput   = _n_samp / max(_ep_sec, 0.001)
             _tpu_tag = f"  {_tput:.0f}samp/s" if is_tpu else ""
+            # TPU duty_cycle_pct (libtpu.sdk - torch_xla 2.6.0+)
+            _duty = ""
+            if is_tpu:
+                try:
+                    from libtpu.sdk import tpumonitoring  # type: ignore
+                    _m = tpumonitoring.get_metric("duty_cycle_pct")
+                    _vals = _m.data()
+                    if _vals:
+                        _duty = f"  TPU使用率:{float(_vals[0]):.1f}%"
+                except Exception:
+                    pass
             print(f"  Ep{epoch:4d}/{args.epochs}  "
                   f"tr={t_loss:.4f}  va={v_loss:.4f}  "
                   f"gap={gap:+.4f}  acc={acc:.3f}  lr={lr_now:.2e}"
-                  f"  [{_ep_sec:.1f}s{_tpu_tag}]")
+                  f"  [{_ep_sec:.1f}s{_tpu_tag}{_duty}]")
 
         # 進捗更新 (progress_every エポックごと / 非同期書き込み)
         if epoch % progress_every == 0 or epoch <= 5:
