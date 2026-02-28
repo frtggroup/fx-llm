@@ -444,10 +444,11 @@ def _dispatch_spmd(args, X_tr, y_tr, X_te, y_te, mean, std, n_feat, n_dev):
                      'mean': mean, 'std': std, 'n_feat': n_feat,
                      'args': _args_dict}, _f)
     try:
-        # start_method='spawn': 新しいインタープリタを起動 → PJRT が安全に初期化される
+        # nprocs=None: PJRT が利用可能な全チップを自動割り当て
+        # start_method='spawn': PJRT 推奨。トップレベル関数が必要
         xmp.spawn(_xmp_spawn_worker,
                   args=(data_path, result_path, n_dev),
-                  nprocs=n_dev,
+                  nprocs=None,
                   start_method='spawn')
     finally:
         try: Path(data_path).unlink()

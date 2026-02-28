@@ -177,10 +177,11 @@ if __name__ == '__main__':
         try:
             import torch_xla.distributed.xla_multiprocessing as xmp  # type: ignore
             print(f"[WARMUP] xmp.spawn: {n_dev} チップ並列コンパイル開始", flush=True)
+            # nprocs=None: PJRT が利用可能な全チップを自動割り当て
             # start_method='spawn': PJRT 推奨。トップレベル関数が必要
             xmp.spawn(_warmup_spawn_worker,
                       args=(n_dev, args.dry_run),
-                      nprocs=n_dev,
+                      nprocs=None,
                       start_method='spawn')
             print(f"[WARMUP] 全 {n_dev} チップ コンパイル完了", flush=True)
         except Exception as e:

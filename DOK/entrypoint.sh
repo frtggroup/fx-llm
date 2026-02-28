@@ -361,6 +361,35 @@ trap '_graceful_stop' SIGTERM SIGINT
 # XLA キャッシュを S3 から復元 (TPU のみ / 失敗しても続行)
 _xla_cache_download || true
 
+# warmup 進捗 JSON を S3 から復元 (TPU のみ / 再起動時にスキップ判定に使用)
+if [ "$DEVICE_TYPE" = "TPU" ] && [ -n "$S3_ENDPOINT" ]; then
+    python3 - <<'PYEOF'
+import os, sys, pathlib
+try:
+    import boto3, urllib3; urllib3.disable_warnings()
+    s3 = boto3.client('s3',
+        endpoint_url=os.environ.get('S3_ENDPOINT',''),
+        aws_access_key_id=os.environ.get('S3_ACCESS_KEY',''),
+        aws_secret_access_key=os.environ.get('S3_SECRET_KEY',''),
+        verify=False)
+    bucket = os.environ.get('S3_BUCKET','fxea')
+    prefix = os.environ.get('S3_PREFIX','mix') + '/warmup_progress/'
+    paginator = s3.get_paginator('list_objects_v2')
+    count = 0
+    for page in paginator.paginate(Bucket=bucket, Prefix=prefix):
+        for obj in page.get('Contents', []):
+            key = obj['Key']; rel = key[len(prefix):]
+            if not rel: continue
+            dst = pathlib.Path('/workspace') / rel
+            s3.download_file(bucket, key, str(dst))
+            count += 1
+    if count: print(f'[OK] warmup 進捗復元: {count}件')
+    else: print('[INFO] warmup 進捗: S3 にまだありません (初回)')
+except Exception as e:
+    print(f'[INFO] warmup 進捗復元スキップ: {e}')
+PYEOF
+fi
+
 # XLA キャッシュ定期アップロード (10分ごと、バックグラウンド)
 XLA_SYNC_PID=""
 if [ "$DEVICE_TYPE" = "TPU" ] && [ -n "$S3_ENDPOINT" ]; then
@@ -373,8 +402,29 @@ fi
 if [ "$DEVICE_TYPE" = "TPU" ]; then
     # xmp.spawn で TPU_NUM_DEVICES 枚を並列コンパイル (シングルチップ時はシングル実行)
     python3 /workspace/ai_ea/warmup_xla.py 2>&1 | tee -a /workspace/train_run.log
-    # warmup 後にキャッシュを S3 へ保存
+    # warmup 後にキャッシュと進捗 JSON を S3 へ保存
     _xla_cache_upload || true
+    if [ -n "$S3_ENDPOINT" ]; then
+        python3 - <<'PYEOF'
+import os, sys, pathlib
+try:
+    import boto3, urllib3; urllib3.disable_warnings()
+    s3 = boto3.client('s3',
+        endpoint_url=os.environ.get('S3_ENDPOINT',''),
+        aws_access_key_id=os.environ.get('S3_ACCESS_KEY',''),
+        aws_secret_access_key=os.environ.get('S3_SECRET_KEY',''),
+        verify=False)
+    bucket = os.environ.get('S3_BUCKET','fxea')
+    prefix = os.environ.get('S3_PREFIX','mix') + '/warmup_progress'
+    count = 0
+    for f in pathlib.Path('/workspace').glob('xla_warmup_rank_*.json'):
+        s3.upload_file(str(f), bucket, f'{prefix}/{f.name}')
+        count += 1
+    if count: print(f'[OK] warmup 進捗 S3 保存: {count}件')
+except Exception as e:
+    print(f'[WARN] warmup 進捗 S3 保存失敗: {e}')
+PYEOF
+    fi
 fi
 
 # ── 自動再起動ループ ──────────────────────────────────────────────────────────
