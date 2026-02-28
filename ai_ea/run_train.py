@@ -1254,15 +1254,20 @@ class ParallelTrainer:
                 'log_fh':     log_fh,
                 'strategy':   strategy,
             }
-        feat_info = (f"set#{params['feat_set']}"
-                     if params.get('feat_set', -1) >= 0 else f"rand{params['n_features']}")
+        if params.get('feat_set', -1) >= 0:
+            feat_info = f"set#{params['feat_set']}"
+        elif params.get('feat_indices'):
+            feat_info = f"idx{len(params['feat_indices'])}"
+        else:
+            feat_info = f"rand{params.get('n_features', '?')}"
         _TAG_MAP = {
             'GA_feat':  '🔍GA_feat ',   # 特徴量探索
             'GA_param': '🔧GA_param',   # パラメータ調整
             'GA_cross': '🧬GA_cross',   # 交叉
             'random':   '🎲Rnd     ',   # ランダム
         }
-        tag = _TAG_MAP.get(strategy, f'?{strategy}')
+        tag = _TAG_MAP.get(strategy.split('_imp')[0] if '_imp' in strategy else strategy,
+                           f'?{strategy[:8]}')
         print(f"  [LAUNCH] 試行#{trial_no:4d} {tag}  {params['arch']:12s}  "
               f"h={params['hidden']:4d}  feat={feat_info}  PID={proc.pid}")
 
@@ -1425,15 +1430,20 @@ class WorkerPool:
                 'start_time': time.time(),
                 'trial_dir':  trial_dir,
             }
-        feat_info = (f"set#{params['feat_set']}"
-                     if params.get('feat_set', -1) >= 0 else f"rand{params['n_features']}")
+        if params.get('feat_set', -1) >= 0:
+            feat_info = f"set#{params['feat_set']}"
+        elif params.get('feat_indices'):
+            feat_info = f"idx{len(params['feat_indices'])}"
+        else:
+            feat_info = f"rand{params.get('n_features', '?')}"
         _TAG_MAP = {
             'GA_feat':  '🔍GA_feat ',
             'GA_param': '🔧GA_param',
             'GA_cross': '🧬GA_cross',
             'random':   '🎲Rnd     ',
         }
-        tag = _TAG_MAP.get(strategy, f'?{strategy}')
+        tag = _TAG_MAP.get(strategy.split('_imp')[0] if '_imp' in strategy else strategy,
+                           f'?{strategy[:8]}')
         print(f"  [LAUNCH] 試行#{trial_no:4d} {tag}  {params['arch']:12s}  "
               f"h={params['hidden']:4d}  feat={feat_info}")
 
@@ -1936,7 +1946,10 @@ def main():
     # ────────────────────────────────────────────────────────────────────────
     _cache_pkl  = TRIALS_DIR.parent / 'df_cache_H1.pkl'
     _on_windows = platform.system() == 'Windows'
-    if _cache_pkl.exists() and not _on_windows:
+    # TPU (XLA) は ProcessPoolExecutor の spawn ワーカー内でクラッシュするため
+    # Windows と同様に ParallelTrainer (subprocess.Popen) を強制使用する
+    _force_subprocess = _on_windows or _TPU_AVAILABLE
+    if _cache_pkl.exists() and not _force_subprocess:
         try:
             trainer = WorkerPool(MAX_PARALLEL, _cache_pkl)
         except Exception as _e:
@@ -1944,8 +1957,10 @@ def main():
             trainer = ParallelTrainer()
     else:
         if _on_windows:
-            print("  [INFO] Windows 環境 → サブプロセスモード使用 "
-                  "(WorkerPool は Linux/Docker 専用: proc.terminate() で確実タイムアウト)")
+            print("  [INFO] Windows 環境 → サブプロセスモード使用")
+        elif _TPU_AVAILABLE:
+            print("  [INFO] TPU (XLA) 環境 → サブプロセスモード使用 "
+                  "(XLA は ProcessPoolExecutor 内でクラッシュするため)")
         else:
             print("  [INFO] キャッシュなし → subprocess モードで起動")
         trainer = ParallelTrainer()
