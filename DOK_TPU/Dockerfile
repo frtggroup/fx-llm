@@ -21,10 +21,14 @@ FROM us-central1-docker.pkg.dev/tpu-pytorch/torch-xla-release/torch_xla:r2.5
 
 ENV DEBIAN_FRONTEND=noninteractive \
     PYTHONUNBUFFERED=1 \
+    # PJRT ランタイム指定 (XRT 旧ランタイムより高速・v6e/v5e/v5p に必須)
+    PJRT_DEVICE=TPU \
     # XLA フラグ: TPU メモリ断片化防止
     XLA_PYTHON_CLIENT_PREALLOCATE=false \
     # PyTorch XLA: プロファイリング無効化 (本番では不要)
     PT_XLA_DEBUG=0 \
+    # v6e-1 などシングルチップ構成のデフォルト (自動検出される場合は不要)
+    TPU_NUM_DEVICES=1 \
     DATA_PATH=/workspace/data/USDJPY_H1.csv \
     WORKSPACE=/workspace \
     DASHBOARD_PORT=8080 \

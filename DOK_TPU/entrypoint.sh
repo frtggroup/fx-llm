@@ -6,17 +6,24 @@ set -e
 
 echo "======================================================"
 echo "  FX AI EA ランダムサーチ on Google Cloud TPU"
+echo "  PJRT_DEVICE=${PJRT_DEVICE:-TPU}  TPU_NUM_DEVICES=${TPU_NUM_DEVICES:-auto}"
 echo "======================================================"
 
-# ── 1. TPU 確認 ──────────────────────────────────────────────────────────────
-echo "[*] TPU 確認..."
+# ── 1. TPU 確認 (PJRT ランタイム) ────────────────────────────────────────────
+echo "[*] TPU 確認 (PJRT_DEVICE=${PJRT_DEVICE:-TPU})..."
 python -c "
-import torch_xla.core.xla_model as xm
-devs = xm.get_xla_supported_devices()
-print(f'[OK] TPU デバイス検出: {len(devs)} チップ')
-for d in devs:
-    print(f'     {d}')
-" 2>/dev/null || echo "[WARN] TPU 未検出 (CPU モードで続行)"
+import os
+os.environ.setdefault('PJRT_DEVICE', 'TPU')
+try:
+    import torch_xla.core.xla_model as xm
+    devs = xm.get_xla_supported_devices()
+    print(f'[OK] TPU デバイス検出: {len(devs)} チップ')
+    for d in devs:
+        print(f'     {d}')
+except Exception as e:
+    print(f'[WARN] TPU 未検出: {e}')
+    print('[INFO] CPU モードで続行します')
+" 2>&1 || echo "[WARN] TPU 確認スクリプト失敗 (CPU モードで続行)"
 
 # ── 2. SSH サーバー ────────────────────────────────────────────────────────
 echo "[*] SSH サーバー起動..."

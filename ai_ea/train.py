@@ -736,7 +736,9 @@ if(dChart)dChart.data.datasets[0].backgroundColor=dlc,dChart.update('none');
 
 
 _BT_MODE: str | None = None  # キャッシュ: 'cpu' / 'cuda_iobind' / 'cuda'
-_BT_MODE_CACHE_FILE = Path('/tmp/fx_bt_mode.txt')  # 並列サブプロセス間共有ファイルキャッシュ
+# Windows では /tmp が存在しないため tempfile.gettempdir() を使用する
+import tempfile as _tempfile
+_BT_MODE_CACHE_FILE = Path(_tempfile.gettempdir()) / 'fx_bt_mode.txt'
 
 def _bench_onnx_providers(onnx_path: str, full_data: np.ndarray) -> str:
     """CUDA利用可能時はCUDA vs CUDA+IOBindingのみ比較（CPUベンチはスキップ）。

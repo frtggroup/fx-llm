@@ -6,7 +6,7 @@ FX AI EA 自動トレーニング v8 - ハイブリッド遺伝的アルゴリ�
   ・停止条件なし (stop.flag が置かれるまで無限継続)
   ・TOP100 モデル保存 + SR / DD / 資産曲線レポート
 """
-import os, subprocess, sys, json, shutil, time, random, threading, signal
+import os, subprocess, sys, json, shutil, time, random, threading, signal, platform
 from pathlib import Path
 
 sys.path.insert(0, str(Path(__file__).parent))
@@ -107,8 +107,8 @@ def _detect_node_id() -> str:
         import torch_xla.core.xla_model as xm  # type: ignore
         dev_str = str(xm.xla_device()).lower()
         tpu_type = os.environ.get('TPU_NAME', os.environ.get('TPU_ACCELERATOR_TYPE', 'tpu'))
-        # tpu_type 例: 'v4-8', 'v5litepod-8', 'trillium'
-        for ver in ('v5p', 'v5e', 'v5litepod', 'v4', 'v3', 'trillium'):
+        # tpu_type 例: 'v4-8', 'v5litepod-8', 'v6e-1', 'trillium'
+        for ver in ('v6e', 'v5p', 'v5e', 'v5litepod', 'v4', 'v3', 'trillium'):
             if ver in tpu_type.lower():
                 return f'tpu_{ver}'
         return 'tpu'
@@ -155,6 +155,7 @@ def _auto_gpu_config(node_id: str) -> tuple[str, float, float, int]:
                 'tpu_v3': 16.0, 'tpu_v4': 32.0,
                 'tpu_v5e': 16.0, 'tpu_v5p': 95.0,
                 'tpu_trillium': 32.0,
+                'tpu_v6e': 32.0,   # Trillium (v6e) = 32 GB HBM/chip
             }.get(node_id, 32.0)
             total_gb = mem_per_chip * num_devices
             # TPU は並列度を 1チップ = 1試行 として計算
@@ -1625,16 +1626,30 @@ def main():
         STOP_FLAG.unlink()
 
     rng     = random.Random()
-    # データキャッシュが存在すれば常駐ワーカープールを使用 (サブプロセス起動コスト削減)
-    _cache_pkl = TRIALS_DIR.parent / 'df_cache_H1.pkl'
-    if _cache_pkl.exists():
+    # ────────────────────────────────────────────────────────────────────────
+    # WorkerPool (ProcessPoolExecutor) vs ParallelTrainer (subprocess.Popen)
+    #
+    # Windows では ProcessPoolExecutor の future.cancel() は実行中のワーカーを
+    # 止められない (Linux と異なり SIGKILL が届かない)。
+    # タイムアウト検出後もワーカーがスロットを占有し続けるため、
+    # 新規試行がキュー詰まり → 完了数が止まる (stuck-at-N 症状)。
+    # → Windows ではサブプロセスモード (ParallelTrainer) を強制使用する。
+    # Linux/Docker 環境では WorkerPool の起動コスト削減メリットを活かす。
+    # ────────────────────────────────────────────────────────────────────────
+    _cache_pkl  = TRIALS_DIR.parent / 'df_cache_H1.pkl'
+    _on_windows = platform.system() == 'Windows'
+    if _cache_pkl.exists() and not _on_windows:
         try:
             trainer = WorkerPool(MAX_PARALLEL, _cache_pkl)
         except Exception as _e:
             print(f"  [WARN] WorkerPool 初期化失敗 → subprocess フォールバック: {_e}")
             trainer = ParallelTrainer()
     else:
-        print("  [INFO] キャッシュなし → subprocess モードで起動 (PRE-CACHE後に自動切替なし)")
+        if _on_windows:
+            print("  [INFO] Windows 環境 → サブプロセスモード使用 "
+                  "(WorkerPool は Linux/Docker 専用: proc.terminate() で確実タイムアウト)")
+        else:
+            print("  [INFO] キャッシュなし → subprocess モードで起動")
         trainer = ParallelTrainer()
     results  = []
     best_pf  = 0.0
