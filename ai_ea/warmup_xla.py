@@ -14,7 +14,7 @@ XLA_PERSISTENT_CACHE_PATH にコンパイル済みグラフをキャッシュす
 進捗は /workspace/xla_warmup_rank_{rank}.json に保存され、
 ダッシュボードの /api/status がランクファイルを集計して表示する。
 """
-import argparse, json, os, sys, time
+import argparse, json, os, subprocess, sys, time
 from pathlib import Path
 
 # ── 全パターン定義 (run_train.py の TPU tier と同一) ──────────────────────────
@@ -97,11 +97,6 @@ def _save_rank(rank: int, world_size: int, all_patterns: list,
     tmp.replace(path)
 
 
-def _warmup_spawn_worker(rank, world_size, dry_run):
-    """xmp.spawn(start_method='spawn') から呼ばれるトップレベル関数"""
-    warmup(rank=rank, world_size=world_size, dry_run=dry_run)
-
-
 def warmup(rank: int = 0, world_size: int = 1, dry_run: bool = False):
     sys.path.insert(0, str(Path(__file__).parent))
     from model import build_model  # noqa
@@ -176,24 +171,45 @@ def warmup(rank: int = 0, world_size: int = 1, dry_run: bool = False):
 if __name__ == '__main__':
     parser = argparse.ArgumentParser()
     parser.add_argument('--dry-run', action='store_true', help='実際のコンパイルをスキップ')
+    parser.add_argument('--rank', type=int, default=None,
+                        help='チップrank (サブプロセス用。省略時は親プロセスとして全チップを起動)')
+    parser.add_argument('--world-size', type=int, default=None,
+                        help='総チップ数 (サブプロセス用。パターン分割に使用)')
     args = parser.parse_args()
 
     n_dev = int(os.environ.get('TPU_NUM_DEVICES', '1'))
 
+    # サブプロセスとして起動された場合 (--rank 指定あり)
+    if args.rank is not None:
+        # world_sizeは--world-size引数から取得 (TPU_NUM_DEVICES=1に上書きされるため)
+        ws = args.world_size if args.world_size is not None else n_dev
+        warmup(rank=args.rank, world_size=ws, dry_run=args.dry_run)
+        sys.exit(0)
+
     if n_dev > 1:
-        # xmp.spawn で全チップを並列コンパイル (PJRT デバイス割り当ては xmp が制御)
-        try:
-            import torch_xla.distributed.xla_multiprocessing as xmp  # type: ignore
-            print(f"[WARMUP] xmp.spawn: {n_dev} チップ並列コンパイル開始", flush=True)
-            # nprocs=None: PJRT が利用可能な全チップを自動割り当て
-            # start_method='spawn': PJRT 推奨。トップレベル関数が必要
-            xmp.spawn(_warmup_spawn_worker,
-                      args=(n_dev, args.dry_run),
-                      nprocs=None,
-                      start_method='spawn')
-            print(f"[WARMUP] 全 {n_dev} チップ コンパイル完了", flush=True)
-        except Exception as e:
-            print(f"[WARMUP] xmp.spawn 失敗: {e} → シングルチップにフォールバック", flush=True)
-            warmup(rank=0, world_size=1, dry_run=args.dry_run)
+        # subprocess.Popen で各チップを独立プロセスとして並列起動
+        # xmp.spawn は xm.mark_step() がグローバルバリアになりデッドロックするため使わない
+        print(f"[WARMUP] subprocess: {n_dev} チップ並列コンパイル開始", flush=True)
+        procs = []
+        for rank in range(n_dev):
+            env = os.environ.copy()
+            env['PJRT_LOCAL_PROCESS_RANK'] = str(rank)
+            env['LOCAL_RANK']              = str(rank)
+            env['TPU_VISIBLE_DEVICES']     = str(rank)
+            env['TPU_NUM_DEVICES']         = '1'
+            cmd = [sys.executable, __file__,
+                   '--rank', str(rank),
+                   '--world-size', str(n_dev)]
+            if args.dry_run:
+                cmd.append('--dry-run')
+            p = subprocess.Popen(cmd, env=env)
+            procs.append((rank, p))
+            print(f"[WARMUP] rank={rank} 起動 PID={p.pid}", flush=True)
+
+        for rank, p in procs:
+            p.wait()
+            print(f"[WARMUP] rank={rank} 完了 (exit={p.returncode})", flush=True)
+
+        print(f"[WARMUP] 全 {n_dev} チップ コンパイル完了", flush=True)
     else:
         warmup(rank=0, world_size=1, dry_run=args.dry_run)
