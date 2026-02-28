@@ -105,6 +105,10 @@ def warmup(rank: int = 0, world_size: int = 1, dry_run: bool = False):
     import torch._dynamo as _dynamo
     _dynamo.config.disable = True   # Inductor デッドロック防止
 
+    # torch_xla が LIBTPU_INIT_ARGS に非対応フラグ (xla_tpu_heartbeat_watchdog_timeout_ms 等) を
+    # 追加してlibtpuがクラッシュするのを防ぐ。空文字列をセットしておくと setdefault が上書きしない。
+    os.environ.setdefault('LIBTPU_INIT_ARGS', '')
+
     import torch_xla.core.xla_model as xm  # type: ignore
     device = xm.xla_device()
     print(f"[WARMUP rank={rank}] デバイス: {device}", flush=True)
@@ -175,6 +179,9 @@ def _worker_env(rank: int, n_dev: int) -> dict:
     env['LOCAL_RANK']              = str(rank)
     env['TPU_VISIBLE_DEVICES']     = str(rank)
     env['TPU_NUM_DEVICES']         = '1'
+    # torch_xla が LIBTPU_INIT_ARGS に非対応フラグを追加してlibtpuがクラッシュするのを防ぐ
+    # 空文字列をセットしておくと torch_xla の setdefault が上書きしない
+    env['LIBTPU_INIT_ARGS'] = ''
     return env
 
 

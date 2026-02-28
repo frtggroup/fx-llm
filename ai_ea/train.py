@@ -374,6 +374,8 @@ def _detect_device():
             _dynamo.config.disable = True
         except Exception:
             pass
+        # torch_xla が LIBTPU_INIT_ARGS に非対応フラグを追加してlibtpuがクラッシュするのを防ぐ
+        _os.environ.setdefault('LIBTPU_INIT_ARGS', '')
         try:
             import torch_xla.core.xla_model as xm  # type: ignore
             dev = xm.xla_device()
@@ -862,20 +864,16 @@ def _train_step(model, xb, yb, opt, crit, sched,
         scaler.update()
     else:
         loss.backward()
-        nn.utils.clip_grad_norm_(model.parameters(), 1.0)
         if is_tpu:
             try:
                 import torch_xla.core.xla_model as xm  # type: ignore
-                if spmd_mode:
-                    # SPMD: 全チップのグラジェントを all_reduce してから step
-                    xm.optimizer_step(opt)
-                else:
-                    # シングルチップ: mark_step() のみ
-                    opt.step()
-                    xm.mark_step()
+                nn.utils.clip_grad_norm_(model.parameters(), 1.0)
+                xm.optimizer_step(opt)
             except Exception:
+                nn.utils.clip_grad_norm_(model.parameters(), 1.0)
                 opt.step()
         else:
+            nn.utils.clip_grad_norm_(model.parameters(), 1.0)
             opt.step()
     sched.step()
     return loss.detach()

@@ -151,6 +151,10 @@ if [ "$DEVICE_TYPE" = "TPU" ]; then
     # 正しいTPU向けキャッシュ設定は XLA_PERSISTENT_CACHE_PATH 環境変数を使う。
     export XLA_PERSISTENT_CACHE_PATH="${XLA_CACHE_DIR}"
     echo "[*] XLA キャッシュ設定: ${XLA_CACHE_DIR}"
+    # torch_xla が LIBTPU_INIT_ARGS に非対応フラグを追加してlibtpuがクラッシュするのを防ぐ
+    # 空文字列をセットしておくと torch_xla の setdefault が上書きしない
+    export LIBTPU_INIT_ARGS=""
+    echo "[*] LIBTPU_INIT_ARGS をクリア (非対応フラグ防止)"
 fi
 
 # Python に デバイス名を渡す

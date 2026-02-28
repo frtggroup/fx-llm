@@ -206,8 +206,10 @@ sudo docker run -d \\
   --restart=unless-stopped \\
   -e PJRT_DEVICE=TPU \\
   -e TPU_NUM_DEVICES=4 \\
-  -e TPU_ACCELERATOR_TYPE=v5e-4 \\
+  -e TPU_ACCELERATOR_TYPE=v5litepod-4 \\
+  -e DEVICE_TYPE=TPU \\
   -e MAX_PARALLEL=4 \\
+  -e LIBTPU_INIT_ARGS="" \\
   {image}
 
 sleep 8
