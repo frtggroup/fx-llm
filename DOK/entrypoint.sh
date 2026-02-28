@@ -276,30 +276,42 @@ _STOP_REQUESTED=0
 _xla_cache_upload() {
     [ "$DEVICE_TYPE" != "TPU" ] && return 0
     [ -z "$S3_ENDPOINT" ] && return 0
-    echo "[*] XLA キャッシュを S3 へ保存中..."
+    echo "[*] XLA キャッシュを S3 へ保存中 (並列16スレッド)..."
     python3 - <<'PYEOF'
-import os, sys, pathlib
+import os, pathlib
+from concurrent.futures import ThreadPoolExecutor, as_completed
 try:
     import boto3, urllib3
     urllib3.disable_warnings()
     cache_dir = pathlib.Path(os.environ.get('XLA_CACHE_DIR', '/workspace/xla_cache'))
+    bucket    = os.environ.get('S3_BUCKET',  'fxea')
+    s3_prefix = os.environ.get('S3_PREFIX',  'mix') + '/xla_cache'
+
+    def make_client():
+        return boto3.client('s3',
+            endpoint_url=os.environ.get('S3_ENDPOINT', ''),
+            aws_access_key_id=os.environ.get('S3_ACCESS_KEY', ''),
+            aws_secret_access_key=os.environ.get('S3_SECRET_KEY', ''),
+            verify=False)
+
     files = [f for f in cache_dir.rglob('*') if f.is_file()]
     if not files:
         print('[INFO] XLA キャッシュ: ファイルなし (スキップ)')
-        sys.exit(0)
-    s3 = boto3.client('s3',
-        endpoint_url=os.environ.get('S3_ENDPOINT', ''),
-        aws_access_key_id=os.environ.get('S3_ACCESS_KEY', ''),
-        aws_secret_access_key=os.environ.get('S3_SECRET_KEY', ''),
-        verify=False)
-    bucket    = os.environ.get('S3_BUCKET',  'fxea')
-    s3_prefix = os.environ.get('S3_PREFIX',  'mix') + '/xla_cache'
-    count = 0
-    for f in files:
+        import sys; sys.exit(0)
+
+    def upload(f):
         rel = f.relative_to(cache_dir)
-        s3.upload_file(str(f), bucket, f'{s3_prefix}/{rel}')
-        count += 1
-    print(f'[OK] XLA キャッシュ S3 保存: {count}件 → s3://{bucket}/{s3_prefix}/')
+        make_client().upload_file(str(f), bucket, f'{s3_prefix}/{rel}')
+        return f.name
+
+    done = 0
+    with ThreadPoolExecutor(max_workers=16) as ex:
+        futs = {ex.submit(upload, f): f for f in files}
+        for fut in as_completed(futs):
+            try: fut.result(); done += 1
+            except Exception as e: print(f'  [WARN] upload failed: {e}')
+            if done % 10 == 0: print(f'  ... {done}/{len(files)}', flush=True)
+    print(f'[OK] XLA キャッシュ S3 保存: {done}/{len(files)}件 → s3://{bucket}/{s3_prefix}/')
 except Exception as e:
     print(f'[WARN] XLA キャッシュ S3 保存失敗: {e}')
 PYEOF
@@ -428,10 +440,11 @@ fi
 if [ "$DEVICE_TYPE" = "TPU" ]; then
     # xmp.spawn で TPU_NUM_DEVICES 枚を並列コンパイル (シングルチップ時はシングル実行)
     python3 /workspace/ai_ea/warmup_xla.py 2>&1 | tee -a /workspace/train_run.log
-    # warmup 後にキャッシュと進捗 JSON を S3 へ保存
-    _xla_cache_upload || true
-    if [ -n "$S3_ENDPOINT" ]; then
-        python3 - <<'PYEOF'
+    # warmup 後にキャッシュと進捗 JSON を S3 へバックグラウンドで保存 (学習を即時開始)
+    (
+        _xla_cache_upload || true
+        if [ -n "$S3_ENDPOINT" ]; then
+            python3 - <<'PYEOF'
 import os, sys, pathlib
 try:
     import boto3, urllib3; urllib3.disable_warnings()
@@ -450,7 +463,9 @@ try:
 except Exception as e:
     print(f'[WARN] warmup 進捗 S3 保存失敗: {e}')
 PYEOF
-    fi
+        fi
+    ) &
+    echo "[*] XLA キャッシュ S3 バックグラウンドアップロード開始 (学習は並行して進みます)"
 fi
 
 # ── 自動再起動ループ ──────────────────────────────────────────────────────────
