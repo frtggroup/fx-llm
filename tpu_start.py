@@ -65,6 +65,24 @@ def run(cmd: list, check=True, capture=False) -> subprocess.CompletedProcess:
         return subprocess.run(full_cmd, check=check)
 
 
+def propagate_ssh_key(zone: str):
+    """gcloud で SSH 鍵を TPU VM に伝播させる (plink ホストキープロンプトは無視)"""
+    print("[*] SSH 鍵を VM に伝播中 (gcloud)...")
+    r = run([
+        "compute", "tpus", "tpu-vm", "ssh", VM_NAME,
+        f"--zone={zone}",
+        "--command=echo PROPAGATED",
+        "--ssh-flag=-o BatchMode=yes",
+        "--ssh-flag=-o StrictHostKeyChecking=no",
+    ], check=False, capture=True)
+    # plink が "-o" を拒否しても鍵伝播自体は成功している場合が多い
+    if "Propagating SSH public key" in (r.stdout + r.stderr) or \
+       "PROPAGATED" in (r.stdout + r.stderr):
+        print("[OK] SSH 鍵伝播完了")
+    else:
+        print("[WARN] gcloud SSH 終了 (鍵は伝播済みの可能性あり、OpenSSH で続行)")
+
+
 def ssh(ip: str, remote_cmd: str, timeout=120) -> bool:
     """OpenSSH でリモートコマンドを実行"""
     import subprocess
@@ -292,6 +310,9 @@ def main():
         print("[ERROR] IP 取得失敗")
         sys.exit(1)
     print(f"[OK] VM IP: {ip}")
+
+    # SSH 鍵伝播 (gcloud 経由で authorized_keys に登録)
+    propagate_ssh_key(created_zone)
 
     # SSH 接続確認 (最大3分待つ)
     print("SSH 接続待ち...")
