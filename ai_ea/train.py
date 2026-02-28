@@ -546,9 +546,17 @@ def train(args, X_tr, y_tr, X_te, y_te, mean, std, n_feat=None):
     v_loss = float('inf')   # 最初のvalidationまでの初期値
     acc    = 0.0
 
+    _xla_compiled = False   # 初回バッチのXLAコンパイル完了フラグ
+
     for epoch in range(1, args.epochs + 1):
         model.train()
         try:
+            # XLA 初回コンパイル中の表示
+            if is_tpu and not _xla_compiled and epoch == 1:
+                import time as _time
+                print(f"  [XLA] グラフコンパイル中... (初回のみ数分かかります)", flush=True)
+                _compile_start = _time.time()
+
             step_losses = [
                 _train_step(model, xb, yb,
                             optimizer, criterion, scheduler, scaler,
@@ -557,6 +565,10 @@ def train(args, X_tr, y_tr, X_te, y_te, mean, std, n_feat=None):
                 for xb, yb in tr_dl
             ]
             t_loss = torch.stack(step_losses).mean().item()
+
+            if is_tpu and not _xla_compiled and epoch == 1:
+                _xla_compiled = True
+                print(f"  [XLA] コンパイル完了 ({_time.time()-_compile_start:.0f}秒)", flush=True)
         except (RuntimeError, torch.cuda.OutOfMemoryError) as e:
             if dev_type == 'cuda':
                 torch.cuda.empty_cache()
