@@ -17,6 +17,51 @@ XLA_PERSISTENT_CACHE_PATH にコンパイル済みグラフをキャッシュす
 import argparse, json, os, subprocess, sys, time
 from pathlib import Path
 
+# ── S3 設定 (環境変数から取得) ────────────────────────────────────────────────
+def _s3_client():
+    """boto3 S3クライアントを生成。設定がなければ None を返す。"""
+    endpoint = os.environ.get('S3_ENDPOINT', '')
+    key      = os.environ.get('S3_ACCESS_KEY', '')
+    secret   = os.environ.get('S3_SECRET_KEY', '')
+    if not endpoint or not key:
+        return None, None, None
+    try:
+        import boto3, urllib3
+        urllib3.disable_warnings()
+        bucket = os.environ.get('S3_BUCKET', 'fxea')
+        prefix = os.environ.get('S3_PREFIX', 'mix') + '/xla_cache'
+        s3 = boto3.client('s3', endpoint_url=endpoint,
+                          aws_access_key_id=key, aws_secret_access_key=secret,
+                          verify=False)
+        return s3, bucket, prefix
+    except Exception:
+        return None, None, None
+
+
+def _upload_new_cache_files(cache_dir: Path, known_files: set, rank: int) -> set:
+    """キャッシュディレクトリに増えたファイルを即座にS3へアップロードする。
+    戻り値: 更新後の既知ファイルセット"""
+    if not cache_dir.exists():
+        return known_files
+    current = {f for f in cache_dir.rglob('*') if f.is_file()}
+    new_files = current - known_files
+    if not new_files:
+        return current
+    s3, bucket, prefix = _s3_client()
+    if s3 is None:
+        return current
+    uploaded = 0
+    for f in new_files:
+        try:
+            rel = f.relative_to(cache_dir)
+            s3.upload_file(str(f), bucket, f'{prefix}/{rel}')
+            uploaded += 1
+        except Exception as e:
+            print(f"[WARMUP rank={rank}] S3アップロード失敗 {f.name}: {e}", flush=True)
+    if uploaded:
+        print(f"[WARMUP rank={rank}] S3アップ: {uploaded}件 → {prefix}/", flush=True)
+    return current
+
 # ── 全パターン定義 (run_train.py の TPU tier と同一) ──────────────────────────
 ARCHS = [
     'mlp', 'gru_attn', 'bigru', 'lstm_attn',
@@ -113,11 +158,11 @@ def warmup(rank: int = 0, world_size: int = 1, dry_run: bool = False):
     device = xm.xla_device()
     print(f"[WARMUP rank={rank}] デバイス: {device}", flush=True)
 
-    all_pats = _all_patterns()
+    all_pats  = _all_patterns()
     # 担当パターン: インターリーブ分割 (負荷均等)
-    my_pats  = [p for i, p in enumerate(all_pats) if i % world_size == rank]
-    done_set = _load_done(rank)
-    todo     = [p for p in my_pats if p not in done_set]
+    my_pats   = [p for i, p in enumerate(all_pats) if i % world_size == rank]
+    done_set  = _load_done(rank)
+    todo      = [p for p in my_pats if p not in done_set]
 
     print(f"[WARMUP rank={rank}] 担当: {len(my_pats)}  完了済み: {len(done_set)}  残り: {len(todo)}", flush=True)
 
@@ -125,6 +170,13 @@ def warmup(rank: int = 0, world_size: int = 1, dry_run: bool = False):
         print(f"[WARMUP rank={rank}] 全パターンコンパイル済み → スキップ", flush=True)
         _save_rank(rank, world_size, all_pats, done_set)
         return
+
+    # XLAキャッシュディレクトリ (コンパイル結果の書き込み先)
+    cache_dir   = Path(os.environ.get('XLA_PERSISTENT_CACHE_PATH',
+                       os.environ.get('XLA_CACHE_DIR', '/workspace/xla_cache')))
+    cache_dir.mkdir(parents=True, exist_ok=True)
+    # コンパイル前の既知ファイルを記録 (新規ファイルのみ S3 アップロードするため)
+    known_files = {f for f in cache_dir.rglob('*') if f.is_file()}
 
     criterion = torch.nn.CrossEntropyLoss()
 
@@ -167,6 +219,9 @@ def warmup(rank: int = 0, world_size: int = 1, dry_run: bool = False):
 
         done_set.add((arch, hidden, layers))
         _save_rank(rank, world_size, all_pats, done_set)
+
+        # ── コンパイル直後に新規キャッシュファイルをS3へ即時アップロード ──────────
+        known_files = _upload_new_cache_files(cache_dir, known_files, rank)
 
     _save_rank(rank, world_size, all_pats, done_set)
     print(f"[WARMUP rank={rank}] 完了! {len(done_set)}/{len(my_pats)} パターンをキャッシュ", flush=True)

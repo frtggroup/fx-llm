@@ -432,24 +432,21 @@ except Exception as e:
 PYEOF
 fi
 
-# XLA キャッシュ定期アップロード (10分ごと、バックグラウンド)
-XLA_SYNC_PID=""
-if [ "$DEVICE_TYPE" = "TPU" ] && [ -n "$S3_ENDPOINT" ]; then
-    (while true; do sleep 600; _xla_cache_upload; done) &
-    XLA_SYNC_PID=$!
-    echo "[*] XLA キャッシュ自動同期 開始 (10分ごと, PID: ${XLA_SYNC_PID})"
-fi
-
-# ── XLA 全パターン事前コンパイル (TPU のみ / キャッシュ未完了時のみ) ───────────
+# ── XLA 全パターン事前コンパイル (TPU のみ) ─────────────────────────────────
+# warmup_xla.py がパターン1個完了するたびに新規キャッシュファイルをS3へ即時アップロードする。
+# このブロックが完了するまで学習は開始しない。
 if [ "$DEVICE_TYPE" = "TPU" ]; then
-    # xmp.spawn で TPU_NUM_DEVICES 枚を並列コンパイル (シングルチップ時はシングル実行)
+    echo "[*] XLA 事前コンパイル開始 (完了後に学習開始)"
     python3 /workspace/ai_ea/warmup_xla.py 2>&1 | tee -a /workspace/train_run.log
-    # warmup 後にキャッシュと進捗 JSON を S3 へバックグラウンドで保存 (学習を即時開始)
-    (
-        _xla_cache_upload || true
-        if [ -n "$S3_ENDPOINT" ]; then
-            python3 - <<'PYEOF'
-import os, sys, pathlib
+
+    # warmup 完了後: 残存キャッシュファイルを同期アップロード (取りこぼし防止)
+    echo "[*] XLA キャッシュ S3 最終同期中..."
+    _xla_cache_upload || true
+
+    # warmup 進捗 JSON を S3 へ保存
+    if [ -n "$S3_ENDPOINT" ]; then
+        python3 - <<'PYEOF'
+import os, pathlib
 try:
     import boto3, urllib3; urllib3.disable_warnings()
     s3 = boto3.client('s3',
@@ -463,13 +460,21 @@ try:
     for f in pathlib.Path('/workspace').glob('xla_warmup_rank_*.json'):
         s3.upload_file(str(f), bucket, f'{prefix}/{f.name}')
         count += 1
-    if count: print(f'[OK] warmup 進捗 S3 保存: {count}件')
+    if count:
+        print(f'[OK] warmup 進捗 S3 保存: {count}件')
 except Exception as e:
     print(f'[WARN] warmup 進捗 S3 保存失敗: {e}')
 PYEOF
-        fi
-    ) &
-    echo "[*] XLA キャッシュ S3 バックグラウンドアップロード開始 (学習は並行して進みます)"
+    fi
+    echo "[OK] XLA コンパイル＆S3同期 完了 → 学習開始"
+fi
+
+# 学習中の新規キャッシュ (train.py が生成) を定期的にS3へバックアップ (10分ごと)
+XLA_SYNC_PID=""
+if [ "$DEVICE_TYPE" = "TPU" ] && [ -n "$S3_ENDPOINT" ]; then
+    (while true; do sleep 600; _xla_cache_upload; done) &
+    XLA_SYNC_PID=$!
+    echo "[*] 学習中XLAキャッシュ自動同期 開始 (10分ごと, PID: ${XLA_SYNC_PID})"
 fi
 
 # ── 自動再起動ループ ──────────────────────────────────────────────────────────
