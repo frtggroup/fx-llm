@@ -212,19 +212,7 @@ try:
 except Exception as e:
     print(f'[WARN] S3 取得失敗: {e}')
 
-# 方法2: GDrive フォールバック
-try:
-    import gdrive
-    if gdrive.GDRIVE_ENABLED:
-        print('[*] GDrive から CSV 取得中...')
-        ok = gdrive.download(dst.name, dst)
-        if ok and dst.exists() and dst.stat().st_size > 0:
-            print(f'[OK] GDrive CSV 取得完了 ({dst.stat().st_size/1e6:.1f} MB)')
-            sys.exit(0)
-except Exception as e:
-    print(f'[WARN] GDrive 取得失敗: {e}')
-
-print('[ERROR] CSV 取得失敗'); sys.exit(1)
+print('[ERROR] S3 CSV 取得失敗'); sys.exit(1)
 PYEOF
     STATUS=$?
     if [ $STATUS -ne 0 ] && [ -n "${DATA_URL}" ]; then
