@@ -569,10 +569,58 @@ TRIAL_TIMEOUT = _TIER_TIMEOUT[_GPU_TIER]
 # ── epoch 進捗ストール検出 ──────────────────────────────────────────────────────
 # 固定タイムアウトではなく「epochが進まない時間」で強制終了する
 # TPU (XLA) は初回グラフコンパイルに 5〜10 分かかるため長めに設定
+# GPU でも大モデルのコンパイル・初期化に数分かかる場合があるため余裕を持たせる
 _is_tpu_env = (os.environ.get('DEVICE_TYPE', '').upper() == 'TPU'
                or os.environ.get('PJRT_DEVICE', '').upper() == 'TPU')
-EP_STALL_INIT_SEC  = 900 if _is_tpu_env else 180   # TPU:15分 / GPU:3分
-EP_STALL_TRAIN_SEC = 600 if _is_tpu_env else 300   # TPU:10分 / GPU:5分
+EP_STALL_INIT_SEC  = 900 if _is_tpu_env else 600   # TPU:15分 / GPU:10分 (初期化猶予)
+EP_STALL_TRAIN_SEC = 900 if _is_tpu_env else 600   # TPU:15分 / GPU:10分 (学習進捗猶予)
+
+
+def _kill_with_group(pid_or_proc):
+    """プロセスグループごと終了させて孤立子プロセス(ゾンビ)を防ぐ。
+    引数は subprocess.Popen オブジェクトまたは PID (int) を受け付ける。"""
+    import subprocess as _sp
+    if isinstance(pid_or_proc, int):
+        pid = pid_or_proc
+        proc = None
+    else:
+        proc = pid_or_proc
+        pid = proc.pid
+
+    if platform.system() != 'Windows':
+        # Linux/Mac: プロセスグループごと SIGTERM → SIGKILL
+        try:
+            pgid = os.getpgid(pid)
+            os.killpg(pgid, signal.SIGTERM)
+            if proc is not None:
+                try:
+                    proc.wait(timeout=5)
+                    return
+                except Exception:
+                    pass
+            else:
+                time.sleep(3)
+            # まだ生きていれば SIGKILL
+            os.killpg(pgid, signal.SIGKILL)
+            return
+        except (ProcessLookupError, OSError):
+            pass  # すでに終了済み
+
+    # Windows フォールバック (またはプロセスグループ取得失敗時)
+    if proc is not None:
+        try:
+            proc.terminate()
+            proc.wait(timeout=10)
+        except Exception:
+            try:
+                proc.kill()
+            except Exception:
+                pass
+    else:
+        try:
+            os.kill(pid, signal.SIGKILL)
+        except Exception:
+            pass
 
 
 def _read_trial_epoch(trial_dir) -> int:
@@ -1247,7 +1295,9 @@ class ParallelTrainer:
             cmd += [f'--{k}', str(v)]
 
         log_fh = open(trial_dir / 'train.log', 'w', encoding='utf-8', buffering=1)
-        proc   = subprocess.Popen(cmd, stdout=log_fh, stderr=subprocess.STDOUT)
+        # start_new_session=True でプロセスグループを分離し、kill 時に子孫まで全終了できるようにする
+        _popen_extra = {'start_new_session': True} if platform.system() != 'Windows' else {}
+        proc   = subprocess.Popen(cmd, stdout=log_fh, stderr=subprocess.STDOUT, **_popen_extra)
 
         with self.lock:
             self.running[trial_no] = {
@@ -1312,12 +1362,8 @@ class ParallelTrainer:
 
                     if _kill_proc:
                         tag, msg = _kill_proc
-                        print(f"  [{tag}] {msg} → 強制終了")
-                        try:
-                            proc.terminate()
-                            proc.wait(timeout=10)
-                        except Exception:
-                            proc.kill()
+                        print(f"  [{tag}] {msg} → 強制終了 (プロセスグループ)")
+                        _kill_with_group(proc)
 
                 if proc.poll() is not None:
                     info['log_fh'].close()
@@ -1329,7 +1375,7 @@ class ParallelTrainer:
         with self.lock:
             for info in self.running.values():
                 try:
-                    info['proc'].terminate()
+                    _kill_with_group(info['proc'])
                 except Exception:
                     pass
 
@@ -1390,9 +1436,8 @@ class WorkerPool:
         # ゾンビワーカーを強制終了
         for pid in old_pids:
             try:
-                import os as _os
-                _os.kill(pid, _signal.SIGKILL)
-                print(f"  [WorkerPool] ゾンビワーカー PID={pid} を KILL")
+                _kill_with_group(pid)
+                print(f"  [WorkerPool] ゾンビワーカー PID={pid} グループごと KILL")
             except Exception:
                 pass
         # 壊れた futures / meta を破棄
