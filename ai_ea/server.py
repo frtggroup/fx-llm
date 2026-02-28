@@ -85,8 +85,29 @@ def _s3_node_ids(results: list) -> list:
     return nodes
 
 
+def _s3_discover_node_ids() -> list:
+    """S3 上の results_*.json から node_id 一覧を取得する (ローカル results が空の場合のフォールバック)。"""
+    if not _S3_ENDPOINT or not _S3_BUCKET:
+        return []
+    try:
+        s3     = _s3_client_srv()
+        prefix = (_S3_PREFIX.rstrip('/') + '/') if _S3_PREFIX else ''
+        resp   = s3.list_objects_v2(Bucket=_S3_BUCKET, Prefix=prefix + 'results_')
+        nodes  = []
+        for obj in resp.get('Contents', []):
+            fname = obj['Key'].split('/')[-1]
+            if fname.startswith('results_') and fname.endswith('.json'):
+                nodes.append(fname[len('results_'):-len('.json')])
+        return nodes
+    except Exception:
+        return []
+
+
 def _s3_fetch_rank_file(global_rank: int, fname: str, node_ids: list) -> bytes | None:
-    """top100_{node_id}/rank_{global_rank:03d}/{fname} を各ノードで順に試す。"""
+    """top100_{node_id}/rank_{global_rank:03d}/{fname} を各ノードで順に試す。
+    node_ids が空の場合は S3 を自動探索する。"""
+    if not node_ids:
+        node_ids = _s3_discover_node_ids()
     for nid in node_ids:
         data = _s3_get_bytes(f'top100_{nid}/rank_{global_rank:03d}/{fname}')
         if data is not None:
@@ -301,8 +322,9 @@ def _get_top_n(n: int = 100) -> list:
             local_report = (rank_dir / 'report.html').exists() or (
                 model_dir is not None and (model_dir / 'report.html').exists())
             # S3 フォールバック: top100_{node_id}/rank_{global_rank:03d}/ に格納済み
-            r['has_model']  = local_model  or (s3_ok and bool(s3_nodes))
-            r['has_report'] = local_report or (s3_ok and bool(s3_nodes))
+            # S3 設定済みなら常にボタン表示 (s3_nodes が空でもS3に存在する可能性あり)
+            r['has_model']  = local_model  or s3_ok
+            r['has_report'] = local_report or s3_ok
             # 特徴量重要度: all_results.json → rank_dir/result.json の順に取得
             imp = r.get('feature_importance')
             if not imp:
