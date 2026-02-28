@@ -57,16 +57,17 @@ def _s3_client_srv():
 _catalog_cache: dict = {}
 _catalog_lock  = threading.Lock()
 
-WORKSPACE     = Path('/workspace')
-AI_EA_DIR     = WORKSPACE / 'ai_ea'
-PROGRESS_JSON = AI_EA_DIR / 'progress.json'
-ALL_RESULTS   = AI_EA_DIR / 'all_results.json'
-TOP_DIR       = AI_EA_DIR / 'top100'
-TRIALS_DIR    = AI_EA_DIR / 'trials'
-BEST_ONNX     = AI_EA_DIR / 'fx_model_best.onnx'
-BEST_NORM     = AI_EA_DIR / 'norm_params_best.json'
-STOP_FLAG     = WORKSPACE / 'stop.flag'
-LOG_FILE      = WORKSPACE / 'train_run.log'
+WORKSPACE      = Path('/workspace')
+AI_EA_DIR      = WORKSPACE / 'ai_ea'
+PROGRESS_JSON  = AI_EA_DIR / 'progress.json'
+ALL_RESULTS    = AI_EA_DIR / 'all_results.json'
+TOP_DIR        = AI_EA_DIR / 'top100'
+TRIALS_DIR     = AI_EA_DIR / 'trials'
+BEST_ONNX      = AI_EA_DIR / 'fx_model_best.onnx'
+BEST_NORM      = AI_EA_DIR / 'norm_params_best.json'
+STOP_FLAG      = WORKSPACE / 'stop.flag'
+LOG_FILE       = WORKSPACE / 'train_run.log'
+WARMUP_JSON    = WORKSPACE / 'xla_warmup_progress.json'
 
 app = FastAPI(title="FX AI EA Dashboard v2")
 app.add_middleware(CORSMiddleware, allow_origins=["*"],
@@ -203,6 +204,17 @@ def api_status():
         st.setdefault(k, v)
     st['server_time']    = datetime.now().isoformat()
     st['stop_requested'] = STOP_FLAG.exists()
+    # XLA warmup 進捗 (TPU 起動時のグラフ事前コンパイル状況)
+    if WARMUP_JSON.exists():
+        try:
+            w = json.loads(WARMUP_JSON.read_text(encoding='utf-8'))
+            st['warmup_total']   = w.get('warmup_total', 0)
+            st['warmup_done']    = w.get('warmup_done', 0)
+            st['warmup_pct']     = w.get('warmup_pct', 0)
+            st['warmup_current'] = w.get('warmup_current')
+            st['warmup_phase']   = (w.get('warmup_done', 0) < w.get('warmup_total', 1))
+        except Exception:
+            pass
     # best_links の S3直リンクをプロキシURLに変換 (自己署名証明書ブロック回避)
     if isinstance(st.get('best_links'), dict):
         bl = st['best_links']
@@ -581,6 +593,24 @@ tr:hover td{background:#1c2128}
       margin-left:10px">GPU: ...</span>
   </h1>
   <span class="badge badge-wait" id="phase-badge">待機中</span>
+</div>
+
+<!-- XLA Warmup 進捗バー (TPU時のみ表示) -->
+<div class="card" id="warmup-card" style="display:none;margin-bottom:12px;border-color:#388bfd44">
+  <h2 style="color:#79c0ff">⚡ XLA グラフ事前コンパイル</h2>
+  <div style="display:flex;align-items:center;gap:16px;flex-wrap:wrap">
+    <div style="flex:1;min-width:200px">
+      <div style="background:#21262d;border-radius:6px;height:18px;overflow:hidden">
+        <div id="warmup-bar" style="height:100%;background:linear-gradient(90deg,#388bfd,#58a6ff);
+          width:0%;transition:width .5s;border-radius:6px"></div>
+      </div>
+    </div>
+    <div style="white-space:nowrap;font-size:.95em;color:#e6edf3" id="warmup-text">0 / 0</div>
+    <div style="font-size:.8em;color:#8b949e" id="warmup-current"></div>
+  </div>
+  <div style="margin-top:6px;font-size:.78em;color:#8b949e">
+    完了後は全パターンがキャッシュから即ロードされます
+  </div>
 </div>
 
 <!-- 稼働マシン一覧 -->
@@ -1032,6 +1062,25 @@ async function poll() {
 
     applyPhase(d.phase??'waiting');
     document.getElementById('msg').textContent = d.message??'';
+
+    // XLA Warmup 進捗バー
+    const wCard = document.getElementById('warmup-card');
+    if (d.warmup_total && d.warmup_phase) {
+      wCard.style.display = 'block';
+      const pct = d.warmup_pct??0;
+      document.getElementById('warmup-bar').style.width = pct+'%';
+      document.getElementById('warmup-text').textContent =
+        `${d.warmup_done??0} / ${d.warmup_total??0} (${pct.toFixed(1)}%)`;
+      const cur = d.warmup_current;
+      document.getElementById('warmup-current').textContent =
+        cur ? `コンパイル中: ${cur[0]} h=${cur[1]} L${cur[2]}` : '次のパターンを準備中...';
+    } else if (d.warmup_total && !d.warmup_phase) {
+      wCard.style.display = 'block';
+      document.getElementById('warmup-bar').style.width = '100%';
+      document.getElementById('warmup-text').textContent =
+        `✓ ${d.warmup_total} / ${d.warmup_total} 完了`;
+      document.getElementById('warmup-current').textContent = 'キャッシュ構築済み';
+    }
 
     if (d.stop_requested && !stopReq) {
       stopReq = true;

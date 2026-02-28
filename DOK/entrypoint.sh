@@ -369,6 +369,13 @@ if [ "$DEVICE_TYPE" = "TPU" ] && [ -n "$S3_ENDPOINT" ]; then
     echo "[*] XLA キャッシュ自動同期 開始 (10分ごと, PID: ${XLA_SYNC_PID})"
 fi
 
+# ── XLA 全パターン事前コンパイル (TPU のみ / キャッシュ未完了時のみ) ───────────
+if [ "$DEVICE_TYPE" = "TPU" ]; then
+    python3 /workspace/ai_ea/warmup_xla.py 2>&1 | tee -a /workspace/train_run.log
+    # warmup 後にキャッシュを S3 へ保存
+    _xla_cache_upload || true
+fi
+
 # ── 自動再起動ループ ──────────────────────────────────────────────────────────
 # run_train.py がクラッシュしても自動復旧する。stop.flag があれば再起動しない。
 RESTART_COUNT=0
