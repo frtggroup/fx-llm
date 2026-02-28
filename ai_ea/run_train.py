@@ -26,6 +26,7 @@ PROGRESS_JSON = OUT_DIR / 'progress.json'
 BEST_ONNX     = OUT_DIR / 'fx_model_best.onnx'
 BEST_NORM     = OUT_DIR / 'norm_params_best.json'
 BEST_JSON     = OUT_DIR / 'best_result.json'
+BEST_LINKS    = OUT_DIR / 'best_links.json'   # GDrive 公開ダウンロードリンクキャッシュ
 
 # ── チェックポイント (停止→再開用) ─────────────────────────────────────────
 # ローカル: /workspace/data/checkpoint/ に定期保存
@@ -1013,6 +1014,17 @@ def rebuild_top_n(results: list) -> None:
                 json.dumps(r, indent=2, ensure_ascii=False), encoding='utf-8')
 
 
+# ── 公開ダウンロードリンク読み込み ──────────────────────────────────────────────
+def _load_best_links() -> dict:
+    """best_links.json から GDrive 公開リンクを読む。なければ空 dict。"""
+    if BEST_LINKS.exists():
+        try:
+            return json.loads(BEST_LINKS.read_text(encoding='utf-8'))
+        except Exception:
+            pass
+    return {}
+
+
 # ── 集約 progress.json ────────────────────────────────────────────────────────
 def write_progress(running: dict, results: list, best_pf: float, start: float) -> None:
     running_info = []
@@ -1126,7 +1138,8 @@ def write_progress(running: dict, results: list, best_pf: float, start: float) -
         'gpu_name':        GPU_NAME,
         'node_id':         NODE_ID,
         'nodes_summary':   nodes_summary,
-        'important_features': _important_features[:10],   # 上位10件を表示
+        'important_features': _important_features[:10],
+        'best_links':      _load_best_links(),
         'message': (f"[{NODE_ID.upper()}] 実行中: {len(running)}並列  完了: {n_done}件  "
                     f"ベスト PF: {best_pf:.4f}  [{search_phase}]  "
                     f"GPU: {gi['gpu_pct']}%  VRAM: {gi['used_gb']:.1f}/{gi['total_gb']:.0f}GB"),
@@ -2061,6 +2074,32 @@ def main():
                 except Exception:
                     pass
                 print(f"  [BEST] 試行#{tno}  PF={pf:.4f}  SR={sr:.3f}  MaxDD={max_dd:.4f}")
+                # GDrive にアップロードして公開リンクを生成 (バックグラウンド)
+                if GDRIVE_ENABLED:
+                    _best_pf_snap = best_pf
+                    def _share_best(pf_snap=_best_pf_snap):
+                        links = {}
+                        for local_p, key in [
+                            (BEST_ONNX, f'best_{NODE_ID}/fx_model_best.onnx'),
+                            (BEST_NORM, f'best_{NODE_ID}/norm_params_best.json'),
+                            (BEST_JSON, f'best_{NODE_ID}/best_result.json'),
+                        ]:
+                            if local_p.exists():
+                                url = _gdrive.upload_and_share(local_p, key)
+                                if url:
+                                    links[local_p.name] = url
+                        if links:
+                            links['pf'] = pf_snap
+                            links['node_id'] = NODE_ID
+                            links['updated_at'] = time.strftime('%Y-%m-%d %H:%M:%S')
+                            try:
+                                BEST_LINKS.write_text(
+                                    json.dumps(links, ensure_ascii=False, indent=2),
+                                    encoding='utf-8')
+                                print(f"  [GDrive] 公開リンク更新: {list(links.keys())}")
+                            except Exception as _e:
+                                print(f"  [GDrive] リンク保存失敗: {_e}")
+                    threading.Thread(target=_share_best, daemon=True).start()
             else:
                 print(f"  [DONE] 試行#{tno:4d}  PF={pf:.4f}  SR={sr:.3f}  "
                       f"MaxDD={max_dd:.4f}  取引={trades}  "

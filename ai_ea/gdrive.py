@@ -140,6 +140,68 @@ def _find_file(folder_id: str, name: str) -> Optional[str]:
     return files[0]['id'] if files else None
 
 
+def make_public_link(rel_key: str, timeout: float = 60.0) -> str:
+    """
+    rel_key のファイルを「リンクを知っている全員がダウンロード可能」に設定し、
+    直接ダウンロードURL を返す。
+    失敗時は空文字列を返す。
+    """
+    if not GDRIVE_ENABLED:
+        return ''
+
+    result = ['']
+    error  = [None]
+
+    def _do():
+        try:
+            svc = _svc()
+            folder_id, fname = _resolve_folder(rel_key)
+            file_id = _find_file(folder_id, fname)
+            if not file_id:
+                return
+            # 誰でも読める権限を付与 (既に付いていれば上書きされず無害)
+            try:
+                svc.permissions().create(
+                    fileId=file_id,
+                    body={'type': 'anyone', 'role': 'reader'},
+                    fields='id',
+                ).execute()
+            except Exception:
+                pass  # 権限が既に存在する場合も続行
+            # webContentLink = 直接ダウンロードURL (ONNX/JSON 用)
+            meta = svc.files().get(
+                fileId=file_id,
+                fields='webContentLink,webViewLink',
+            ).execute()
+            link = meta.get('webContentLink') or meta.get('webViewLink', '')
+            result[0] = link
+        except Exception as e:
+            error[0] = e
+
+    t = threading.Thread(target=_do, daemon=True)
+    t.start()
+    t.join(timeout)
+    if t.is_alive():
+        print(f'  [GDrive] make_public_link タイムアウト ({timeout:.0f}s): {rel_key}')
+        return ''
+    if error[0]:
+        print(f'  [GDrive] make_public_link 失敗 {rel_key}: {error[0]}')
+        return ''
+    return result[0]
+
+
+def upload_and_share(local_path: Path, rel_key: str, timeout: float = 180.0) -> str:
+    """
+    ファイルをアップロードして公開リンクを返す (upload + make_public_link の合体版)。
+    タイムアウトまたは失敗時は空文字列を返す。
+    """
+    if not GDRIVE_ENABLED:
+        return ''
+    if not upload(local_path, rel_key, timeout=timeout):
+        return ''
+    return make_public_link(rel_key, timeout=60.0)
+
+
 def upload(local_path: Path, rel_key: str, timeout: float = 120.0) -> bool:
     """
     local_path のファイルを GDrive の rel_key にアップロード。

@@ -498,6 +498,12 @@ tr:hover td{background:#1c2128}
   </div>
 </div>
 
+<!-- ベストモデル ダウンロードリンク -->
+<div class="card" id="best-links-card" style="margin-bottom:12px;display:none">
+  <h2>📥 ベストモデル ダウンロードリンク (Google Drive)</h2>
+  <div id="best-links-body" style="font-size:.85em;line-height:2"></div>
+</div>
+
 <!-- TOP100 テーブル -->
 <div class="card" style="margin-bottom:12px">
   <div style="display:flex;justify-content:space-between;align-items:center;margin-bottom:8px">
@@ -849,6 +855,29 @@ async function poll() {
     document.getElementById('bar-gpu').style.background  = gpuC;
     document.getElementById('m-vram').textContent        = `${vramU.toFixed(1)} / ${vramT.toFixed(0)} GB`;
     document.getElementById('bar-vram').style.width      = pct(vramU,vramT)+'%';
+
+    // ベストモデル GDrive ダウンロードリンク
+    if (d.best_links && Object.keys(d.best_links).length > 0) {
+      const bl = d.best_links;
+      const card = document.getElementById('best-links-card');
+      const body = document.getElementById('best-links-body');
+      const pfTxt = bl.pf ? ` (PF=${parseFloat(bl.pf).toFixed(4)})` : '';
+      const updTxt = bl.updated_at ? ` — 更新: ${bl.updated_at}` : '';
+      let html = `<div style="color:#8b949e;margin-bottom:6px">ノード: <b style="color:#e3b341">${bl.node_id||'-'}</b>${pfTxt}${updTxt}</div>`;
+      const fileLabels = {
+        'fx_model_best.onnx':    '🧠 ONNX モデル',
+        'norm_params_best.json': '📐 正規化パラメータ',
+        'best_result.json':      '📊 ベスト結果 JSON',
+      };
+      for (const [fname, label] of Object.entries(fileLabels)) {
+        if (bl[fname]) {
+          html += `<div><a href="${bl[fname]}" target="_blank" style="color:#58a6ff;text-decoration:none">
+            ${label} (${fname})</a></div>`;
+        }
+      }
+      body.innerHTML = html;
+      card.style.display = '';
+    }
 
     // GPU名 & ノード情報
     const gpuLabel = d.gpu_name || (d.node_id ? d.node_id.toUpperCase() : null);
