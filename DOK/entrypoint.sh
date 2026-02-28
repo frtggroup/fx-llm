@@ -10,6 +10,17 @@ echo "======================================================"
 echo "  FX AI EA 並列ランダムサーチ (統合イメージ)"
 echo "======================================================"
 
+# ── 0. torch_xla が CUDA_VISIBLE_DEVICES を空にするのを防ぐ ──────────────────
+# torch_xla はインポート時に CUDA_VISIBLE_DEVICES="" を設定する場合がある。
+# デバイス検出前にリセットして GPU が見えるようにする。
+if [ -z "${CUDA_VISIBLE_DEVICES+x}" ] || [ "${CUDA_VISIBLE_DEVICES}" = "" ]; then
+    if [ -n "${NVIDIA_VISIBLE_DEVICES}" ] && [ "${NVIDIA_VISIBLE_DEVICES}" != "none" ] && [ "${NVIDIA_VISIBLE_DEVICES}" != "void" ]; then
+        export CUDA_VISIBLE_DEVICES=0
+        echo "[*] CUDA_VISIBLE_DEVICES を 0 にリセット (torch_xla 干渉防止)"
+    fi
+fi
+export PJRT_DEVICE=CUDA   # torch_xla が CPU にフォールバックするのを防ぐ
+
 # ── 1. デバイス自動検出 (--gpus / --privileged 不要) ─────────────────────────
 echo "[*] デバイス検出中..."
 
