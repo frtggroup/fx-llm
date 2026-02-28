@@ -486,14 +486,30 @@ EPOCH_COUNT = 800   # GPU 共通
 
 # 試行タイムアウト: 大モデルは学習に時間がかかる
 _TIER_TIMEOUT = {
-    'micro':   600,   # 10分
-    'small':   900,   # 15分
-    'medium': 1200,   # 20分
-    'large':  1800,   # 30分
-    'xlarge': 2400,   # 40分
-    'tpu':    2400,   # 40分
+    'micro':  1800,   # 30分 (安全網: epoch進捗ストール検出で早期終了)
+    'small':  1800,   # 30分
+    'medium': 2400,   # 40分
+    'large':  3600,   # 60分
+    'xlarge': 3600,   # 60分
+    'tpu':    3600,   # 60分
 }
 TRIAL_TIMEOUT = _TIER_TIMEOUT[_GPU_TIER]
+
+# ── epoch 進捗ストール検出 ──────────────────────────────────────────────────────
+# 固定タイムアウトではなく「epochが進まない時間」で強制終了する
+EP_STALL_INIT_SEC  = 180   # ep=0 のまま 3分 → CUDA初期化/データ準備ハング
+EP_STALL_TRAIN_SEC = 300   # ep>0 で epoch変化なし 5分 → 学習ハング
+
+
+def _read_trial_epoch(trial_dir) -> int:
+    """trial_progress.json から現在の epoch を読む (失敗時は 0)"""
+    tp = trial_dir / 'trial_progress.json'
+    if tp.exists():
+        try:
+            return json.loads(tp.read_text(encoding='utf-8')).get('epoch', 0)
+        except Exception:
+            pass
+    return 0
 
 
 # ── ハイパーパラメータサンプリング ───────────────────────────────────────────
@@ -1185,26 +1201,27 @@ class ParallelTrainer:
 
                     # ── GPU使用中PIDの追跡 ──────────────────────────────
                     if pid in gpu_pids:
-                        info['last_gpu_time'] = now   # GPUアクティブ時刻を更新
+                        info['last_gpu_time'] = now
 
-                    last_gpu = info.get('last_gpu_time')
-                    since_gpu = (now - last_gpu) if last_gpu else elapsed
+                    # ── epoch 進捗ストール検出 ──────────────────────────
+                    cur_ep = _read_trial_epoch(info['trial_dir'])
+                    if cur_ep != info.get('_last_ep', -1):
+                        info['_last_ep']      = cur_ep
+                        info['_last_ep_time'] = now
+                    stall = now - info.get('_last_ep_time', info['start_time'])
+                    stall_limit = EP_STALL_INIT_SEC if cur_ep == 0 else EP_STALL_TRAIN_SEC
 
-                    # ── GPUノーアクティビティウォッチドッグ ─────────────
-                    # DATA_PREP_BUDGET 秒以内はデータ準備中として許容
-                    # それ以降も GPU を使っていなければ強制終了
-                    if elapsed > DATA_PREP_BUDGET and since_gpu > NO_GPU_TIMEOUT:
-                        print(f"  [NO-GPU] 試行#{tno}  経過{elapsed/60:.1f}分"
-                              f"  GPU無使用{since_gpu/60:.1f}分 → 強制終了")
-                        try:
-                            proc.terminate()
-                            proc.wait(timeout=10)
-                        except Exception:
-                            proc.kill()
-
-                    # ── 全体タイムアウト ────────────────────────────────
+                    _kill_proc = None
+                    if elapsed > 30 and stall > stall_limit:
+                        _kill_proc = ('STALL',
+                                      f"試行#{tno} ep={cur_ep} {stall/60:.1f}分進捗なし")
                     elif elapsed > TRIAL_TIMEOUT:
-                        print(f"  [TIMEOUT] 試行#{tno} ({elapsed/60:.0f}分超) → 強制終了")
+                        _kill_proc = ('TIMEOUT',
+                                      f"試行#{tno} ({elapsed/60:.0f}分超)")
+
+                    if _kill_proc:
+                        tag, msg = _kill_proc
+                        print(f"  [{tag}] {msg} → 強制終了")
                         try:
                             proc.terminate()
                             proc.wait(timeout=10)
@@ -1377,13 +1394,27 @@ class WorkerPool:
                     done.append((tno, meta))
                     del self._futures[tno]
                     del self._meta[tno]
-                elif elapsed > TRIAL_TIMEOUT:
-                    future.cancel()
-                    print(f"  [TIMEOUT] 試行#{tno} ({elapsed/60:.0f}分超) → スキップ")
-                    done.append((tno, meta))
-                    del self._futures[tno]
-                    del self._meta[tno]
-                elif broken:
+                else:
+                    # ── epoch 進捗ストール検出 ──────────────────────────
+                    cur_ep = _read_trial_epoch(meta['trial_dir'])
+                    if cur_ep != meta.get('_last_ep', -1):
+                        meta['_last_ep']      = cur_ep
+                        meta['_last_ep_time'] = now
+                    stall = now - meta.get('_last_ep_time', meta['start_time'])
+                    stall_limit = EP_STALL_INIT_SEC if cur_ep == 0 else EP_STALL_TRAIN_SEC
+
+                    if elapsed > 30 and stall > stall_limit:
+                        print(f"  [STALL] 試行#{tno} ep={cur_ep} {stall/60:.1f}分進捗なし"
+                              f" → executor再起動でワーカー強制終了")
+                        broken = True   # executor全体再起動でハングワーカーを殺す
+                    elif elapsed > TRIAL_TIMEOUT:
+                        future.cancel()
+                        print(f"  [TIMEOUT] 試行#{tno} ({elapsed/60:.0f}分超) → スキップ")
+                        done.append((tno, meta))
+                        del self._futures[tno]
+                        del self._meta[tno]
+
+                if broken and tno in self._futures:
                     # executor 破損 → 残り全ての future も強制削除
                     done.append((tno, meta))
                     del self._futures[tno]
