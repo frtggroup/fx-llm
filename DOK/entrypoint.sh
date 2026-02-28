@@ -141,6 +141,16 @@ case "$DEVICE_TYPE" in
         ;;
 esac
 
+# ── XLA コンパイルキャッシュ (TPU 専用) ──────────────────────────────────────
+# XLA は初回コンパイル結果をファイルにキャッシュし、2回目以降は再利用する。
+# S3 に永続化することでコンテナ/VM 再作成後もキャッシュが復元される。
+if [ "$DEVICE_TYPE" = "TPU" ]; then
+    export XLA_CACHE_DIR=/workspace/xla_cache
+    mkdir -p "${XLA_CACHE_DIR}"
+    export XLA_FLAGS="${XLA_FLAGS:+${XLA_FLAGS} }--xla_persistent_cache_dir=${XLA_CACHE_DIR}"
+    echo "[*] XLA キャッシュ設定: ${XLA_CACHE_DIR}"
+fi
+
 # Python に デバイス名を渡す
 export GPU_NAME
 export DEVICE_TYPE
@@ -252,6 +262,18 @@ fi
 
 # ── 8. 学習ループ起動 ─────────────────────────────────────────────────────────
 rm -f /workspace/stop.flag
+
+# XLA キャッシュを S3 から復元 (TPU のみ / 失敗しても続行)
+_xla_cache_download || true
+
+# XLA キャッシュ定期アップロード (10分ごと、バックグラウンド)
+XLA_SYNC_PID=""
+if [ "$DEVICE_TYPE" = "TPU" ] && [ -n "$S3_ENDPOINT" ]; then
+    (while true; do sleep 600; _xla_cache_upload; done) &
+    XLA_SYNC_PID=$!
+    echo "[*] XLA キャッシュ自動同期 開始 (10分ごと, PID: ${XLA_SYNC_PID})"
+fi
+
 echo ""
 echo "[*] 並列ランダムサーチ開始"
 echo "    ダッシュボード: http://0.0.0.0:${DASHBOARD_PORT}"
@@ -259,12 +281,88 @@ echo ""
 
 _STOP_REQUESTED=0
 
+# ─── XLA キャッシュ S3 アップロード ─────────────────────────────────────────
+_xla_cache_upload() {
+    [ "$DEVICE_TYPE" != "TPU" ] && return 0
+    [ -z "$S3_ENDPOINT" ] && return 0
+    echo "[*] XLA キャッシュを S3 へ保存中..."
+    python3 - <<'PYEOF'
+import os, sys, pathlib
+try:
+    import boto3, urllib3
+    urllib3.disable_warnings()
+    cache_dir = pathlib.Path(os.environ.get('XLA_CACHE_DIR', '/workspace/xla_cache'))
+    files = [f for f in cache_dir.rglob('*') if f.is_file()]
+    if not files:
+        print('[INFO] XLA キャッシュ: ファイルなし (スキップ)')
+        sys.exit(0)
+    s3 = boto3.client('s3',
+        endpoint_url=os.environ.get('S3_ENDPOINT', ''),
+        aws_access_key_id=os.environ.get('S3_ACCESS_KEY', ''),
+        aws_secret_access_key=os.environ.get('S3_SECRET_KEY', ''),
+        verify=False)
+    bucket    = os.environ.get('S3_BUCKET',  'fxea')
+    s3_prefix = os.environ.get('S3_PREFIX',  'mix') + '/xla_cache'
+    count = 0
+    for f in files:
+        rel = f.relative_to(cache_dir)
+        s3.upload_file(str(f), bucket, f'{s3_prefix}/{rel}')
+        count += 1
+    print(f'[OK] XLA キャッシュ S3 保存: {count}件 → s3://{bucket}/{s3_prefix}/')
+except Exception as e:
+    print(f'[WARN] XLA キャッシュ S3 保存失敗: {e}')
+PYEOF
+}
+
+# ─── XLA キャッシュ S3 ダウンロード ─────────────────────────────────────────
+_xla_cache_download() {
+    [ "$DEVICE_TYPE" != "TPU" ] && return 0
+    [ -z "$S3_ENDPOINT" ] && return 0
+    echo "[*] XLA キャッシュを S3 から復元中..."
+    python3 - <<'PYEOF'
+import os, sys, pathlib
+try:
+    import boto3, urllib3
+    urllib3.disable_warnings()
+    cache_dir = pathlib.Path(os.environ.get('XLA_CACHE_DIR', '/workspace/xla_cache'))
+    cache_dir.mkdir(parents=True, exist_ok=True)
+    s3 = boto3.client('s3',
+        endpoint_url=os.environ.get('S3_ENDPOINT', ''),
+        aws_access_key_id=os.environ.get('S3_ACCESS_KEY', ''),
+        aws_secret_access_key=os.environ.get('S3_SECRET_KEY', ''),
+        verify=False)
+    bucket    = os.environ.get('S3_BUCKET',  'fxea')
+    s3_prefix = os.environ.get('S3_PREFIX',  'mix') + '/xla_cache/'
+    paginator = s3.get_paginator('list_objects_v2')
+    count = 0
+    for page in paginator.paginate(Bucket=bucket, Prefix=s3_prefix):
+        for obj in page.get('Contents', []):
+            key = obj['Key']
+            rel = key[len(s3_prefix):]
+            if not rel:
+                continue
+            dst = cache_dir / rel
+            dst.parent.mkdir(parents=True, exist_ok=True)
+            s3.download_file(bucket, key, str(dst))
+            count += 1
+    if count:
+        print(f'[OK] XLA キャッシュ復元: {count}件')
+    else:
+        print('[INFO] XLA キャッシュ: S3 にまだ存在しません (初回)')
+except Exception as e:
+    print(f'[INFO] XLA キャッシュ復元スキップ: {e}')
+PYEOF
+}
+
 _graceful_stop() {
     echo "[*] 停止シグナル受信..."
     _STOP_REQUESTED=1
     [ -n "$TRAIN_PID" ] && kill -0 "$TRAIN_PID" 2>/dev/null && kill -TERM "$TRAIN_PID"
     sleep 5
     [ -n "$TRAIN_PID" ] && kill -0 "$TRAIN_PID" 2>/dev/null && kill -KILL "$TRAIN_PID" || true
+    # XLA キャッシュを最終アップロード
+    _xla_cache_upload
+    [ -n "$XLA_SYNC_PID" ] && kill "$XLA_SYNC_PID" 2>/dev/null || true
     echo "[OK] 停止完了"
 }
 trap '_graceful_stop' SIGTERM SIGINT
