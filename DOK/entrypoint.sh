@@ -371,23 +371,8 @@ fi
 
 # ── XLA 全パターン事前コンパイル (TPU のみ / キャッシュ未完了時のみ) ───────────
 if [ "$DEVICE_TYPE" = "TPU" ]; then
-    N_CHIPS="${TPU_NUM_DEVICES:-1}"
-    if [ "$N_CHIPS" -gt 1 ]; then
-        echo "[*] XLA warmup: ${N_CHIPS}チップ並列コンパイル (各チップが担当パターンを分担)"
-        WARMUP_PIDS=""
-        for RANK in $(seq 0 $((N_CHIPS - 1))); do
-            PJRT_LOCAL_RANK=$RANK TPU_NUM_DEVICES=1 \
-            python3 /workspace/ai_ea/warmup_xla.py \
-                --rank "$RANK" --world-size "$N_CHIPS" \
-            2>&1 | tee -a /workspace/train_run.log &
-            WARMUP_PIDS="$WARMUP_PIDS $!"
-        done
-        echo "[*] 全${N_CHIPS}プロセス待機中... (PIDs:${WARMUP_PIDS})"
-        wait $WARMUP_PIDS
-        echo "[*] XLA warmup 全プロセス完了"
-    else
-        python3 /workspace/ai_ea/warmup_xla.py 2>&1 | tee -a /workspace/train_run.log
-    fi
+    # PJRT (tpu-runtime) は1プロセスのみ接続可能 → シングルプロセスで全パターンをコンパイル
+    python3 /workspace/ai_ea/warmup_xla.py 2>&1 | tee -a /workspace/train_run.log
     # warmup 後にキャッシュを S3 へ保存
     _xla_cache_upload || true
 fi

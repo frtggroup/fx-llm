@@ -202,8 +202,7 @@ sudo docker run -d \\
   --net=host \\
   --restart=unless-stopped \\
   -e PJRT_DEVICE=TPU \\
-  -e TPU_NUM_DEVICES=4 \\
-  -e PJRT_WORLD_SIZE=4 \\
+  -e TPU_NUM_DEVICES=1 \\
   -e TPU_ACCELERATOR_TYPE=v6e-4 \\
   {image}
 

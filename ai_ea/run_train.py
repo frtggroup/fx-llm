@@ -1280,10 +1280,6 @@ class ParallelTrainer:
     def __init__(self):
         self.running: dict = {}   # trial_no -> {proc, params, start_time, trial_dir, log_fh}
         self.lock = threading.Lock()
-        # TPU マルチチップ対応: 利用可能な PJRT ランクプール
-        # v6e-4 なら [0,1,2,3]、v6e-1 なら [0]
-        _n = int(os.environ.get('TPU_NUM_DEVICES', '1')) if _is_tpu_env else 0
-        self._tpu_rank_pool: list[int] = list(range(_n))
 
     def launch(self, trial_no: int, params: dict, best_pf: float, start_time: float,
                strategy: str = 'random'):
@@ -1304,21 +1300,8 @@ class ParallelTrainer:
         # start_new_session=True でプロセスグループを分離し、kill 時に子孫まで全終了できるようにする
         _popen_extra = {'start_new_session': True} if platform.system() != 'Windows' else {}
 
-        # TPU マルチチップ: 各サブプロセスに専用チップを割り当てる
-        # v6e-4 では PJRT_LOCAL_RANK=N で N番チップを専有、TPU_NUM_DEVICES=1 で他チップを見えなくする
-        _sub_env = None
-        _tpu_rank = None
-        if _is_tpu_env and self._tpu_rank_pool:
-            with self.lock:
-                _tpu_rank = self._tpu_rank_pool.pop(0) if self._tpu_rank_pool else None
-            if _tpu_rank is not None:
-                _sub_env = os.environ.copy()
-                _sub_env['PJRT_LOCAL_RANK'] = str(_tpu_rank)
-                _sub_env['TPU_NUM_DEVICES'] = '1'
-                _sub_env.pop('PJRT_WORLD_SIZE', None)  # 独立試行なのでworld sync不要
-
         proc = subprocess.Popen(cmd, stdout=log_fh, stderr=subprocess.STDOUT,
-                                env=_sub_env, **_popen_extra)
+                                **_popen_extra)
 
         with self.lock:
             self.running[trial_no] = {
@@ -1328,7 +1311,6 @@ class ParallelTrainer:
                 'trial_dir':  trial_dir,
                 'log_fh':     log_fh,
                 'strategy':   strategy,
-                'tpu_rank':   _tpu_rank,
             }
         if params.get('feat_set', -1) >= 0:
             feat_info = f"set#{params['feat_set']}"
@@ -1344,9 +1326,8 @@ class ParallelTrainer:
         }
         tag = _TAG_MAP.get(strategy.split('_imp')[0] if '_imp' in strategy else strategy,
                            f'?{strategy[:8]}')
-        _rank_tag = f"  chip={_tpu_rank}" if _tpu_rank is not None else ""
         print(f"  [LAUNCH] 試行#{trial_no:4d} {tag}  {params['arch']:12s}  "
-              f"h={params['hidden']:4d}  feat={feat_info}  PID={proc.pid}{_rank_tag}")
+              f"h={params['hidden']:4d}  feat={feat_info}  PID={proc.pid}")
 
     def poll_completed(self) -> list:
         """完了/タイムアウトした試行のリストを返し running から削除"""
@@ -1390,11 +1371,6 @@ class ParallelTrainer:
 
                 if proc.poll() is not None:
                     info['log_fh'].close()
-                    # TPU ランクを返却 (次の試行が同チップを使えるように)
-                    _rank = info.get('tpu_rank')
-                    if _rank is not None and _rank not in self._tpu_rank_pool:
-                        self._tpu_rank_pool.append(_rank)
-                        self._tpu_rank_pool.sort()
                     done.append((tno, info))
                     del self.running[tno]
         return done
