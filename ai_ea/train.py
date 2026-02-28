@@ -1183,7 +1183,7 @@ def main():
 
     if r['trades'] >= 200:
         print(f"\n=== ONNX エクスポート (取引{r['trades']}件) ===")
-        export_onnx(wrapped, seq_len, n_feat, str(ONNX_PATH), opset=12)
+        export_onnx(wrapped, seq_len, n_feat, str(ONNX_PATH), opset=14)
     print(f"  PF={r['pf']}  取引={r['trades']}  勝率={r['win_rate']:.1%}  "
           f"SR={r.get('sr',0):.3f}  MaxDD={r.get('max_dd',0):.4f}")
 
@@ -1320,7 +1320,7 @@ def run_trial_worker(trial_no: int, params: dict, trial_dir_str: str,
         # ── ONNX エクスポート (採用基準 trades >= 200 のモデルのみ) ─────────────
         if r['trades'] >= 200:
             try:
-                export_onnx(wrapped, seq_len, n_feat, str(ONNX_PATH), opset=12)
+                export_onnx(wrapped, seq_len, n_feat, str(ONNX_PATH), opset=14)
             except Exception as _e:
                 print(f"  [WARN] ONNX エクスポート失敗: {_e}")
 

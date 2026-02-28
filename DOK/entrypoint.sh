@@ -10,7 +10,15 @@ echo "======================================================"
 echo "  FX AI EA 並列ランダムサーチ (統合イメージ)"
 echo "======================================================"
 
-# ── 0. torch_xla が CUDA_VISIBLE_DEVICES を空にするのを防ぐ ──────────────────
+# ── 0a. NTP 時刻同期 (S3 RequestTimeTooSkewed 防止) ──────────────────────────
+# S3 署名検証は±15分以内の時刻一致が必要。コンテナ起動時にクロックを同期する。
+if command -v ntpdate &>/dev/null; then
+    ntpdate -u pool.ntp.org &>/dev/null && echo "[*] NTP 同期完了 (ntpdate)" || true
+elif command -v chronyc &>/dev/null; then
+    chronyc makestep &>/dev/null && echo "[*] NTP 同期完了 (chronyc)" || true
+fi
+
+# ── 0b. torch_xla が CUDA_VISIBLE_DEVICES を空にするのを防ぐ ──────────────────
 # torch_xla はインポート時に CUDA_VISIBLE_DEVICES="" を設定する場合がある。
 # デバイス検出前にリセットして GPU が見えるようにする。
 if [ -z "${CUDA_VISIBLE_DEVICES+x}" ] || [ "${CUDA_VISIBLE_DEVICES}" = "" ]; then

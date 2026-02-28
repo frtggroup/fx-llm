@@ -307,36 +307,56 @@ def _s3_client():
     )
 
 
+_s3_time_skewed = False   # True = RequestTimeTooSkewed が発生 → S3 を一時無効化
+
+def _s3_check_time_skew(e: Exception) -> None:
+    """RequestTimeTooSkewed を検出したら S3 を無効化して警告を一度だけ出す。"""
+    global _s3_time_skewed
+    if not _s3_time_skewed and 'RequestTimeTooSkewed' in str(e):
+        _s3_time_skewed = True
+        print(f'  [S3] ⚠ 時刻スキュー検出 → S3 を無効化します (NTPを同期してください)')
+
+
 def s3_upload(local_path: Path, s3_key: str) -> bool:
     """ファイルを S3 にアップロード。失敗しても例外を投げず False を返す"""
+    if _s3_time_skewed:
+        return False
     try:
         _s3_client().upload_file(str(local_path), S3_BUCKET,
                                  f'{S3_PREFIX}/{s3_key}')
         return True
     except Exception as e:
-        print(f'  [S3] upload失敗 {s3_key}: {e}')
+        _s3_check_time_skew(e)
+        if not _s3_time_skewed:
+            print(f'  [S3] upload失敗 {s3_key}: {e}')
         return False
 
 
 def s3_download(s3_key: str, local_path: Path) -> bool:
     """S3 からファイルをダウンロード。失敗したら False を返す"""
+    if _s3_time_skewed:
+        return False
     try:
         local_path.parent.mkdir(parents=True, exist_ok=True)
         _s3_client().download_file(S3_BUCKET, f'{S3_PREFIX}/{s3_key}',
                                    str(local_path))
         return True
     except Exception as e:
-        print(f'  [S3] download失敗 {s3_key}: {e}')
+        _s3_check_time_skew(e)
+        if not _s3_time_skewed:
+            print(f'  [S3] download失敗 {s3_key}: {e}')
         return False
 
 
-_s3_public_policy_set = False
+_s3_public_policy_set = False   # True=成功済み / None=失敗・スキップ
 
 def s3_ensure_public_policy() -> bool:
-    """バケットに public-read ポリシーを設定 (一度だけ実行)。"""
+    """バケットに public-read ポリシーを設定 (一度だけ実行)。失敗後はリトライしない。"""
     global _s3_public_policy_set
-    if _s3_public_policy_set:
+    if _s3_public_policy_set is True:
         return True
+    if _s3_public_policy_set is None:
+        return False   # 前回失敗 → 再試行しない
     try:
         import json as _json
         policy = _json.dumps({
@@ -354,7 +374,10 @@ def s3_ensure_public_policy() -> bool:
         print(f'  [S3] バケットポリシー設定完了 (public-read)')
         return True
     except Exception as e:
-        print(f'  [S3] バケットポリシー設定失敗: {e}')
+        _s3_public_policy_set = None   # 失敗確定 → 以降スキップ
+        _s3_check_time_skew(e)
+        if not _s3_time_skewed:
+            print(f'  [S3] バケットポリシー設定失敗 (以後スキップ): {e}')
         return False
 
 
@@ -365,6 +388,8 @@ def s3_public_url(s3_key: str) -> str:
 
 def s3_list_keys(prefix: str = '') -> list:
     """S3_PREFIX/prefix 以下のキー一覧を返す"""
+    if _s3_time_skewed:
+        return []
     try:
         full_prefix = f'{S3_PREFIX}/{prefix}' if prefix else S3_PREFIX + '/'
         paginator = _s3_client().get_paginator('list_objects_v2')
@@ -374,7 +399,9 @@ def s3_list_keys(prefix: str = '') -> list:
                 keys.append(obj['Key'])
         return keys
     except Exception as e:
-        print(f'  [S3] list失敗: {e}')
+        _s3_check_time_skew(e)
+        if not _s3_time_skewed:
+            print(f'  [S3] list失敗: {e}')
         return []
 
 
