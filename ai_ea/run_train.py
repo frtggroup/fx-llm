@@ -194,8 +194,33 @@ def _auto_gpu_config(node_id: str) -> tuple[str, float, float, int]:
 
 
 NODE_ID = _detect_node_id()   # このノードの識別子 (例: 'h100', 'gtx1080ti')
-GPU_NAME = os.environ.get("GPU_NAME", NODE_ID.upper())  # GPU display name for dashboard
+
+# GPU_NAME: entrypoint.sh から export された実際のGPU名を優先使用
+# entrypoint.sh が export していない場合 (直接 python 起動など) は torch から取得
+def _get_gpu_display_name() -> str:
+    env = os.environ.get("GPU_NAME", "").strip()
+    if env and env != "CPU":
+        return env
+    try:
+        import torch
+        if torch.cuda.is_available():
+            return torch.cuda.get_device_name(0)
+    except Exception:
+        pass
+    return env if env else "CPU (no GPU)"
+
+GPU_NAME = _get_gpu_display_name()
 _GPU_TIER, _GPU_VRAM_GB, _VPT_DEFAULT, _PAR_DEFAULT = _auto_gpu_config(NODE_ID)
+
+# CUDA が実際に使えない場合の警告
+try:
+    import torch as _torch_check
+    _CUDA_AVAILABLE = _torch_check.cuda.is_available()
+except Exception:
+    _CUDA_AVAILABLE = False
+if not _CUDA_AVAILABLE:
+    print("[WARN] ⚠ CUDA が利用できません。CPU モードで実行します。")
+    print("[WARN]   --gpus all オプションを付けて docker run しているか確認してください。")
 
 
 def _s3_client():
@@ -1677,11 +1702,11 @@ def main():
     TOP_CACHE_DIR.mkdir(parents=True, exist_ok=True)
     TOP_DIR.mkdir(parents=True, exist_ok=True)
 
-    gpu_name = NODE_ID.upper()
     print('=' * 60)
     storage_tag = 'GDrive' if GDRIVE_ENABLED else ('S3' if S3_ENABLED else 'ローカルのみ')
     print(f'FX AI EA v8 - 並列ランダムサーチ  ストレージ: {storage_tag}/{NODE_ID}')
-    print(f'  GPU     : {gpu_name}  ({_GPU_VRAM_GB:.0f} GB)  tier={_GPU_TIER}')
+    cuda_str = f'CUDA={_CUDA_AVAILABLE}'
+    print(f'  GPU     : {GPU_NAME}  ({_GPU_VRAM_GB:.0f} GB)  tier={_GPU_TIER}  {cuda_str}')
     print(f'  並列数  : {MAX_PARALLEL}  VRAM/試行={VRAM_PER_TRIAL} GB  H100_MODE={H100_MODE}')
     print(f'  モデル  : hidden={[v for v in HIDDEN_MAP.get("mlp",[])]}  batch={BATCH_CHOICES}')
     print(f'  TOP {TOP_N} 保存  タイムアウト {TRIAL_TIMEOUT//60}分  stop.flag: {STOP_FLAG}')

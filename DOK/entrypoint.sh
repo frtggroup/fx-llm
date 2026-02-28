@@ -15,7 +15,9 @@ GPU_NAME=$(nvidia-smi --query-gpu=name --format=csv,noheader 2>/dev/null | head 
 nvidia-smi --query-gpu=name,memory.total,driver_version \
            --format=csv,noheader 2>/dev/null \
   && echo "[OK] GPU 検出: ${GPU_NAME}" \
-  || echo "[WARN] nvidia-smi 使用不可 (CPU モードで続行)"
+  || { GPU_NAME="CPU"; echo "[WARN] nvidia-smi 使用不可 (CPU モードで続行)"; }
+# Python に GPU 名を渡す (run_train.py の GPU_NAME 変数で使用)
+export GPU_NAME
 
 # ── 2. CUDA MPS デーモン起動 (GPU並列スループット向上) ─────────────────────
 echo "[*] CUDA MPS デーモン起動..."
