@@ -17,14 +17,14 @@ from pathlib import Path
 # ── 設定 ──────────────────────────────────────────────────────────────────────
 DOCKER_IMAGE  = "frtgroup/fx-ea:latest"
 VM_NAME       = "fx-ea-tpu-v6e"
-ACCEL_TYPE    = "v6e-1"
+ACCEL_TYPE    = "v6e-4"
 TPU_VERSION   = "v2-alpha-tpuv6e"
 PROJECT       = "project-c7a2ed3f-0395-4b76-967"
 SSH_KEY       = str(Path.home() / ".ssh" / "google_compute_engine")
 SSH_USER      = "yu"
 AUTO_DELETE_H = 3   # デフォルト自動削除時間 (時間)
 
-# v6e-1 が利用可能なゾーン候補 (空き率が高い順)
+# v6e-4 が利用可能なゾーン候補 (空き率が高い順)
 ZONES = [
     "us-central1-b",
     "us-central1-a",
@@ -202,8 +202,9 @@ sudo docker run -d \\
   --net=host \\
   --restart=unless-stopped \\
   -e PJRT_DEVICE=TPU \\
-  -e TPU_NUM_DEVICES=1 \\
-  -e TPU_ACCELERATOR_TYPE=v6e-1 \\
+  -e TPU_NUM_DEVICES=4 \\
+  -e PJRT_WORLD_SIZE=4 \\
+  -e TPU_ACCELERATOR_TYPE=v6e-4 \\
   {image}
 
 sleep 8

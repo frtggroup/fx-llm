@@ -14,6 +14,11 @@ Usage:
 import argparse, json, os, sys, time
 from pathlib import Path
 
+# warmup はチップ0のみ使用 (並列学習が始まる前の単独実行)
+# PJRT_LOCAL_RANK=0 + TPU_NUM_DEVICES=1 でチップ0を専有
+os.environ.setdefault('PJRT_LOCAL_RANK', '0')
+os.environ['TPU_NUM_DEVICES'] = '1'
+
 # ── 全パターン定義 (run_train.py の TPU tier と同一) ──────────────────────────
 ARCHS = [
     'mlp', 'gru_attn', 'bigru', 'lstm_attn',
