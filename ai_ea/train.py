@@ -232,7 +232,15 @@ def prepare(args):
     feat_frac   = getattr(args, 'feat_frac', 1.0)
     feat_indices_direct = getattr(args, 'feat_indices', None)
 
-    if feat_indices_direct and isinstance(feat_indices_direct, list):
+    # TPU (XLA) モードでは全特徴量を使用してグラフ形状を固定化
+    # → 同じアーキテクチャ・hiddenサイズなら2回目以降はコンパイル不要になる
+    _tpu_mode = (os.environ.get('PJRT_DEVICE', '').upper() == 'TPU'
+                 or os.environ.get('DEVICE_TYPE', '').upper() == 'TPU')
+    if _tpu_mode:
+        feat_indices = None
+        print(f"  [TPU] 全{N_FEATURES}特徴量使用 (XLAグラフ形状固定化)")
+
+    elif feat_indices_direct and isinstance(feat_indices_direct, list):
         # GAが重要特徴量から直接指定したインデックスリスト
         feat_indices = sorted(int(i) for i in feat_indices_direct if 0 <= int(i) < N_FEATURES)
         print(f"  特徴量直指定: {len(feat_indices)}個 (重要特徴量GAモード)")
@@ -284,16 +292,20 @@ class GPULoader:
     """
     全データを GPU に常駐させてバッチを GPU 上で切り出す。
     CPU↔GPU 転送オーバーヘッドをゼロにして GPU 使用率を最大化。
+    drop_last=True (TPU用): XLA は全バッチが同じサイズでないと再コンパイルが走るため
+    最終の端数バッチを捨てることでグラフ形状を完全固定化する。
     """
     def __init__(self, X: np.ndarray, y: np.ndarray,
                  device: torch.device, batch_size: int,
-                 weights: np.ndarray = None, shuffle: bool = False):
+                 weights: np.ndarray = None, shuffle: bool = False,
+                 drop_last: bool = False):
         self.X   = torch.tensor(X, dtype=torch.float32, device=device)
         self.y   = torch.tensor(y, dtype=torch.long,    device=device)
         self.n   = len(y)
         self.bs  = batch_size
         self.dev = device
         self.shuf = shuffle
+        self.drop_last = drop_last
         # 重み付きサンプリング用 (GPU上で multinomial)
         if weights is not None:
             self.w = torch.tensor(weights, dtype=torch.float32, device=device)
@@ -301,31 +313,40 @@ class GPULoader:
             self.w = None
 
     def __len__(self):
+        if self.drop_last:
+            return max(1, self.n // self.bs)
         return max(1, (self.n + self.bs - 1) // self.bs)
 
     def __iter__(self):
+        # drop_last 時は端数が出ないよう (n//bs)*bs 件だけサンプリング
+        n_use = (self.n // self.bs) * self.bs if self.drop_last else self.n
+        n_use = max(n_use, self.bs)  # 最低1バッチは確保
+
         if self.w is not None:
-            idx = torch.multinomial(self.w, self.n, replacement=True)
+            idx = torch.multinomial(self.w, n_use, replacement=True)
         elif self.shuf:
-            idx = torch.randperm(self.n, device=self.dev)
+            idx = torch.randperm(self.n, device=self.dev)[:n_use]
         else:
-            idx = torch.arange(self.n, device=self.dev)
-        for start in range(0, self.n, self.bs):
+            idx = torch.arange(self.n, device=self.dev)[:n_use]
+        for start in range(0, n_use, self.bs):
             sl = idx[start:start + self.bs]
             yield self.X[sl], self.y[sl]
 
 
-def make_loaders(X_tr, y_tr, X_te, y_te, args, device):
+def make_loaders(X_tr, y_tr, X_te, y_te, args, device, drop_last: bool = False):
     counts = np.bincount(y_tr, minlength=3).astype(float)
     counts = np.where(counts == 0, 1.0, counts)
     n      = len(y_tr)
     tw     = 1.0 + np.linspace(0, 1, n)          # 新データ重視
     weights = (1.0 / counts)[y_tr] * tw
 
-    tr_dl = GPULoader(X_tr, y_tr, device, args.batch, weights=weights)
-    va_dl = GPULoader(X_te, y_te, device, args.batch, shuffle=False)
+    tr_dl = GPULoader(X_tr, y_tr, device, args.batch, weights=weights,
+                      drop_last=drop_last)
+    va_dl = GPULoader(X_te, y_te, device, args.batch, shuffle=False,
+                      drop_last=drop_last)
     print(f"  GPU常駐データ: 訓練{len(X_tr):,} テスト{len(X_te):,} "
-          f"batch={args.batch} batches/ep={len(tr_dl)}")
+          f"batch={args.batch} batches/ep={len(tr_dl)}"
+          + (" [drop_last=ON]" if drop_last else ""))
     return tr_dl, va_dl
 
 
@@ -397,7 +418,19 @@ def train(args, X_tr, y_tr, X_te, y_te, mean, std, n_feat=None):
         except Exception:
             print(f"  TPU モード: BF16 AMP 有効")
 
-    tr_dl, va_dl = make_loaders(X_tr, y_tr, X_te, y_te, args, device)
+    # TPU XLA: バッチサイズを1024に固定 + drop_last でグラフ形状を完全統一
+    # → 同じ arch/hidden の2回目以降はXLAコンパイルキャッシュが効き高速化
+    if is_tpu:
+        tpu_batch = 1024
+        if args.batch != tpu_batch:
+            print(f"  [TPU] batch {args.batch} → {tpu_batch} に固定 (XLAグラフ固定化)")
+            args.batch = tpu_batch
+        tpu_drop_last = True
+    else:
+        tpu_drop_last = False
+
+    tr_dl, va_dl = make_loaders(X_tr, y_tr, X_te, y_te, args, device,
+                                drop_last=tpu_drop_last)
 
     # AMP 設定: TPU は BF16 (GradScaler 不要), CUDA FP16 は Scaler 使用
     use_amp    = True  # GPU/TPU ともに混合精度を使用
@@ -421,8 +454,10 @@ def train(args, X_tr, y_tr, X_te, y_te, mean, std, n_feat=None):
         if dev_type == 'cuda':
             torch.cuda.empty_cache()
         args.hidden = max(64, args.hidden // 2)
-        args.batch  = max(256, args.batch  // 2)
-        tr_dl, va_dl = make_loaders(X_tr, y_tr, X_te, y_te, args, device)
+        if not is_tpu:  # TPUはbatch固定のため変更しない
+            args.batch = max(256, args.batch // 2)
+        tr_dl, va_dl = make_loaders(X_tr, y_tr, X_te, y_te, args, device,
+                                    drop_last=tpu_drop_last)
         model = _build_and_place()
 
     # H100: torch.compile で GPU カーネル効率を向上 (TPU は XLA が自動最適化するためスキップ)
