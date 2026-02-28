@@ -373,6 +373,12 @@ def _detect_device():
     # entrypoint.sh が TPU と判定済み → XLA を使用
     if _dt == "TPU":
         try:
+            # torch_xla が dynamo/Inductor を自動起動してデッドロックするのを防ぐ
+            import torch._dynamo as _dynamo  # type: ignore
+            _dynamo.config.disable = True
+        except Exception:
+            pass
+        try:
             import torch_xla.core.xla_model as xm  # type: ignore
             dev = xm.xla_device()
             return dev, 'xla'
@@ -692,10 +698,12 @@ def _train_step(model, xb, yb, opt, crit, sched,
         loss.backward()
         nn.utils.clip_grad_norm_(model.parameters(), 1.0)
         if is_tpu:
-            # TPU: XLA グラフをコンパイル・実行して同期
+            # TPU: optimizer.step() 後に mark_step() で XLA グラフを実行
+            # xm.optimizer_step() は dynamo 経由で Inductor を起動しデッドロックするため使わない
             try:
                 import torch_xla.core.xla_model as xm  # type: ignore
-                xm.optimizer_step(opt)
+                opt.step()
+                xm.mark_step()
             except Exception:
                 opt.step()
         else:
