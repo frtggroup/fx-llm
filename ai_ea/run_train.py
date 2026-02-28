@@ -1444,23 +1444,24 @@ def restore_checkpoint() -> bool:
     if REMOTE_ENABLED():
         tag = 'GDrive' if GDRIVE_ENABLED else 'S3'
         print(f'  [{tag}]  チェックポイント確認中 ...')
-        # 全ノードの results_*.json をダウンロード
+        # 全ノードの results_*.json をダウンロード (ファイル毎 60秒 タイムアウト)
         result_keys = remote_list_node_keys('results_')
         if not result_keys:
             print(f'  [{tag}]  チェックポイントなし (全ノード)')
         else:
             for rk in result_keys:
-                remote_download(rk, CHECKPOINT_DIR / rk)
-                print(f'  [{tag}]  取得: {rk}')
+                print(f'  [{tag}]  取得中: {rk} ...', end='', flush=True)
+                ok = remote_download(rk, CHECKPOINT_DIR / rk)
+                print(f' {"OK" if ok else "SKIP"}')
         # 全ノードの meta_*.json をダウンロード
         for mk in remote_list_node_keys('meta_'):
             remote_download(mk, CHECKPOINT_DIR / mk)
         # このノード + 他ノードの best モデルをダウンロード (サブフォルダ内ファイル)
         for bk in remote_list_best_keys():   # 例: best_h100/fx_model_best.onnx
             remote_download(bk, CHECKPOINT_DIR / bk)
-        # 全ノードの top100 をダウンロード (ONNX含む全ファイル)
+        # 全ノードの top100 をダウンロード (ONNX含む全ファイル) ─ 最大 300 ファイル
         top100_count = 0
-        for rel in remote_list_top100_keys():   # 例: top100_h100/rank_001/fx_model.onnx
+        for rel in list(remote_list_top100_keys())[:300]:
             dest = CHECKPOINT_DIR / rel
             dest.parent.mkdir(parents=True, exist_ok=True)
             if remote_download(rel, dest):

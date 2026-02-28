@@ -157,32 +157,50 @@ def upload(local_path: Path, rel_key: str) -> bool:
         return False
 
 
-def download(rel_key: str, local_path: Path) -> bool:
+def download(rel_key: str, local_path: Path, timeout: float = 60.0) -> bool:
     """
     GDrive の rel_key を local_path にダウンロード。
+    timeout 秒でハングした場合は諦めて False を返す。
     Returns True on success.
     """
     if not GDRIVE_ENABLED:
         return False
-    try:
-        from googleapiclient.http import MediaIoBaseDownload
-        svc = _svc()
-        folder_id, fname = _resolve_folder(rel_key)
-        fid = _find_file(folder_id, fname)
-        if not fid:
-            return False
-        local_path.parent.mkdir(parents=True, exist_ok=True)
-        request = svc.files().get_media(fileId=fid)
-        buf = io.BytesIO()
-        dl = MediaIoBaseDownload(buf, request)
-        done = False
-        while not done:
-            _, done = dl.next_chunk()
-        local_path.write_bytes(buf.getvalue())
-        return True
-    except Exception as e:
-        print(f'  [GDrive] download失敗 {rel_key}: {e}')
+
+    import threading as _threading
+
+    result = [False]
+    error  = [None]
+
+    def _do_download():
+        try:
+            from googleapiclient.http import MediaIoBaseDownload
+            svc = _svc()
+            folder_id, fname = _resolve_folder(rel_key)
+            fid = _find_file(folder_id, fname)
+            if not fid:
+                return
+            local_path.parent.mkdir(parents=True, exist_ok=True)
+            request = svc.files().get_media(fileId=fid)
+            buf = io.BytesIO()
+            dl = MediaIoBaseDownload(buf, request, chunksize=4 * 1024 * 1024)
+            done = False
+            while not done:
+                _, done = dl.next_chunk()
+            local_path.write_bytes(buf.getvalue())
+            result[0] = True
+        except Exception as e:
+            error[0] = e
+
+    t = _threading.Thread(target=_do_download, daemon=True)
+    t.start()
+    t.join(timeout=timeout)
+    if t.is_alive():
+        print(f'  [GDrive] download タイムアウト ({timeout:.0f}s): {rel_key} → スキップ')
         return False
+    if error[0]:
+        print(f'  [GDrive] download失敗 {rel_key}: {error[0]}')
+        return False
+    return result[0]
 
 
 def list_keys(prefix: str = '') -> list[str]:
@@ -278,27 +296,40 @@ def upload_bytes(data: bytes, rel_key: str) -> bool:
         return False
 
 
-def download_bytes(rel_key: str) -> Optional[bytes]:
+def download_bytes(rel_key: str, timeout: float = 60.0) -> Optional[bytes]:
     """GDrive から bytes としてダウンロード。失敗時 None"""
     if not GDRIVE_ENABLED:
         return None
-    try:
-        from googleapiclient.http import MediaIoBaseDownload
-        svc = _svc()
-        folder_id, fname = _resolve_folder(rel_key)
-        fid = _find_file(folder_id, fname)
-        if not fid:
-            return None
-        request = svc.files().get_media(fileId=fid)
-        buf = io.BytesIO()
-        dl = MediaIoBaseDownload(buf, request)
-        done = False
-        while not done:
-            _, done = dl.next_chunk()
-        return buf.getvalue()
-    except Exception as e:
-        print(f'  [GDrive] download_bytes失敗 {rel_key}: {e}')
+
+    import threading as _threading
+
+    result = [None]
+
+    def _do():
+        try:
+            from googleapiclient.http import MediaIoBaseDownload
+            svc = _svc()
+            folder_id, fname = _resolve_folder(rel_key)
+            fid = _find_file(folder_id, fname)
+            if not fid:
+                return
+            request = svc.files().get_media(fileId=fid)
+            buf = io.BytesIO()
+            dl = MediaIoBaseDownload(buf, request, chunksize=4 * 1024 * 1024)
+            done = False
+            while not done:
+                _, done = dl.next_chunk()
+            result[0] = buf.getvalue()
+        except Exception as e:
+            print(f'  [GDrive] download_bytes失敗 {rel_key}: {e}')
+
+    t = _threading.Thread(target=_do, daemon=True)
+    t.start()
+    t.join(timeout=timeout)
+    if t.is_alive():
+        print(f'  [GDrive] download_bytes タイムアウト ({timeout:.0f}s): {rel_key}')
         return None
+    return result[0]
 
 
 def test_connection() -> bool:
