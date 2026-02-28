@@ -6,11 +6,29 @@ FX AI EA 自動トレーニング v8 - ハイブリッド遺伝的アルゴリ�
   ・停止条件なし (stop.flag が置かれるまで無限継続)
   ・TOP100 モデル保存 + SR / DD / 資産曲線レポート
 """
-import os, subprocess, sys, json, shutil, time, random, threading, signal, platform
+import os, subprocess, sys, json, shutil, time, random, threading, signal, platform, faulthandler
 from pathlib import Path
 
-# GDrive/S3 バックグラウンドアップロードの同時実行を1に制限
-# (並列スレッドが Google API C ライブラリを同時呼び出すとヒープ破壊が発生するため)
+# ── クラッシュログ (SIGSEGV / SIGABRT / ヒープ破壊) ─────────────────────────
+_CRASH_LOG = Path('/workspace/crash.log') if Path('/workspace').exists() \
+             else Path(__file__).parent.parent / 'crash.log'
+_crash_log_fh = open(_CRASH_LOG, 'a', buffering=1)
+faulthandler.enable(file=_crash_log_fh, all_threads=True)
+try:
+    faulthandler.register(signal.SIGABRT, file=_crash_log_fh, all_threads=True, chain=True)
+except Exception:
+    pass
+
+def _unhandled_exception(exc_type, exc_value, exc_tb):
+    import traceback
+    _crash_log_fh.write(f'\n[CRASH {time.strftime("%Y-%m-%d %H:%M:%S")}] 未捕捉例外:\n')
+    traceback.print_exception(exc_type, exc_value, exc_tb, file=_crash_log_fh)
+    _crash_log_fh.flush()
+    sys.__excepthook__(exc_type, exc_value, exc_tb)
+
+sys.excepthook = _unhandled_exception
+
+# リモートアップロードの同時実行を1に制限 (並列スレッドによるヒープ破壊防止)
 _remote_upload_sem = threading.Semaphore(1)
 
 sys.path.insert(0, str(Path(__file__).parent))
@@ -46,61 +64,49 @@ S3_BUCKET    = os.environ.get('S3_BUCKET',      'fxea')
 S3_PREFIX    = os.environ.get('S3_PREFIX',      'mix')   # 両ノード共有フォルダ
 S3_ENABLED   = bool(S3_ENDPOINT and S3_ACCESS_KEY and S3_SECRET_KEY)
 
-# ── Google Drive 共有ストレージ (S3 より優先) ─────────────────────────────────
+# ── Google Drive: 完全無効 (S3 のみ使用) ─────────────────────────────────────
 import gdrive as _gdrive
-GDRIVE_ENABLED = _gdrive.GDRIVE_ENABLED
+GDRIVE_ENABLED = False   # GDrive は無効化 — S3 のみ使用
 
 
 def remote_upload(local_path: Path, rel_key: str) -> bool:
-    """S3 > GDrive の優先順でアップロード (S3は高速なローカルサーバ)"""
-    ok = False
+    """S3 にアップロード (GDrive は無効)"""
     if S3_ENABLED:
-        ok = s3_upload(local_path, rel_key) or ok
-    if GDRIVE_ENABLED:
-        ok = _gdrive.upload(local_path, rel_key) or ok
-    return ok
+        return s3_upload(local_path, rel_key)
+    return False
 
 
 def remote_download(rel_key: str, local_path: Path) -> bool:
-    """S3 > GDrive の優先順でダウンロード"""
+    """S3 からダウンロード (GDrive は無効)"""
     if S3_ENABLED:
-        if s3_download(rel_key, local_path):
-            return True
-    if GDRIVE_ENABLED:
-        return _gdrive.download(rel_key, local_path)
+        return s3_download(rel_key, local_path)
     return False
 
 
 def remote_list_node_keys(glob_prefix: str) -> list[str]:
-    """全ノードの同種ファイル一覧 (S3 > GDrive)"""
+    """全ノードの同種ファイル一覧 (S3 のみ)"""
     if S3_ENABLED:
         return s3_list_node_keys(glob_prefix)
-    if GDRIVE_ENABLED:
-        return _gdrive.list_node_keys(glob_prefix)
     return []
 
 
 def remote_list_top100_keys() -> list[str]:
-    """top100_* 以下の全ファイル相対パス一覧 (S3 > GDrive)"""
+    """top100_* 以下の全ファイル相対パス一覧 (S3 のみ)"""
     if S3_ENABLED:
         raw = s3_list_keys('top100_')
         return [k[len(S3_PREFIX)+1:] for k in raw]
-    if GDRIVE_ENABLED:
-        return _gdrive.list_keys_recursive('top100_')
     return []
 
 
 def remote_list_best_keys() -> list[str]:
-    """best_* 以下の全ファイル相対パス一覧 (S3 > GDrive)"""
+    """best_* 以下の全ファイル相対パス一覧 (S3 のみ)"""
     if S3_ENABLED:
         return s3_list_node_keys('best_')
-    if GDRIVE_ENABLED:
-        return _gdrive.list_keys_recursive('best_')
     return []
 
 
 def REMOTE_ENABLED() -> bool:
-    return S3_ENABLED or GDRIVE_ENABLED
+    return S3_ENABLED
 
 # ── ノードID (GTX / H100 / CPU) ─────────────────────────────────────────────
 # S3 上でノードごとにファイルを分離することで競合を回避する
@@ -1622,7 +1628,7 @@ def save_checkpoint(results: list, best_pf: float) -> None:
         print(f'  [CKPT] ローカル保存完了 node={NODE_ID} ({len(own)}件 / bestPF={best_pf:.4f})')
 
         if REMOTE_ENABLED():
-            tag = 'GDrive' if GDRIVE_ENABLED else 'S3'
+            tag = 'S3'
             # 全リモートアップロードをバックグラウンドスレッドで実行
             # → メインループ (write_progress等) を一切ブロックしない
             _own_key_snap   = own_key
@@ -1703,7 +1709,7 @@ def restore_checkpoint() -> bool:
     CHECKPOINT_DIR.mkdir(parents=True, exist_ok=True)
 
     if REMOTE_ENABLED():
-        tag = 'GDrive' if GDRIVE_ENABLED else 'S3'
+        tag = 'S3'
         print(f'  [{tag}]  チェックポイント確認中 ...')
         # 全ノードの results_*.json をダウンロード (ファイル毎 60秒 タイムアウト)
         result_keys = remote_list_node_keys('results_')
@@ -1904,7 +1910,7 @@ def main():
     TOP_DIR.mkdir(parents=True, exist_ok=True)
 
     print('=' * 60)
-    storage_tag = 'GDrive' if GDRIVE_ENABLED else ('S3' if S3_ENABLED else 'ローカルのみ')
+    storage_tag = 'S3' if S3_ENABLED else 'ローカルのみ'
     print(f'FX AI EA v8 - 並列ランダムサーチ  ストレージ: {storage_tag}/{NODE_ID}')
     if _TPU_AVAILABLE:
         dev_str = 'TPU=True'
@@ -1919,11 +1925,9 @@ def main():
     print('=' * 60)
 
     # ── ストレージ接続確認 ─────────────────────────────────────────────────────
-    print(f'  GDRIVE_ENABLED: {GDRIVE_ENABLED}')
+    print(f'  GDRIVE_ENABLED: False (無効化済み)')
     print(f'  S3_ENABLED    : {S3_ENABLED}  (S3_ENDPOINT: {S3_ENDPOINT or "(未設定)"})')
-    if GDRIVE_ENABLED:
-        _gdrive.test_connection()
-    elif S3_ENABLED:
+    if S3_ENABLED:
         try:
             cl = _s3_client()
             cl.put_object(Bucket=S3_BUCKET, Key=f'{S3_PREFIX}/.ping', Body=b'ok')
@@ -2189,14 +2193,10 @@ def main():
                             for local_p, key in upload_targets:
                                 if not local_p.exists():
                                     continue
-                                if S3_ENABLED:
-                                    s3_ensure_public_policy()
-                                    if s3_upload(local_p, key):
-                                        links[local_p.name] = s3_public_url(key)
-                                elif GDRIVE_ENABLED:
-                                    url = _gdrive.upload_and_share(local_p, key)
-                                    if url:
-                                        links[local_p.name] = url
+                            if S3_ENABLED:
+                                s3_ensure_public_policy()
+                                if s3_upload(local_p, key):
+                                    links[local_p.name] = s3_public_url(key)
 
                             if links:
                                 links['pf']         = pf_snap

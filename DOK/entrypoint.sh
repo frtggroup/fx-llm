@@ -286,6 +286,12 @@ while true; do
 
     RESTART_COUNT=$((RESTART_COUNT + 1))
     echo "[RESTART #${RESTART_COUNT}] run_train.py 異常終了 (exit=${EXIT_CODE}) → 5秒後に再起動..."
+    # クラッシュログがあれば末尾を表示
+    if [ -f /workspace/crash.log ]; then
+        echo "--- crash.log (末尾20行) ---"
+        tail -20 /workspace/crash.log
+        echo "----------------------------"
+    fi
     sleep 5
 done
 
