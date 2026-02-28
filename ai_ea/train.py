@@ -547,15 +547,17 @@ def train(args, X_tr, y_tr, X_te, y_te, mean, std, n_feat=None):
     acc    = 0.0
 
     _xla_compiled = False   # 初回バッチのXLAコンパイル完了フラグ
+    import time as _time
+    _ep_start = _time.time()
 
     for epoch in range(1, args.epochs + 1):
+        _ep_t0 = _time.time()
         model.train()
         try:
             # XLA 初回コンパイル中の表示
             if is_tpu and not _xla_compiled and epoch == 1:
-                import time as _time
                 print(f"  [XLA] グラフコンパイル中... (初回のみ数分かかります)", flush=True)
-                _compile_start = _time.time()
+                _compile_start = _ep_t0
 
             step_losses = [
                 _train_step(model, xb, yb,
@@ -568,7 +570,11 @@ def train(args, X_tr, y_tr, X_te, y_te, mean, std, n_feat=None):
 
             if is_tpu and not _xla_compiled and epoch == 1:
                 _xla_compiled = True
-                print(f"  [XLA] コンパイル完了 ({_time.time()-_compile_start:.0f}秒)", flush=True)
+                _compile_sec = _time.time() - _compile_start
+                n_samples = len(tr_dl) * tr_dl.bs
+                _tput = n_samples / max(_compile_sec, 0.01)
+                print(f"  [XLA] コンパイル完了 ({_compile_sec:.0f}秒) | "
+                      f"スループット: {_tput:.0f} samples/sec", flush=True)
         except (RuntimeError, torch.cuda.OutOfMemoryError) as e:
             if dev_type == 'cuda':
                 torch.cuda.empty_cache()
@@ -596,10 +602,15 @@ def train(args, X_tr, y_tr, X_te, y_te, mean, std, n_feat=None):
         gap = v_loss - t_loss   # 過学習ギャップ
 
         if epoch % 10 == 0 or epoch <= 5:
-            lr_now = optimizer.param_groups[0]['lr']
+            lr_now  = optimizer.param_groups[0]['lr']
+            _ep_sec = _time.time() - _ep_t0
+            _n_samp = len(tr_dl) * tr_dl.bs
+            _tput   = _n_samp / max(_ep_sec, 0.001)
+            _tpu_tag = f"  {_tput:.0f}samp/s" if is_tpu else ""
             print(f"  Ep{epoch:4d}/{args.epochs}  "
                   f"tr={t_loss:.4f}  va={v_loss:.4f}  "
-                  f"gap={gap:+.4f}  acc={acc:.3f}  lr={lr_now:.2e}")
+                  f"gap={gap:+.4f}  acc={acc:.3f}  lr={lr_now:.2e}"
+                  f"  [{_ep_sec:.1f}s{_tpu_tag}]")
 
         # 進捗更新 (progress_every エポックごと / 非同期書き込み)
         if epoch % progress_every == 0 or epoch <= 5:
