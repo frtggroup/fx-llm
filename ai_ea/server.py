@@ -111,50 +111,52 @@ def _read_warmup_status() -> dict:
     return {}
 
 # ── TPU 使用率ポーリング (GCP Cloud Monitoring API / ~3分遅延) ──────────────────
-_tpu_duty_cycle: float | None = None   # 最新のTPU使用率 (%)
-_tpu_hbm_used_gb: float | None = None  # HBM使用量 GB (torch_xla から取得)
+# TPU チップ情報 (tpu-info 経由 / リアルタイム)
+_tpu_chips: list[dict] = []   # [{chip, hbm_used, hbm_total, duty_cycle}, ...]
 
-def _gcp_metadata(path: str, timeout: int = 3) -> str:
-    """GCP メタデータサーバーから値を取得"""
-    req = _ureq.Request(
-        f'http://metadata.google.internal/computeMetadata/v1/{path}',
-        headers={'Metadata-Flavor': 'Google'})
-    return _ureq.urlopen(req, timeout=timeout).read().decode()
-
-def _poll_tpu_duty_cycle():
-    global _tpu_duty_cycle
+def _poll_tpu_info():
+    """tpu-info CLI を定期実行してチップ情報を更新"""
+    global _tpu_chips
+    import subprocess, re
+    # tpu-info の候補パス
+    _TPU_INFO = None
+    for candidate in ('/home/yu/.local/bin/tpu-info', '/usr/local/bin/tpu-info',
+                      '/usr/bin/tpu-info'):
+        if Path(candidate).exists():
+            _TPU_INFO = candidate
+            break
+    if not _TPU_INFO:
+        # pip install して取得
+        try:
+            subprocess.run(['pip', 'install', '-q', 'tpu-info'],
+                           capture_output=True, timeout=60)
+            _TPU_INFO = '/usr/local/bin/tpu-info'
+        except Exception:
+            return
     while True:
         try:
-            token     = json.loads(_gcp_metadata(
-                'instance/service-accounts/default/token'))['access_token']
-            project   = _gcp_metadata('project/project-id')
-            now       = datetime.now(timezone.utc)
-            start     = (now - timedelta(minutes=6)).strftime('%Y-%m-%dT%H:%M:%SZ')
-            end       = now.strftime('%Y-%m-%dT%H:%M:%SZ')
-            # v6e は tpu.googleapis.com/node/accelerator/duty_cycle
-            for metric in ('tpu.googleapis.com/node/accelerator/duty_cycle',
-                           'tpu.googleapis.com/node/duty_cycle'):
-                url = (f'https://monitoring.googleapis.com/v3/projects/{project}'
-                       f'/timeSeries?filter=metric.type%3D%22{metric}%22'
-                       f'&interval.startTime={start}&interval.endTime={end}')
-                req = _ureq.Request(url, headers={'Authorization': f'Bearer {token}'})
-                data = json.loads(_ureq.urlopen(req, timeout=10).read())
-                series = data.get('timeSeries', [])
-                if series:
-                    pts = sorted(series[0].get('points', []),
-                                 key=lambda p: p['interval']['endTime'], reverse=True)
-                    if pts:
-                        v = pts[0]['value']
-                        _tpu_duty_cycle = float(v.get('doubleValue',
-                                                v.get('int64Value', 0)))
-                        break
+            r = subprocess.run([_TPU_INFO], capture_output=True, text=True, timeout=15)
+            out = r.stdout
+            chips = []
+            # HBM Usage 行をパース: "│ N │ X.XX GiB / Y.YY GiB │ Z.ZZ% │"
+            for m in re.finditer(
+                    r'│\s*(\d+)\s*│\s*([\d.]+)\s*GiB\s*/\s*([\d.]+)\s*GiB\s*│\s*([\d.]+)%',
+                    out):
+                chips.append({
+                    'chip':      int(m.group(1)),
+                    'hbm_used':  float(m.group(2)),
+                    'hbm_total': float(m.group(3)),
+                    'duty_cycle': float(m.group(4)),
+                })
+            if chips:
+                _tpu_chips = chips
         except Exception:
             pass
-        time.sleep(60)   # 1分ごと (メトリクスは~3分遅延)
+        time.sleep(10)   # 10秒ごと (リアルタイム)
 
 _is_tpu_server = os.environ.get('DEVICE_TYPE', '').upper() == 'TPU'
 if _is_tpu_server:
-    threading.Thread(target=_poll_tpu_duty_cycle, daemon=True, name='tpu-monitor').start()
+    threading.Thread(target=_poll_tpu_info, daemon=True, name='tpu-monitor').start()
 
 
 app = FastAPI(title="FX AI EA Dashboard v2")
@@ -296,9 +298,16 @@ def api_status():
     _ws = _read_warmup_status()
     if _ws:
         st.update(_ws)
-    # TPU 使用率 (GCP Cloud Monitoring / ~3分遅延)
-    if _tpu_duty_cycle is not None:
-        st['tpu_duty_cycle'] = round(_tpu_duty_cycle, 1)
+    # TPU チップ情報 (tpu-info / リアルタイム)
+    if _tpu_chips:
+        st['tpu_chips'] = _tpu_chips
+        # 代表値: 使用中チップの平均 duty_cycle
+        active = [c for c in _tpu_chips if c['hbm_used'] > 0.1]
+        if active:
+            st['tpu_duty_cycle'] = round(
+                sum(c['duty_cycle'] for c in active) / len(active), 1)
+        else:
+            st['tpu_duty_cycle'] = 0.0
     # best_links の S3直リンクをプロキシURLに変換 (自己署名証明書ブロック回避)
     if isinstance(st.get('best_links'), dict):
         bl = st['best_links']
@@ -679,18 +688,10 @@ tr:hover td{background:#1c2128}
   <span class="badge badge-wait" id="phase-badge">待機中</span>
 </div>
 
-<!-- TPU 使用率 (GCP Cloud Monitoring / ~3分遅延) -->
+<!-- TPU チップ使用率 (tpu-info / リアルタイム) -->
 <div class="card" id="tpu-duty-card" style="display:none;margin-bottom:12px;border-color:#3fb95044">
-  <h2 style="color:#56d364">🔥 TPU 使用率 <span style="font-size:.7em;color:#8b949e">(~3分遅延)</span></h2>
-  <div style="display:flex;align-items:center;gap:16px;flex-wrap:wrap">
-    <div style="flex:1;min-width:200px">
-      <div style="background:#21262d;border-radius:6px;height:22px;overflow:hidden">
-        <div id="tpu-duty-bar" style="height:100%;background:linear-gradient(90deg,#3fb950,#56d364);
-          width:0%;transition:width 1s;border-radius:6px"></div>
-      </div>
-    </div>
-    <div style="white-space:nowrap;font-size:1.2em;font-weight:bold;color:#e6edf3" id="tpu-duty-text">--%</div>
-  </div>
+  <h2 style="color:#56d364">🔥 TPU チップ使用率</h2>
+  <div id="tpu-chips-grid" style="display:grid;grid-template-columns:repeat(auto-fill,minmax(180px,1fr));gap:10px;margin-top:8px"></div>
 </div>
 
 <!-- XLA Warmup 進捗バー (TPU時のみ表示) -->
@@ -1161,17 +1162,24 @@ async function poll() {
     applyPhase(d.phase??'waiting');
     document.getElementById('msg').textContent = d.message??'';
 
-    // TPU 使用率 (GCP Cloud Monitoring)
-    const tpuDuty = document.getElementById('tpu-duty-card');
-    if (d.tpu_duty_cycle !== undefined && d.tpu_duty_cycle !== null) {
-      tpuDuty.style.display = 'block';
-      const pct = d.tpu_duty_cycle;
-      document.getElementById('tpu-duty-bar').style.width = pct+'%';
-      document.getElementById('tpu-duty-text').textContent = pct.toFixed(1)+'%';
-      document.getElementById('tpu-duty-bar').style.background =
-        pct > 70 ? 'linear-gradient(90deg,#3fb950,#56d364)' :
-        pct > 30 ? 'linear-gradient(90deg,#d29922,#e3b341)' :
-                   'linear-gradient(90deg,#f85149,#ff7b72)';
+    // TPU チップ使用率 (tpu-info)
+    if (d.tpu_chips && d.tpu_chips.length > 0) {
+      document.getElementById('tpu-duty-card').style.display = 'block';
+      const grid = document.getElementById('tpu-chips-grid');
+      grid.innerHTML = '';
+      d.tpu_chips.forEach(c => {
+        const pct = c.duty_cycle;
+        const col = pct > 70 ? '#3fb950' : pct > 20 ? '#d29922' : '#8b949e';
+        const hbmPct = c.hbm_total > 0 ? (c.hbm_used/c.hbm_total*100) : 0;
+        grid.innerHTML += `<div style="background:#21262d;border-radius:8px;padding:10px;border:1px solid #30363d">
+          <div style="font-size:.85em;color:#8b949e;margin-bottom:4px">Chip ${c.chip}</div>
+          <div style="font-size:1.4em;font-weight:bold;color:${col}">${pct.toFixed(1)}<span style="font-size:.6em">%</span></div>
+          <div style="font-size:.75em;color:#8b949e;margin-top:4px">HBM ${c.hbm_used.toFixed(1)}/${c.hbm_total.toFixed(0)} GiB</div>
+          <div style="background:#161b22;border-radius:3px;height:4px;margin-top:4px;overflow:hidden">
+            <div style="height:100%;width:${hbmPct.toFixed(1)}%;background:#388bfd;border-radius:3px"></div>
+          </div>
+        </div>`;
+      });
     }
 
     // XLA Warmup 進捗バー
