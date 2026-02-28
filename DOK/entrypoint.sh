@@ -14,39 +14,20 @@ echo "======================================================"
 echo "[*] デバイス検出中..."
 
 DEVICE_INFO=$(python3 - <<'PYEOF'
-import os, sys
+import os, sys, subprocess
 
-# ── TPU チェック ─────────────────────────────────────────────────────────────
-try:
-    import torch_xla.core.xla_model as xm
-    tpu_type = os.environ.get('TPU_ACCELERATOR_TYPE',
-               os.environ.get('TPU_NAME', 'TPU'))
-    print(f"TPU|TPU ({tpu_type})|0")
-    sys.exit(0)
-except Exception:
-    pass
-
-# /dev/accel0 チェック (torch_xla がなくてもTPU VMなら存在する)
-if os.path.exists('/dev/accel0') or os.path.exists('/dev/vfio/0') \
-   or os.environ.get('TPU_NAME') or os.environ.get('TPU_ACCELERATOR_TYPE'):
-    tpu_type = os.environ.get('TPU_ACCELERATOR_TYPE',
-               os.environ.get('TPU_NAME', 'TPU'))
-    print(f"TPU|TPU ({tpu_type})|0")
-    sys.exit(0)
-
-# ── GPU チェック (torch.cuda が最も確実) ────────────────────────────────────
+# ── 1. GPU チェック (最優先: CUDA が使えるなら確実にGPU) ─────────────────────
 try:
     import torch
     if torch.cuda.is_available():
-        name  = torch.cuda.get_device_name(0)
-        vram  = round(torch.cuda.get_device_properties(0).total_memory / 1e9, 1)
+        name = torch.cuda.get_device_name(0)
+        vram = round(torch.cuda.get_device_properties(0).total_memory / 1e9, 1)
         print(f"GPU|{name}|{vram}")
         sys.exit(0)
 except Exception:
     pass
 
-# nvidia-smi フォールバック (torch が何らかの理由で失敗した場合)
-import subprocess
+# nvidia-smi フォールバック
 try:
     r = subprocess.run(
         ['nvidia-smi', '--query-gpu=name,memory.total', '--format=csv,noheader,nounits'],
@@ -60,11 +41,25 @@ try:
 except Exception:
     pass
 
-# NVIDIA_VISIBLE_DEVICES が設定されているが torch/nvidia-smi が失敗した場合
-if os.environ.get('NVIDIA_VISIBLE_DEVICES', '') not in ('', 'none', 'void'):
+# NVIDIA_VISIBLE_DEVICES フォールバック
+if os.environ.get('NVIDIA_VISIBLE_DEVICES', '') not in ('', 'none', 'void', 'NoDevFiles'):
     print("GPU|Unknown GPU|0")
     sys.exit(0)
 
+# ── 2. TPU チェック (ハードウェア存在確認を必須とする) ───────────────────────
+# torch_xla が importできるだけでは不十分 - 物理デバイスの存在を確認する
+tpu_hw = (os.path.exists('/dev/accel0') or
+          os.path.exists('/dev/vfio/0')  or
+          bool(os.environ.get('TPU_NAME')) or
+          bool(os.environ.get('TPU_ACCELERATOR_TYPE')) or
+          bool(os.environ.get('COLAB_TPU_ADDR')))
+if tpu_hw:
+    tpu_type = os.environ.get('TPU_ACCELERATOR_TYPE',
+               os.environ.get('TPU_NAME', 'TPU'))
+    print(f"TPU|TPU ({tpu_type})|0")
+    sys.exit(0)
+
+# ── 3. CPU ───────────────────────────────────────────────────────────────────
 print("CPU|CPU|0")
 PYEOF
 )
