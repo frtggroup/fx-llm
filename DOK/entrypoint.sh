@@ -105,6 +105,7 @@ esac
 # Python に デバイス名を渡す
 export GPU_NAME
 export DEVICE_TYPE
+export GPU_VRAM
 
 # ── 2. CUDA MPS (特権不要・失敗しても続行) ───────────────────────────────────
 if [ "$DEVICE_TYPE" = "GPU" ]; then

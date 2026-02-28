@@ -165,13 +165,22 @@ def _auto_gpu_config(node_id: str) -> tuple[str, float, float, int]:
         except Exception:
             pass
 
+    # entrypoint.sh が export した GPU_VRAM を最優先で使用（torch_xla 干渉を回避）
     total_gb = 0.0
-    try:
-        import torch
-        if torch.cuda.is_available():
-            total_gb = torch.cuda.get_device_properties(0).total_memory / 1e9
-    except Exception:
-        pass
+    _vram_env = os.environ.get("GPU_VRAM", "").strip()
+    if _vram_env:
+        try:
+            total_gb = float(_vram_env)
+        except ValueError:
+            pass
+
+    if total_gb <= 0:
+        try:
+            import torch
+            if torch.cuda.is_available():
+                total_gb = torch.cuda.get_device_properties(0).total_memory / 1e9
+        except Exception:
+            pass
 
     if total_gb <= 0:
         _fallback: dict[str, float] = {
@@ -222,15 +231,22 @@ GPU_NAME = _get_gpu_display_name()
 _GPU_TIER, _GPU_VRAM_GB, _VPT_DEFAULT, _PAR_DEFAULT = _auto_gpu_config(NODE_ID)
 
 # CUDA / TPU の利用可否チェック
-try:
-    import torch as _torch_check
-    _CUDA_AVAILABLE = _torch_check.cuda.is_available()
-except Exception:
+# entrypoint.sh の DEVICE_TYPE 環境変数を優先（torch_xla 干渉を回避）
+_device_type_env = os.environ.get("DEVICE_TYPE", "").upper()
+if _device_type_env == "GPU":
+    _CUDA_AVAILABLE = True
+elif _device_type_env == "TPU":
     _CUDA_AVAILABLE = False
+else:
+    try:
+        import torch as _torch_check
+        _CUDA_AVAILABLE = _torch_check.cuda.is_available()
+    except Exception:
+        _CUDA_AVAILABLE = False
 
 try:
     import torch_xla.core.xla_model as _xm  # type: ignore
-    _TPU_AVAILABLE = True
+    _TPU_AVAILABLE = (_device_type_env == "TPU")
 except Exception:
     _TPU_AVAILABLE = False
 
