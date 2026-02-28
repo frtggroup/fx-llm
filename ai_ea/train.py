@@ -644,6 +644,24 @@ def train(args, X_tr, y_tr, X_te, y_te, mean, std, n_feat=None, _spawn_rank=None
     import time as _time
     _ep_start = _time.time()
 
+    # TPUチップID (PJRT_LOCAL_PROCESS_RANK から取得。未設定なら0)
+    _tpu_chip = int(os.environ.get('PJRT_LOCAL_PROCESS_RANK',
+                                    os.environ.get('LOCAL_RANK', '0')))
+    # XLA ExecuteTime ベースライン (利用率計算用)
+    _xla_prev_execute_ns: int = 0
+    _xla_prev_wall_ns: int = _time.time_ns()
+
+    def _get_xla_execute_ns() -> int:
+        """torch_xla.debug.metrics から累積XLA実行時間(ns)を取得"""
+        try:
+            import torch_xla.debug.metrics as _met  # type: ignore
+            data = _met.metric_data('ExecuteTime')
+            if data:
+                return int(data[-1][1])
+        except Exception:
+            pass
+        return 0
+
     for epoch in range(1, args.epochs + 1):
         _ep_t0 = _time.time()
         model.train()
@@ -717,6 +735,20 @@ def train(args, X_tr, y_tr, X_te, y_te, mean, std, n_feat=None, _spawn_rank=None
             _dash.setdefault('epoch_log', []).append(
                 {'epoch': epoch, 'train_loss': round(t_loss,6),
                  'val_loss': round(v_loss,6), 'acc': round(acc,4)})
+
+            # TPU利用率: XLA ExecuteTime の差分 / 壁時計時間
+            _ep_sec_now = _time.time() - _ep_t0
+            _tpu_util_pct = 0.0
+            if is_tpu:
+                _xla_now_ns   = _get_xla_execute_ns()
+                _wall_now_ns  = _time.time_ns()
+                _delta_xla    = _xla_now_ns  - _xla_prev_execute_ns
+                _delta_wall   = _wall_now_ns - _xla_prev_wall_ns
+                if _delta_wall > 0 and _delta_xla > 0:
+                    _tpu_util_pct = min(100.0, round(_delta_xla / _delta_wall * 100, 1))
+                _xla_prev_execute_ns = _xla_now_ns
+                _xla_prev_wall_ns    = _wall_now_ns
+
             # 並列モード: trial_progress.json に非同期書き込み (GPUをブロックしない)
             _write_trial_progress(OUT_DIR, {
                 'trial': args.trial, 'arch': getattr(args, 'arch', '?'),
@@ -724,6 +756,9 @@ def train(args, X_tr, y_tr, X_te, y_te, mean, std, n_feat=None, _spawn_rank=None
                 'epoch': epoch, 'total_epochs': args.epochs,
                 'train_loss': round(t_loss, 5), 'val_loss': round(v_loss, 5),
                 'accuracy': round(acc, 4), 'phase': 'training',
+                'ep_sec': round(_ep_sec_now, 2),
+                'tpu_chip': _tpu_chip,
+                'tpu_util_pct': _tpu_util_pct,
             })
             # シングルモード: HTML ダッシュボードも更新
             if not getattr(args, 'out_dir', ''):

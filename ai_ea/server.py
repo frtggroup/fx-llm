@@ -353,16 +353,48 @@ def api_status():
     _ws = _read_warmup_status()
     if _ws:
         st.update(_ws)
-    # TPU チップ情報 (tpu-info / リアルタイム)
-    if _tpu_chips:
+    # TPU チップ情報: trial_progress.json から per-chip 利用率を集計
+    _tpu_chip_map: dict[int, dict] = {}   # chip_id -> latest info
+    try:
+        import glob as _glob, time as _time
+        _now = _time.time()
+        for _pf in _glob.glob(str(TRIALS_DIR / 'trial_*/trial_progress.json')):
+            try:
+                _pd = json.loads(Path(_pf).read_text(encoding='utf-8'))
+                _chip = int(_pd.get('tpu_chip', -1))
+                if _chip < 0:
+                    continue
+                _age = _now - Path(_pf).stat().st_mtime
+                # 2分以内に更新されたもののみ (古い試行を除外)
+                if _age > 120:
+                    continue
+                _tpu_chip_map[_chip] = {
+                    'chip':        _chip,
+                    'trial':       _pd.get('trial', 0),
+                    'arch':        _pd.get('arch', '?'),
+                    'hidden':      _pd.get('hidden', 0),
+                    'epoch':       _pd.get('epoch', 0),
+                    'total_epochs':_pd.get('total_epochs', 0),
+                    'ep_sec':      _pd.get('ep_sec', 0.0),
+                    'util_pct':    _pd.get('tpu_util_pct', 0.0),
+                    'phase':       _pd.get('phase', 'unknown'),
+                }
+            except Exception:
+                pass
+    except Exception:
+        pass
+
+    if _tpu_chip_map:
+        chips_sorted = [_tpu_chip_map[k] for k in sorted(_tpu_chip_map)]
+        st['tpu_chips'] = chips_sorted
+        utils = [c['util_pct'] for c in chips_sorted if c['util_pct'] > 0]
+        st['tpu_duty_cycle'] = round(sum(utils) / len(utils), 1) if utils else 0.0
+    elif _tpu_chips:
+        # fallback: tpu-info がある場合
         st['tpu_chips'] = _tpu_chips
-        # 代表値: 使用中チップの平均 duty_cycle
         active = [c for c in _tpu_chips if c['hbm_used'] > 0.1]
-        if active:
-            st['tpu_duty_cycle'] = round(
-                sum(c['duty_cycle'] for c in active) / len(active), 1)
-        else:
-            st['tpu_duty_cycle'] = 0.0
+        st['tpu_duty_cycle'] = round(
+            sum(c['duty_cycle'] for c in active) / len(active), 1) if active else 0.0
     # best_links の S3直リンクをプロキシURLに変換 (自己署名証明書ブロック回避)
     if isinstance(st.get('best_links'), dict):
         bl = st['best_links']
@@ -1247,22 +1279,41 @@ async function poll() {
     applyPhase(d.phase??'waiting');
     document.getElementById('msg').textContent = d.message??'';
 
-    // TPU チップ使用率 (tpu-info)
+    // TPU チップ使用率 (trial_progress.json から集計)
     if (d.tpu_chips && d.tpu_chips.length > 0) {
       document.getElementById('tpu-duty-card').style.display = 'block';
       const grid = document.getElementById('tpu-chips-grid');
       grid.innerHTML = '';
       d.tpu_chips.forEach(c => {
-        const pct = c.duty_cycle;
-        const col = pct > 70 ? '#3fb950' : pct > 20 ? '#d29922' : '#8b949e';
-        const hbmPct = c.hbm_total > 0 ? (c.hbm_used/c.hbm_total*100) : 0;
+        // trial_progress 形式 (util_pct) と tpu-info 形式 (duty_cycle) の両方に対応
+        const pct   = c.util_pct ?? c.duty_cycle ?? 0;
+        const col   = pct > 60 ? '#3fb950' : pct > 15 ? '#d29922' : '#8b949e';
+        const epSec = c.ep_sec != null ? `${c.ep_sec.toFixed(1)}s/ep` : '';
+        const arch  = c.arch   ? `${c.arch}/h${c.hidden}` : '';
+        const epStr = c.epoch  ? `ep ${c.epoch}/${c.total_epochs}` : '';
+        // tpu-info 形式の場合は HBM バー、trial形式は epoch バー
+        let subBar = '';
+        if (c.hbm_total > 0) {
+          const hbmPct = (c.hbm_used / c.hbm_total * 100).toFixed(1);
+          subBar = `<div style="font-size:.75em;color:#8b949e;margin-top:3px">HBM ${c.hbm_used.toFixed(1)}/${c.hbm_total.toFixed(0)} GiB</div>
+            <div style="background:#161b22;border-radius:3px;height:4px;margin-top:3px;overflow:hidden">
+              <div style="height:100%;width:${hbmPct}%;background:#388bfd;border-radius:3px"></div></div>`;
+        } else if (c.total_epochs > 0) {
+          const epPct = (c.epoch / c.total_epochs * 100).toFixed(1);
+          subBar = `<div style="font-size:.72em;color:#8b949e;margin-top:3px">${epStr} ${epSec}</div>
+            <div style="background:#161b22;border-radius:3px;height:4px;margin-top:3px;overflow:hidden">
+              <div style="height:100%;width:${epPct}%;background:#388bfd;border-radius:3px"></div></div>`;
+        }
         grid.innerHTML += `<div style="background:#21262d;border-radius:8px;padding:10px;border:1px solid #30363d">
-          <div style="font-size:.85em;color:#8b949e;margin-bottom:4px">Chip ${c.chip}</div>
-          <div style="font-size:1.4em;font-weight:bold;color:${col}">${pct.toFixed(1)}<span style="font-size:.6em">%</span></div>
-          <div style="font-size:.75em;color:#8b949e;margin-top:4px">HBM ${c.hbm_used.toFixed(1)}/${c.hbm_total.toFixed(0)} GiB</div>
-          <div style="background:#161b22;border-radius:3px;height:4px;margin-top:4px;overflow:hidden">
-            <div style="height:100%;width:${hbmPct.toFixed(1)}%;background:#388bfd;border-radius:3px"></div>
+          <div style="display:flex;justify-content:space-between;align-items:center;margin-bottom:4px">
+            <span style="font-size:.82em;color:#8b949e">Chip ${c.chip}</span>
+            <span style="font-size:.75em;color:#58a6ff">${arch}</span>
           </div>
+          <div style="font-size:1.5em;font-weight:bold;color:${col}">${pct.toFixed(1)}<span style="font-size:.55em">%</span></div>
+          <div style="background:#161b22;border-radius:3px;height:6px;margin-top:5px;overflow:hidden">
+            <div style="height:100%;width:${Math.min(pct,100).toFixed(1)}%;background:${col};border-radius:3px;transition:width .5s"></div>
+          </div>
+          ${subBar}
         </div>`;
       });
     }

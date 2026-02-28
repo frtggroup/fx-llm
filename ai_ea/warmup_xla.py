@@ -144,9 +144,9 @@ def warmup(rank: int = 0, world_size: int = 1, dry_run: bool = False):
             import torch.optim as _optim
             opt = _optim.Adam(model.parameters(), lr=1e-3)
 
-            # 2ステップ実行: forward+backward+optimizer_step をキャッシュ
-            # (1ステップだけだとoptimizer内部グラフが未完成になる場合がある)
-            for _step in range(2):
+            # 大型モデル(h>=1024)は1ステップのみ: 2ステップだとXLAウォッチドッグ(121秒)を超えてkillされる
+            n_steps = 1 if hidden >= 1024 else 2
+            for _step in range(n_steps):
                 opt.zero_grad()
                 with torch.amp.autocast('xla', enabled=True, dtype=torch.bfloat16):
                     logits = model(x_dummy)
@@ -168,6 +168,63 @@ def warmup(rank: int = 0, world_size: int = 1, dry_run: bool = False):
     print(f"[WARMUP rank={rank}] 完了! {len(done_set)}/{len(my_pats)} パターンをキャッシュ", flush=True)
 
 
+def _worker_env(rank: int, n_dev: int) -> dict:
+    """ワーカーサブプロセス用の環境変数を生成"""
+    env = os.environ.copy()
+    env['PJRT_LOCAL_PROCESS_RANK'] = str(rank)
+    env['LOCAL_RANK']              = str(rank)
+    env['TPU_VISIBLE_DEVICES']     = str(rank)
+    env['TPU_NUM_DEVICES']         = '1'
+    return env
+
+
+def _run_rank_until_done(rank: int, n_dev: int, dry_run: bool, max_retries: int = 20):
+    """
+    1チップのwarmupワーカーを実行。クラッシュ(watchdog timeout等)したら
+    進捗JSONから自動再開し、全パターン完了まで繰り返す。
+    """
+    all_pats = _all_patterns()
+    my_pats  = [p for i, p in enumerate(all_pats) if i % n_dev == rank]
+    cmd_base = [sys.executable, __file__,
+                '--rank', str(rank),
+                '--world-size', str(n_dev)]
+    if dry_run:
+        cmd_base.append('--dry-run')
+
+    env = _worker_env(rank, n_dev)
+
+    for attempt in range(1, max_retries + 1):
+        # 残りパターン数を確認
+        done = _load_done(rank)
+        remaining = len(my_pats) - len(done)
+        if remaining <= 0:
+            print(f"[WARMUP] rank={rank} 全パターン完了", flush=True)
+            return True
+
+        print(f"[WARMUP] rank={rank} 起動 attempt={attempt}  残り={remaining}/{len(my_pats)}", flush=True)
+        p = subprocess.Popen(cmd_base, env=env)
+        p.wait()
+
+        if p.returncode == 0:
+            print(f"[WARMUP] rank={rank} 正常完了", flush=True)
+            return True
+
+        # クラッシュ — 進捗を再確認して続行するか判断
+        done_after = _load_done(rank)
+        print(f"[WARMUP] rank={rank} クラッシュ (exit={p.returncode}) "
+              f"完了={len(done_after)}/{len(my_pats)}  再起動待機中...", flush=True)
+
+        if len(done_after) >= len(my_pats):
+            print(f"[WARMUP] rank={rank} 全パターン完了 (クラッシュ前に保存済み)", flush=True)
+            return True
+
+        # TPUデバイス解放を待つ
+        time.sleep(5)
+
+    print(f"[WARMUP] rank={rank} 最大リトライ({max_retries})超過", flush=True)
+    return False
+
+
 if __name__ == '__main__':
     parser = argparse.ArgumentParser()
     parser.add_argument('--dry-run', action='store_true', help='実際のコンパイルをスキップ')
@@ -181,35 +238,29 @@ if __name__ == '__main__':
 
     # サブプロセスとして起動された場合 (--rank 指定あり)
     if args.rank is not None:
-        # world_sizeは--world-size引数から取得 (TPU_NUM_DEVICES=1に上書きされるため)
         ws = args.world_size if args.world_size is not None else n_dev
         warmup(rank=args.rank, world_size=ws, dry_run=args.dry_run)
         sys.exit(0)
 
     if n_dev > 1:
         # subprocess.Popen で各チップを独立プロセスとして並列起動
-        # xmp.spawn は xm.mark_step() がグローバルバリアになりデッドロックするため使わない
-        print(f"[WARMUP] subprocess: {n_dev} チップ並列コンパイル開始", flush=True)
-        procs = []
-        for rank in range(n_dev):
-            env = os.environ.copy()
-            env['PJRT_LOCAL_PROCESS_RANK'] = str(rank)
-            env['LOCAL_RANK']              = str(rank)
-            env['TPU_VISIBLE_DEVICES']     = str(rank)
-            env['TPU_NUM_DEVICES']         = '1'
-            cmd = [sys.executable, __file__,
-                   '--rank', str(rank),
-                   '--world-size', str(n_dev)]
-            if args.dry_run:
-                cmd.append('--dry-run')
-            p = subprocess.Popen(cmd, env=env)
-            procs.append((rank, p))
-            print(f"[WARMUP] rank={rank} 起動 PID={p.pid}", flush=True)
+        # クラッシュ時は自動再起動して全パターン完了を保証
+        print(f"[WARMUP] subprocess: {n_dev} チップ並列コンパイル開始 (自動再起動あり)", flush=True)
 
-        for rank, p in procs:
-            p.wait()
-            print(f"[WARMUP] rank={rank} 完了 (exit={p.returncode})", flush=True)
+        import threading
+        results = {}
 
-        print(f"[WARMUP] 全 {n_dev} チップ コンパイル完了", flush=True)
+        def _run_rank_thread(rank):
+            results[rank] = _run_rank_until_done(rank, n_dev, args.dry_run)
+
+        threads = [threading.Thread(target=_run_rank_thread, args=(r,), daemon=True)
+                   for r in range(n_dev)]
+        for t in threads:
+            t.start()
+        for t in threads:
+            t.join()
+
+        ok = all(results.get(r, False) for r in range(n_dev))
+        print(f"[WARMUP] 全 {n_dev} チップ コンパイル完了 (success={ok})", flush=True)
     else:
         warmup(rank=0, world_size=1, dry_run=args.dry_run)
