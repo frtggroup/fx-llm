@@ -2238,10 +2238,10 @@ def main():
                             for local_p, key in upload_targets:
                                 if not local_p.exists():
                                     continue
-                            if S3_ENABLED:
-                                s3_ensure_public_policy()
-                                if s3_upload(local_p, key):
-                                    links[local_p.name] = s3_public_url(key)
+                                if S3_ENABLED:
+                                    s3_ensure_public_policy()
+                                    if s3_upload(local_p, key):
+                                        links[local_p.name] = s3_public_url(key)
 
                             if links:
                                 links['pf']         = pf_snap

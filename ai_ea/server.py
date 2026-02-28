@@ -181,15 +181,35 @@ def index():
     return HTMLResponse(DASHBOARD_HTML)
 
 
+def _rewrite_s3_url_to_proxy(url: str) -> str:
+    """S3直リンク (自己署名証明書) をダッシュボード経由プロキシURLに変換する。
+    ブラウザのHTTPSセキュリティエラーを回避するため全S3リンクをプロキシ経由にする。"""
+    if not url or not isinstance(url, str):
+        return url
+    if not _S3_ENDPOINT:
+        return url
+    prefix = (_S3_PREFIX.rstrip('/') + '/') if _S3_PREFIX else ''
+    base   = f"{_S3_ENDPOINT}/{_S3_BUCKET}/{prefix}"
+    if url.startswith(base):
+        return _s3_proxy_url(url[len(base):])
+    return url
+
+
 @app.get('/api/status')
 def api_status():
     st = _read_progress()
     gpu = _gpu_stats()
-    # progress.json にない場合だけ上書き
     for k, v in gpu.items():
         st.setdefault(k, v)
     st['server_time']    = datetime.now().isoformat()
     st['stop_requested'] = STOP_FLAG.exists()
+    # best_links の S3直リンクをプロキシURLに変換 (自己署名証明書ブロック回避)
+    if isinstance(st.get('best_links'), dict):
+        bl = st['best_links']
+        for fname in ('fx_model_best.onnx', 'norm_params_best.json',
+                      'best_result.json', 'report.html'):
+            if fname in bl:
+                bl[fname] = _rewrite_s3_url_to_proxy(bl[fname])
     return JSONResponse(st)
 
 
@@ -354,6 +374,46 @@ def health():
     return {'ok': True, 'time': datetime.now().isoformat()}
 
 
+@app.get('/s3/download/{s3_path:path}')
+def s3_proxy_download(s3_path: str):
+    """S3ファイルをダッシュボード経由でプロキシ配信する。
+    自己署名証明書によるブラウザのHTTPSブロックを回避するため、
+    サーバー側でS3から取得してブラウザに返す。
+    """
+    if not _S3_ENDPOINT or not _S3_BUCKET:
+        raise HTTPException(503, 'S3未設定')
+    prefix = (_S3_PREFIX.rstrip('/') + '/') if _S3_PREFIX else ''
+    key    = prefix + s3_path
+    try:
+        s3  = _s3_client_srv()
+        obj = s3.get_object(Bucket=_S3_BUCKET, Key=key)
+        body = obj['Body'].read()
+    except Exception as e:
+        raise HTTPException(404, f'S3取得失敗: {e}')
+
+    fname = s3_path.split('/')[-1]
+    ext   = fname.rsplit('.', 1)[-1].lower() if '.' in fname else ''
+    mime_map = {
+        'onnx': 'application/octet-stream',
+        'json': 'application/json',
+        'html': 'text/html; charset=utf-8',
+        'csv':  'text/csv',
+        'zip':  'application/zip',
+    }
+    media_type = mime_map.get(ext, 'application/octet-stream')
+
+    headers = {}
+    if ext not in ('html',):
+        headers['Content-Disposition'] = f'attachment; filename="{fname}"'
+    return StreamingResponse(
+        io.BytesIO(body), media_type=media_type, headers=headers)
+
+
+def _s3_proxy_url(key: str) -> str:
+    """ブラウザ用プロキシURL (ダッシュボード経由でS3ファイルを取得)"""
+    return f'/s3/download/{key}'
+
+
 @app.get('/api/s3_catalog')
 def api_s3_catalog():
     """全ノードの S3 上モデル・レポート一覧を返す (60秒キャッシュ)"""
@@ -401,8 +461,8 @@ def api_s3_catalog():
                 r2 = dict(r)
                 r2['node_id']    = nid
                 r2['node_rank']  = rank_idx      # ノード内 rank (0-based)
-                r2['model_url']  = _s3_public_url(f'top100_{nid}/rank_{rank_idx:03d}/fx_model.onnx')
-                r2['params_url'] = _s3_public_url(f'top100_{nid}/rank_{rank_idx:03d}/norm_params.json')
+                r2['model_url']  = _s3_proxy_url(f'top100_{nid}/rank_{rank_idx:03d}/fx_model.onnx')
+                r2['params_url'] = _s3_proxy_url(f'top100_{nid}/rank_{rank_idx:03d}/norm_params.json')
                 all_results.append(r2)
 
             nodes[nid] = {
@@ -411,10 +471,10 @@ def api_s3_catalog():
                 'best_arch':  best.get('arch', '-'),
                 'count':      len(results),
                 'files': {
-                    'model':  _s3_public_url(f'best_{nid}/fx_model_best.onnx'),
-                    'params': _s3_public_url(f'best_{nid}/norm_params_best.json'),
-                    'result': _s3_public_url(f'best_{nid}/best_result.json'),
-                    'report': _s3_public_url(f'best_{nid}/report.html'),
+                    'model':  _s3_proxy_url(f'best_{nid}/fx_model_best.onnx'),
+                    'params': _s3_proxy_url(f'best_{nid}/norm_params_best.json'),
+                    'result': _s3_proxy_url(f'best_{nid}/best_result.json'),
+                    'report': _s3_proxy_url(f'best_{nid}/report.html'),
                 },
             }
 
