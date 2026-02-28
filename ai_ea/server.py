@@ -67,7 +67,47 @@ BEST_ONNX      = AI_EA_DIR / 'fx_model_best.onnx'
 BEST_NORM      = AI_EA_DIR / 'norm_params_best.json'
 STOP_FLAG      = WORKSPACE / 'stop.flag'
 LOG_FILE       = WORKSPACE / 'train_run.log'
-WARMUP_JSON    = WORKSPACE / 'xla_warmup_progress.json'
+WARMUP_JSON    = WORKSPACE / 'xla_warmup_progress.json'  # 旧形式 (単一ランク)
+# 新形式: ランク別ファイル xla_warmup_rank_{N}.json を集計
+
+
+def _read_warmup_status() -> dict:
+    """ランク別 JSON を集計して warmup 状況を返す。旧形式にも対応。"""
+    rank_files = sorted(WORKSPACE.glob('xla_warmup_rank_*.json'))
+    if rank_files:
+        total = 0
+        done  = 0
+        world_size = len(rank_files)
+        current  = None
+        any_active = False
+        for f in rank_files:
+            try:
+                w = json.loads(f.read_text(encoding='utf-8'))
+                if total == 0:
+                    total = w.get('warmup_total', 0)   # 全パターン数 (共通)
+                done += w.get('warmup_done', 0)
+                if w.get('warmup_current'):
+                    current = w['warmup_current']
+                    any_active = True
+            except Exception:
+                pass
+        pct = round(done / max(total, 1) * 100, 1)
+        return dict(warmup_total=total, warmup_done=done, warmup_pct=pct,
+                    warmup_current=current, warmup_phase=any_active or done < total,
+                    warmup_chips=world_size)
+    if WARMUP_JSON.exists():
+        try:
+            w = json.loads(WARMUP_JSON.read_text(encoding='utf-8'))
+            return dict(
+                warmup_total=w.get('warmup_total', 0),
+                warmup_done=w.get('warmup_done', 0),
+                warmup_pct=w.get('warmup_pct', 0),
+                warmup_current=w.get('warmup_current'),
+                warmup_phase=(w.get('warmup_done', 0) < w.get('warmup_total', 1)),
+            )
+        except Exception:
+            pass
+    return {}
 
 app = FastAPI(title="FX AI EA Dashboard v2")
 app.add_middleware(CORSMiddleware, allow_origins=["*"],
@@ -205,16 +245,9 @@ def api_status():
     st['server_time']    = datetime.now().isoformat()
     st['stop_requested'] = STOP_FLAG.exists()
     # XLA warmup 進捗 (TPU 起動時のグラフ事前コンパイル状況)
-    if WARMUP_JSON.exists():
-        try:
-            w = json.loads(WARMUP_JSON.read_text(encoding='utf-8'))
-            st['warmup_total']   = w.get('warmup_total', 0)
-            st['warmup_done']    = w.get('warmup_done', 0)
-            st['warmup_pct']     = w.get('warmup_pct', 0)
-            st['warmup_current'] = w.get('warmup_current')
-            st['warmup_phase']   = (w.get('warmup_done', 0) < w.get('warmup_total', 1))
-        except Exception:
-            pass
+    _ws = _read_warmup_status()
+    if _ws:
+        st.update(_ws)
     # best_links の S3直リンクをプロキシURLに変換 (自己署名証明書ブロック回避)
     if isinstance(st.get('best_links'), dict):
         bl = st['best_links']
@@ -1068,9 +1101,11 @@ async function poll() {
     if (d.warmup_total && d.warmup_phase) {
       wCard.style.display = 'block';
       const pct = d.warmup_pct??0;
+      const chips = d.warmup_chips??1;
       document.getElementById('warmup-bar').style.width = pct+'%';
+      const chipTag = chips > 1 ? ` [${chips}チップ並列]` : '';
       document.getElementById('warmup-text').textContent =
-        `${d.warmup_done??0} / ${d.warmup_total??0} (${pct.toFixed(1)}%)`;
+        `${d.warmup_done??0} / ${d.warmup_total??0} (${pct.toFixed(1)}%)${chipTag}`;
       const cur = d.warmup_current;
       document.getElementById('warmup-current').textContent =
         cur ? `コンパイル中: ${cur[0]} h=${cur[1]} L${cur[2]}` : '次のパターンを準備中...';

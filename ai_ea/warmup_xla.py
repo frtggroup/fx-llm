@@ -5,19 +5,19 @@ TPU起動時に全 (arch, hidden, layers) パターンを1フォワード+バッ
 XLA_PERSISTENT_CACHE_PATH にコンパイル済みグラフをキャッシュする。
 2回目以降の試行はキャッシュを再利用するため即座に学習開始できる。
 
-Usage:
-    python warmup_xla.py [--dry-run]
+単一チップ:
+    python warmup_xla.py
 
-進捗は /workspace/xla_warmup_progress.json に保存され、
-ダッシュボードの /api/status に反映される。
+並列 (v6e-4 など): entrypoint.sh が 4プロセス起動
+    PJRT_LOCAL_RANK=0 TPU_NUM_DEVICES=1 python warmup_xla.py --rank 0 --world-size 4
+    PJRT_LOCAL_RANK=1 TPU_NUM_DEVICES=1 python warmup_xla.py --rank 1 --world-size 4
+    ...
+
+進捗は /workspace/xla_warmup_rank_{rank}.json に保存され、
+ダッシュボードの /api/status がランクファイルを集計して表示する。
 """
 import argparse, json, os, sys, time
 from pathlib import Path
-
-# warmup はチップ0のみ使用 (並列学習が始まる前の単独実行)
-# PJRT_LOCAL_RANK=0 + TPU_NUM_DEVICES=1 でチップ0を専有
-os.environ.setdefault('PJRT_LOCAL_RANK', '0')
-os.environ['TPU_NUM_DEVICES'] = '1'
 
 # ── 全パターン定義 (run_train.py の TPU tier と同一) ──────────────────────────
 ARCHS = [
@@ -38,7 +38,6 @@ _HIDDEN_LARGE = {
     'inception':   [256, 512, 1024],
 }
 
-# layers の上限 (mlp/gru_attn は2まで)
 _MAX_LAYERS = {
     'mlp': 2, 'gru_attn': 2,
 }
@@ -49,7 +48,7 @@ BATCH      = 1024
 N_CLASSES  = 3
 DROPOUT    = 0.3
 
-PROGRESS_PATH = Path('/workspace/xla_warmup_progress.json')
+WORKSPACE = Path('/workspace')
 
 
 def _all_patterns():
@@ -63,65 +62,78 @@ def _all_patterns():
     return patterns
 
 
-def _load_progress(patterns):
-    """進捗ファイルを読み込み、完了済みセットを返す"""
-    if PROGRESS_PATH.exists():
+def _rank_progress_path(rank: int) -> Path:
+    return WORKSPACE / f'xla_warmup_rank_{rank}.json'
+
+
+def _load_done(rank: int) -> set:
+    """このランクの完了済みパターンを返す"""
+    p = _rank_progress_path(rank)
+    if p.exists():
         try:
-            d = json.loads(PROGRESS_PATH.read_text(encoding='utf-8'))
-            done = set(tuple(p) for p in d.get('completed_patterns', []))
-            return done
+            d = json.loads(p.read_text(encoding='utf-8'))
+            return set(tuple(x) for x in d.get('completed_patterns', []))
         except Exception:
             pass
     return set()
 
 
-def _save_progress(patterns, done_set, current=None):
-    """進捗をJSONに書き込む (ダッシュボードが読む)"""
+def _save_rank(rank: int, world_size: int, all_patterns: list,
+               done_set: set, current=None):
+    """ランク別進捗を書き込む (ダッシュボードが集計して読む)"""
+    my_patterns = [p for i, p in enumerate(all_patterns) if i % world_size == rank]
     data = {
-        'phase':              'warmup',
-        'warmup_total':       len(patterns),
+        'rank':               rank,
+        'world_size':         world_size,
+        'warmup_total':       len(all_patterns),   # 全体の合計 (集計用)
+        'my_total':           len(my_patterns),
         'warmup_done':        len(done_set),
         'warmup_current':     list(current) if current else None,
-        'warmup_pct':         round(len(done_set) / max(len(patterns), 1) * 100, 1),
+        'warmup_pct':         round(len(done_set) / max(len(my_patterns), 1) * 100, 1),
         'completed_patterns': [list(p) for p in done_set],
         'updated_at':         time.strftime('%Y-%m-%dT%H:%M:%S'),
     }
-    tmp = PROGRESS_PATH.with_suffix('.tmp')
+    path = _rank_progress_path(rank)
+    tmp  = path.with_suffix('.tmp')
     tmp.write_text(json.dumps(data, ensure_ascii=False), encoding='utf-8')
-    tmp.replace(PROGRESS_PATH)
+    tmp.replace(path)
 
 
-def warmup(dry_run=False):
+def warmup(rank: int = 0, world_size: int = 1, dry_run: bool = False):
+    # このプロセスが使うチップを固定
+    os.environ['PJRT_LOCAL_RANK'] = str(rank)
+    os.environ['TPU_NUM_DEVICES'] = '1'
+
     sys.path.insert(0, str(Path(__file__).parent))
     from model import build_model  # noqa
 
-    # TPU 初期化
     import torch
     import torch._dynamo as _dynamo
     _dynamo.config.disable = True   # Inductor デッドロック防止
 
     import torch_xla.core.xla_model as xm  # type: ignore
     device = xm.xla_device()
-    print(f"[WARMUP] デバイス: {device}", flush=True)
+    print(f"[WARMUP rank={rank}] デバイス: {device}", flush=True)
 
-    patterns = _all_patterns()
-    done_set = _load_progress(patterns)
+    all_pats = _all_patterns()
+    # 担当パターン: インターリーブ分割 (負荷均等)
+    my_pats  = [p for i, p in enumerate(all_pats) if i % world_size == rank]
+    done_set = _load_done(rank)
+    todo     = [p for p in my_pats if p not in done_set]
 
-    todo = [p for p in patterns if p not in done_set]
-    print(f"[WARMUP] 全パターン: {len(patterns)}  完了済み: {len(done_set)}  残り: {len(todo)}", flush=True)
+    print(f"[WARMUP rank={rank}] 担当: {len(my_pats)}  完了済み: {len(done_set)}  残り: {len(todo)}", flush=True)
 
     if not todo:
-        print("[WARMUP] 全パターンコンパイル済み → スキップ", flush=True)
-        _save_progress(patterns, done_set, current=None)
+        print(f"[WARMUP rank={rank}] 全パターンコンパイル済み → スキップ", flush=True)
+        _save_rank(rank, world_size, all_pats, done_set)
         return
 
     criterion = torch.nn.CrossEntropyLoss()
 
-    for i, (arch, hidden, layers) in enumerate(todo, 1):
+    for arch, hidden, layers in todo:
         tag = f"{arch}/h{hidden}/L{layers}"
-        total_remaining = len(todo)
-        print(f"[WARMUP] ({len(done_set)+1}/{len(patterns)}) {tag} コンパイル中...", flush=True)
-        _save_progress(patterns, done_set, current=(arch, hidden, layers))
+        print(f"[WARMUP rank={rank}] ({len(done_set)+1}/{len(my_pats)}) {tag} コンパイル中...", flush=True)
+        _save_rank(rank, world_size, all_pats, done_set, current=(arch, hidden, layers))
 
         if dry_run:
             done_set.add((arch, hidden, layers))
@@ -129,38 +141,35 @@ def warmup(dry_run=False):
 
         t0 = time.time()
         try:
-            # モデル構築 (CPU → TPU)
             model = build_model(arch, N_FEATURES, SEQ_LEN, hidden, layers, DROPOUT, N_CLASSES)
             model = model.to(device).train()
 
-            # ランダム入力 (shape は train.py と同じ)
             x_dummy = torch.randn(BATCH, SEQ_LEN, N_FEATURES, device=device, dtype=torch.bfloat16)
             y_dummy = torch.randint(0, N_CLASSES, (BATCH,), device=device)
 
-            # forward + backward → XLA グラフコンパイル
             with torch.amp.autocast('xla', enabled=True, dtype=torch.bfloat16):
                 logits = model(x_dummy)
                 loss   = criterion(logits, y_dummy)
             loss.backward()
-
-            # グラフを実行・キャッシュに保存
             xm.mark_step()
 
             elapsed = time.time() - t0
-            print(f"[WARMUP] ✓ {tag}  {elapsed:.0f}秒", flush=True)
+            print(f"[WARMUP rank={rank}] ✓ {tag}  {elapsed:.0f}秒", flush=True)
 
         except Exception as e:
-            print(f"[WARMUP] ✗ {tag}  エラー: {e}", flush=True)
+            print(f"[WARMUP rank={rank}] ✗ {tag}  エラー: {e}", flush=True)
 
         done_set.add((arch, hidden, layers))
-        _save_progress(patterns, done_set, current=None)
+        _save_rank(rank, world_size, all_pats, done_set)
 
-    _save_progress(patterns, done_set, current=None)
-    print(f"[WARMUP] 完了! {len(done_set)}/{len(patterns)} パターンをキャッシュ", flush=True)
+    _save_rank(rank, world_size, all_pats, done_set)
+    print(f"[WARMUP rank={rank}] 完了! {len(done_set)}/{len(my_pats)} パターンをキャッシュ", flush=True)
 
 
 if __name__ == '__main__':
     parser = argparse.ArgumentParser()
-    parser.add_argument('--dry-run', action='store_true', help='実際のコンパイルをスキップ (テスト用)')
+    parser.add_argument('--rank',       type=int, default=0, help='このプロセスのランク (0始まり)')
+    parser.add_argument('--world-size', type=int, default=1, help='並列プロセス総数')
+    parser.add_argument('--dry-run',    action='store_true',  help='実際のコンパイルをスキップ')
     args = parser.parse_args()
-    warmup(dry_run=args.dry_run)
+    warmup(rank=args.rank, world_size=args.world_size, dry_run=args.dry_run)
