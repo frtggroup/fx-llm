@@ -32,8 +32,8 @@ BEST_LINKS    = OUT_DIR / 'best_links.json'   # GDrive 公開ダウンロード�
 # ローカル: /workspace/data/checkpoint/ に定期保存
 # S3: 環境変数 S3_* が設定されていれば Sakura オブジェクトストレージにも保存
 CHECKPOINT_DIR      = _WORKSPACE / 'data' / 'checkpoint'
-CHECKPOINT_INTERVAL = 600   # 秒 (10分ごとに保存)
-CHECKPOINT_EVERY_N  = 10    # 件 (10試行完了ごとに保存)
+CHECKPOINT_INTERVAL = 60    # 秒 (1分ごとに保存)
+CHECKPOINT_EVERY_N  = 5     # 件 (5試行完了ごとに保存)
 
 S3_ENDPOINT  = os.environ.get('S3_ENDPOINT',   '')   # 例: https://s3.isk01.sakurastorage.jp
 S3_ACCESS_KEY= os.environ.get('S3_ACCESS_KEY',  '')
@@ -48,53 +48,55 @@ GDRIVE_ENABLED = _gdrive.GDRIVE_ENABLED
 
 
 def remote_upload(local_path: Path, rel_key: str) -> bool:
-    """GDrive > S3 の優先順でアップロード"""
-    if GDRIVE_ENABLED:
-        return _gdrive.upload(local_path, rel_key)
+    """S3 > GDrive の優先順でアップロード (S3は高速なローカルサーバ)"""
+    ok = False
     if S3_ENABLED:
-        return s3_upload(local_path, rel_key)
-    return False
+        ok = s3_upload(local_path, rel_key) or ok
+    if GDRIVE_ENABLED:
+        ok = _gdrive.upload(local_path, rel_key) or ok
+    return ok
 
 
 def remote_download(rel_key: str, local_path: Path) -> bool:
-    """GDrive > S3 の優先順でダウンロード"""
+    """S3 > GDrive の優先順でダウンロード"""
+    if S3_ENABLED:
+        if s3_download(rel_key, local_path):
+            return True
     if GDRIVE_ENABLED:
         return _gdrive.download(rel_key, local_path)
-    if S3_ENABLED:
-        return s3_download(rel_key, local_path)
     return False
 
 
 def remote_list_node_keys(glob_prefix: str) -> list[str]:
-    """全ノードの同種ファイル一覧 (GDrive > S3)"""
-    if GDRIVE_ENABLED:
-        return _gdrive.list_node_keys(glob_prefix)
+    """全ノードの同種ファイル一覧 (S3 > GDrive)"""
     if S3_ENABLED:
         return s3_list_node_keys(glob_prefix)
+    if GDRIVE_ENABLED:
+        return _gdrive.list_node_keys(glob_prefix)
     return []
 
 
 def remote_list_top100_keys() -> list[str]:
-    """top100_* 以下の全ファイル相対パス一覧 (GDrive > S3)"""
-    if GDRIVE_ENABLED:
-        return _gdrive.list_keys_recursive('top100_')
+    """top100_* 以下の全ファイル相対パス一覧 (S3 > GDrive)"""
     if S3_ENABLED:
         raw = s3_list_keys('top100_')
         return [k[len(S3_PREFIX)+1:] for k in raw]
+    if GDRIVE_ENABLED:
+        return _gdrive.list_keys_recursive('top100_')
     return []
 
 
 def remote_list_best_keys() -> list[str]:
-    """best_* 以下の全ファイル相対パス一覧 (GDrive > S3)"""
-    if GDRIVE_ENABLED:
-        return _gdrive.list_keys_recursive('best_')
+    """best_* 以下の全ファイル相対パス一覧 (S3 > GDrive)"""
     if S3_ENABLED:
         return s3_list_node_keys('best_')
+    if GDRIVE_ENABLED:
+        return _gdrive.list_keys_recursive('best_')
     return []
 
 
 def REMOTE_ENABLED() -> bool:
-    return GDRIVE_ENABLED or S3_ENABLED
+    return S3_ENABLED or GDRIVE_ENABLED
 
 # ── ノードID (GTX / H100 / CPU) ─────────────────────────────────────────────
 # S3 上でノードごとにファイルを分離することで競合を回避する
@@ -326,6 +328,20 @@ def s3_download(s3_key: str, local_path: Path) -> bool:
     except Exception as e:
         print(f'  [S3] download失敗 {s3_key}: {e}')
         return False
+
+
+def s3_presign(s3_key: str, expires: int = 86400) -> str:
+    """S3オブジェクトの署名付きDL URL を生成 (デフォルト24時間有効)。失敗時は空文字。"""
+    try:
+        url = _s3_client().generate_presigned_url(
+            'get_object',
+            Params={'Bucket': S3_BUCKET, 'Key': f'{S3_PREFIX}/{s3_key}'},
+            ExpiresIn=expires,
+        )
+        return url
+    except Exception as e:
+        print(f'  [S3] presign失敗 {s3_key}: {e}')
+        return ''
 
 
 def s3_list_keys(prefix: str = '') -> list:
@@ -2081,31 +2097,57 @@ def main():
                 except Exception:
                     pass
                 print(f"  [BEST] 試行#{tno}  PF={pf:.4f}  SR={sr:.3f}  MaxDD={max_dd:.4f}")
-                # GDrive にアップロードして公開リンクを生成 (バックグラウンド)
-                if GDRIVE_ENABLED:
-                    _best_pf_snap = best_pf
-                    def _share_best(pf_snap=_best_pf_snap):
+                # S3 / GDrive にアップロードしてDLリンクを生成 (バックグラウンド)
+                if REMOTE_ENABLED():
+                    _best_pf_snap  = best_pf
+                    _tno_snap      = tno
+                    _trial_dir_snap = info['trial_dir']
+                    def _share_best(pf_snap=_best_pf_snap, tno_snap=_tno_snap,
+                                    trial_dir=_trial_dir_snap):
                         links = {}
-                        for local_p, key in [
+                        # ベストモデルファイル
+                        upload_targets = [
                             (BEST_ONNX, f'best_{NODE_ID}/fx_model_best.onnx'),
                             (BEST_NORM, f'best_{NODE_ID}/norm_params_best.json'),
                             (BEST_JSON, f'best_{NODE_ID}/best_result.json'),
-                        ]:
-                            if local_p.exists():
+                        ]
+                        # レポートHTML (trial_dir/report.html を best_<NODE_ID>/report.html に)
+                        report_src = trial_dir / 'report.html'
+                        if not report_src.exists():
+                            # top_cache にある場合
+                            report_src = TOP_CACHE_DIR / f'trial_{tno_snap:06d}' / 'report.html'
+                        if report_src.exists():
+                            upload_targets.append(
+                                (report_src, f'best_{NODE_ID}/report.html'))
+
+                        for local_p, key in upload_targets:
+                            if not local_p.exists():
+                                continue
+                            # S3優先でアップロード
+                            if S3_ENABLED:
+                                if s3_upload(local_p, key):
+                                    url = s3_presign(key, expires=86400 * 7)  # 7日間有効
+                                    if url:
+                                        links[local_p.name] = url
+                            elif GDRIVE_ENABLED:
                                 url = _gdrive.upload_and_share(local_p, key)
                                 if url:
                                     links[local_p.name] = url
+
                         if links:
-                            links['pf'] = pf_snap
-                            links['node_id'] = NODE_ID
+                            links['pf']         = pf_snap
+                            links['node_id']    = NODE_ID
+                            links['trial']      = tno_snap
                             links['updated_at'] = time.strftime('%Y-%m-%d %H:%M:%S')
+                            links['storage']    = 'S3' if S3_ENABLED else 'GDrive'
                             try:
                                 BEST_LINKS.write_text(
                                     json.dumps(links, ensure_ascii=False, indent=2),
                                     encoding='utf-8')
-                                print(f"  [GDrive] 公開リンク更新: {list(links.keys())}")
+                                tag = links['storage']
+                                print(f"  [{tag}] DLリンク更新: {[k for k in links if '.' in k]}")
                             except Exception as _e:
-                                print(f"  [GDrive] リンク保存失敗: {_e}")
+                                print(f"  [REMOTE] リンク保存失敗: {_e}")
                     threading.Thread(target=_share_best, daemon=True).start()
             else:
                 print(f"  [DONE] 試行#{tno:4d}  PF={pf:.4f}  SR={sr:.3f}  "

@@ -500,8 +500,8 @@ tr:hover td{background:#1c2128}
 
 <!-- ベストモデル ダウンロードリンク -->
 <div class="card" id="best-links-card" style="margin-bottom:12px;display:none">
-  <h2>📥 ベストモデル ダウンロードリンク (Google Drive)</h2>
-  <div id="best-links-body" style="font-size:.85em;line-height:2"></div>
+  <h2>📥 ベストモデル ダウンロード</h2>
+  <div id="best-links-body" style="font-size:.85em"></div>
 </div>
 
 <!-- TOP100 テーブル -->
@@ -856,25 +856,38 @@ async function poll() {
     document.getElementById('m-vram').textContent        = `${vramU.toFixed(1)} / ${vramT.toFixed(0)} GB`;
     document.getElementById('bar-vram').style.width      = pct(vramU,vramT)+'%';
 
-    // ベストモデル GDrive ダウンロードリンク
+    // ベストモデル ダウンロードリンク (S3 / GDrive)
     if (d.best_links && Object.keys(d.best_links).length > 0) {
       const bl = d.best_links;
       const card = document.getElementById('best-links-card');
       const body = document.getElementById('best-links-body');
-      const pfTxt = bl.pf ? ` (PF=${parseFloat(bl.pf).toFixed(4)})` : '';
+      const pfTxt  = bl.pf         ? ` (PF=${parseFloat(bl.pf).toFixed(4)})` : '';
       const updTxt = bl.updated_at ? ` — 更新: ${bl.updated_at}` : '';
-      let html = `<div style="color:#8b949e;margin-bottom:6px">ノード: <b style="color:#e3b341">${bl.node_id||'-'}</b>${pfTxt}${updTxt}</div>`;
+      const storageBadge = bl.storage === 'S3'
+        ? `<span style="background:#1f6feb;color:#fff;padding:1px 6px;border-radius:4px;font-size:.8em">S3</span>`
+        : `<span style="background:#238636;color:#fff;padding:1px 6px;border-radius:4px;font-size:.8em">GDrive</span>`;
+      let html = `<div style="color:#8b949e;margin-bottom:8px">
+        ${storageBadge} &nbsp;ノード: <b style="color:#e3b341">${bl.node_id||'-'}</b>
+        &nbsp;試行#${bl.trial||'-'}${pfTxt}${updTxt}
+      </div>`;
       const fileLabels = {
-        'fx_model_best.onnx':    '🧠 ONNX モデル',
-        'norm_params_best.json': '📐 正規化パラメータ',
-        'best_result.json':      '📊 ベスト結果 JSON',
+        'fx_model_best.onnx':    ['🧠', 'ONNX モデル'],
+        'norm_params_best.json': ['📐', '正規化パラメータ'],
+        'best_result.json':      ['📊', 'ベスト結果 JSON'],
+        'report.html':           ['📈', 'バックテストレポート'],
       };
-      for (const [fname, label] of Object.entries(fileLabels)) {
+      html += '<div style="display:flex;flex-wrap:wrap;gap:8px">';
+      for (const [fname, [icon, label]] of Object.entries(fileLabels)) {
         if (bl[fname]) {
-          html += `<div><a href="${bl[fname]}" target="_blank" style="color:#58a6ff;text-decoration:none">
-            ${label} (${fname})</a></div>`;
+          html += `<a href="${bl[fname]}" target="_blank"
+            style="display:inline-flex;align-items:center;gap:4px;padding:5px 10px;
+                   background:#21262d;border:1px solid #30363d;border-radius:6px;
+                   color:#58a6ff;text-decoration:none;font-size:.82em">
+            ${icon} ${label}
+          </a>`;
         }
       }
+      html += '</div>';
       body.innerHTML = html;
       card.style.display = '';
     }
