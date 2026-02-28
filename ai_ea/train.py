@@ -397,22 +397,61 @@ def _detect_device():
     return torch.device('cpu'), 'cpu'
 
 
+def _xmp_spawn_worker(rank, data_path, result_path, n_dev):
+    """xmp.spawn(start_method='spawn') から呼ばれるトップレベルワーカー。
+    spawn では親プロセスのメモリを共有しないため、データはファイル経由で渡す。
+    XLA 関連コードはすべてこの関数内 (ローカルスコープ) で初期化する。"""
+    import pickle, sys
+    sys.path.insert(0, str(Path(__file__).parent))
+
+    with open(data_path, 'rb') as _f:
+        _d = pickle.load(_f)
+    X_tr   = _d['X_tr'];  y_tr = _d['y_tr']
+    X_te   = _d['X_te'];  y_te = _d['y_te']
+    mean   = _d['mean'];  std  = _d['std']
+    n_feat = _d['n_feat']
+
+    class _A: pass
+    args = _A()
+    for k, v in _d['args'].items():
+        setattr(args, k, v)
+
+    train(args, X_tr, y_tr, X_te, y_te, mean, std, n_feat,
+          _spawn_rank=rank, _spmd_n_dev=n_dev, _spmd_result=result_path)
+
+
 def _dispatch_spmd(args, X_tr, y_tr, X_te, y_te, mean, std, n_feat, n_dev):
     """xmp.spawn で n_dev チップに学習を分散する。
+    PJRT 推奨の start_method='spawn' を使用し、データは /dev/shm 経由で渡す。
     この関数は XLA/PJRT を初期化する前に呼び出す必要がある。"""
+    import pickle
     try:
         import torch_xla.distributed.xla_multiprocessing as xmp  # type: ignore
     except ImportError:
         print("[WARN] xla_multiprocessing が利用不可 → シングルチップにフォールバック", flush=True)
-        return train(args, X_tr, y_tr, X_te, y_te, mean, std, n_feat, _spawn_rank=0)
+        return train(args, X_tr, y_tr, X_te, y_te, mean, std, n_feat,
+                     _spawn_rank=0, _spmd_n_dev=1, _spmd_result='')
 
-    tmp_path = f'/dev/shm/xmp_{os.getpid()}.pt'
+    pid         = os.getpid()
+    data_path   = f'/dev/shm/xmp_data_{pid}.pkl'
+    result_path = f'/dev/shm/xmp_result_{pid}.pt'
+
     print(f"\n=== SPMD 並列学習 [{n_dev} チップ] ===", flush=True)
 
-    def _worker(rank):
-        train(args, X_tr, y_tr, X_te, y_te, mean, std, n_feat, _spawn_rank=rank)
-
-    xmp.spawn(_worker, nprocs=n_dev, start_method='fork')
+    _args_dict = {k: v for k, v in vars(args).items()} if hasattr(args, '__dict__') else {}
+    with open(data_path, 'wb') as _f:
+        pickle.dump({'X_tr': X_tr, 'y_tr': y_tr, 'X_te': X_te, 'y_te': y_te,
+                     'mean': mean, 'std': std, 'n_feat': n_feat,
+                     'args': _args_dict}, _f)
+    try:
+        # start_method='spawn': 新しいインタープリタを起動 → PJRT が安全に初期化される
+        xmp.spawn(_xmp_spawn_worker,
+                  args=(data_path, result_path, n_dev),
+                  nprocs=n_dev,
+                  start_method='spawn')
+    finally:
+        try: Path(data_path).unlink()
+        except Exception: pass
 
     # rank 0 が保存したモデルをロード
     seq_len = X_tr.shape[1]
@@ -420,22 +459,24 @@ def _dispatch_spmd(args, X_tr, y_tr, X_te, y_te, mean, std, n_feat, n_dev):
     arch    = getattr(args, 'arch', 'gru_attn')
     model   = build_model(arch, n_in, seq_len, args.hidden, args.layers, args.dropout)
     try:
-        state = torch.load(tmp_path, map_location='cpu', weights_only=True)
+        state = torch.load(result_path, map_location='cpu', weights_only=True)
         model.load_state_dict(state)
         print(f"  [SPMD] モデルロード完了", flush=True)
     except Exception as _e:
         print(f"  [WARN] SPMD モデルロード失敗: {_e}", flush=True)
     try:
-        Path(tmp_path).unlink()
+        Path(result_path).unlink()
     except Exception:
         pass
     return model
 
 
-def train(args, X_tr, y_tr, X_te, y_te, mean, std, n_feat=None, _spawn_rank=None):
+def train(args, X_tr, y_tr, X_te, y_te, mean, std, n_feat=None, _spawn_rank=None,
+          _spmd_n_dev=None, _spmd_result=None):
     # ── SPMD ディスパッチ (XLA 初期化前に実行) ──────────────────────────────
     _is_tpu_env = os.environ.get('DEVICE_TYPE', '').upper() == 'TPU'
-    _n_dev = int(os.environ.get('TPU_NUM_DEVICES', '1')) if _is_tpu_env else 1
+    _n_dev = _spmd_n_dev if _spmd_n_dev is not None else (
+        int(os.environ.get('TPU_NUM_DEVICES', '1')) if _is_tpu_env else 1)
     if _spawn_rank is None and _is_tpu_env and _n_dev > 1:
         return _dispatch_spmd(args, X_tr, y_tr, X_te, y_te, mean, std, n_feat, _n_dev)
 
@@ -759,14 +800,13 @@ def train(args, X_tr, y_tr, X_te, y_te, mean, std, n_feat=None, _spawn_rank=None
                 pass
 
     # SPMD rank 0 → モデルの重みを CPU に移して保存 (dispatch 側がロード)
-    if _spmd_mode and _spawn_rank == 0:
+    if _spmd_mode and _spawn_rank == 0 and _spmd_result:
         try:
             import torch_xla.core.xla_model as xm  # type: ignore
-            tmp_path = f'/dev/shm/xmp_{os.getppid()}.pt'
-            state = {k: v.cpu() for k, v in model_for_export.state_dict().items()}
-            torch.save(state, tmp_path)
             xm.mark_step()
-            print(f"  [SPMD rank=0] モデル保存 → {tmp_path}", flush=True)
+            state = {k: v.cpu() for k, v in model_for_export.state_dict().items()}
+            torch.save(state, _spmd_result)
+            print(f"  [SPMD rank=0] モデル保存完了", flush=True)
         except Exception as _e:
             print(f"  [WARN] SPMD モデル保存失敗: {_e}", flush=True)
 

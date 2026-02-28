@@ -97,6 +97,11 @@ def _save_rank(rank: int, world_size: int, all_patterns: list,
     tmp.replace(path)
 
 
+def _warmup_spawn_worker(rank, world_size, dry_run):
+    """xmp.spawn(start_method='spawn') から呼ばれるトップレベル関数"""
+    warmup(rank=rank, world_size=world_size, dry_run=dry_run)
+
+
 def warmup(rank: int = 0, world_size: int = 1, dry_run: bool = False):
     sys.path.insert(0, str(Path(__file__).parent))
     from model import build_model  # noqa
@@ -172,11 +177,11 @@ if __name__ == '__main__':
         try:
             import torch_xla.distributed.xla_multiprocessing as xmp  # type: ignore
             print(f"[WARMUP] xmp.spawn: {n_dev} チップ並列コンパイル開始", flush=True)
-
-            def _spawn_worker(rank):
-                warmup(rank=rank, world_size=n_dev, dry_run=args.dry_run)
-
-            xmp.spawn(_spawn_worker, nprocs=n_dev, start_method='fork')
+            # start_method='spawn': PJRT 推奨。トップレベル関数が必要
+            xmp.spawn(_warmup_spawn_worker,
+                      args=(n_dev, args.dry_run),
+                      nprocs=n_dev,
+                      start_method='spawn')
             print(f"[WARMUP] 全 {n_dev} チップ コンパイル完了", flush=True)
         except Exception as e:
             print(f"[WARMUP] xmp.spawn 失敗: {e} → シングルチップにフォールバック", flush=True)
