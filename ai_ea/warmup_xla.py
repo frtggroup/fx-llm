@@ -146,11 +146,19 @@ def warmup(rank: int = 0, world_size: int = 1, dry_run: bool = False):
             x_dummy = torch.randn(BATCH, SEQ_LEN, N_FEATURES, device=device, dtype=torch.bfloat16)
             y_dummy = torch.randint(0, N_CLASSES, (BATCH,), device=device)
 
-            with torch.amp.autocast('xla', enabled=True, dtype=torch.bfloat16):
-                logits = model(x_dummy)
-                loss   = criterion(logits, y_dummy)
-            loss.backward()
-            xm.mark_step()
+            import torch.optim as _optim
+            opt = _optim.Adam(model.parameters(), lr=1e-3)
+
+            # 2ステップ実行: forward+backward+optimizer_step をキャッシュ
+            # (1ステップだけだとoptimizer内部グラフが未完成になる場合がある)
+            for _step in range(2):
+                opt.zero_grad()
+                with torch.amp.autocast('xla', enabled=True, dtype=torch.bfloat16):
+                    logits = model(x_dummy)
+                    loss   = criterion(logits, y_dummy)
+                loss.backward()
+                xm.optimizer_step(opt)
+                xm.mark_step()
 
             elapsed = time.time() - t0
             print(f"[WARMUP rank={rank}] ✓ {tag}  {elapsed:.0f}秒", flush=True)

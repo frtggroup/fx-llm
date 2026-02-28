@@ -1079,7 +1079,8 @@ def get_gpu_compute_pids() -> set:
 
 def get_max_parallel(n_running: int) -> int:
     """VRAM/GPU 使用率から動的に最大並列数を返す"""
-    if not H100_MODE:
+    if not H100_MODE or TPU_MODE:
+        # TPU: HBM は CUDA VRAM と独立 → MAX_PARALLEL を直接返す
         return MAX_PARALLEL
     gi = _gpu_info()
     total_gb = max(gi['total_gb'], 1)
