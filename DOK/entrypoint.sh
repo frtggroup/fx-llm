@@ -16,18 +16,7 @@ echo "[*] デバイス検出中..."
 DEVICE_INFO=$(python3 - <<'PYEOF'
 import os, sys, subprocess
 
-# ── 1. GPU チェック (最優先: CUDA が使えるなら確実にGPU) ─────────────────────
-try:
-    import torch
-    if torch.cuda.is_available():
-        name = torch.cuda.get_device_name(0)
-        vram = round(torch.cuda.get_device_properties(0).total_memory / 1e9, 1)
-        print(f"GPU|{name}|{vram}")
-        sys.exit(0)
-except Exception:
-    pass
-
-# nvidia-smi フォールバック
+# ── 1. nvidia-smi で先に確認 (torch より先に実行 = torch_xla 干渉を回避) ──────
 try:
     r = subprocess.run(
         ['nvidia-smi', '--query-gpu=name,memory.total', '--format=csv,noheader,nounits'],
@@ -41,13 +30,34 @@ try:
 except Exception:
     pass
 
-# NVIDIA_VISIBLE_DEVICES フォールバック
-if os.environ.get('NVIDIA_VISIBLE_DEVICES', '') not in ('', 'none', 'void', 'NoDevFiles'):
-    print("GPU|Unknown GPU|0")
+# ── 2. NVIDIA_VISIBLE_DEVICES チェック (Vast.ai 等はこれで確認できる) ────────
+nv = os.environ.get('NVIDIA_VISIBLE_DEVICES', '')
+if nv and nv not in ('none', 'void', 'NoDevFiles'):
+    # torch.cuda で GPU 名を取得 (torch_xla の干渉より前に nvidia-smi で判定済み)
+    try:
+        import torch
+        if torch.cuda.is_available():
+            name = torch.cuda.get_device_name(0)
+            vram = round(torch.cuda.get_device_properties(0).total_memory / 1e9, 1)
+            print(f"GPU|{name}|{vram}")
+        else:
+            print(f"GPU|Unknown GPU (NVDEV={nv})|0")
+    except Exception:
+        print(f"GPU|Unknown GPU (NVDEV={nv})|0")
     sys.exit(0)
 
-# ── 2. TPU チェック (ハードウェア存在確認を必須とする) ───────────────────────
-# torch_xla が importできるだけでは不十分 - 物理デバイスの存在を確認する
+# ── 3. torch.cuda 直接確認 (NVIDIA_VISIBLE_DEVICES がない環境向け) ──────────
+try:
+    import torch
+    if torch.cuda.is_available():
+        name = torch.cuda.get_device_name(0)
+        vram = round(torch.cuda.get_device_properties(0).total_memory / 1e9, 1)
+        print(f"GPU|{name}|{vram}")
+        sys.exit(0)
+except Exception:
+    pass
+
+# ── 4. TPU チェック (物理デバイス確認必須 / torch_xla importだけでは不十分) ──
 tpu_hw = (os.path.exists('/dev/accel0') or
           os.path.exists('/dev/vfio/0')  or
           bool(os.environ.get('TPU_NAME')) or
@@ -59,7 +69,7 @@ if tpu_hw:
     print(f"TPU|TPU ({tpu_type})|0")
     sys.exit(0)
 
-# ── 3. CPU ───────────────────────────────────────────────────────────────────
+# ── 5. CPU ───────────────────────────────────────────────────────────────────
 print("CPU|CPU|0")
 PYEOF
 )

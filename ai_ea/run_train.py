@@ -410,6 +410,7 @@ _TIER_HIDDEN_MAP = {
     'medium': _HIDDEN_LARGE,
     'large':  _HIDDEN_LARGE,
     'xlarge': _HIDDEN_LARGE,
+    'tpu':    _HIDDEN_LARGE,   # TPU = large相当の大モデル
 }
 HIDDEN_MAP_LOCAL = _HIDDEN_MICRO   # 後方互換エイリアス
 HIDDEN_MAP_H100  = _HIDDEN_LARGE   # 後方互換エイリアス
@@ -422,6 +423,7 @@ _TIER_BATCH = {
     'medium': [256, 512, 1024, 2048],
     'large':  [256, 512, 1024, 2048],
     'xlarge': [512, 1024, 2048, 4096],
+    'tpu':    [512, 1024, 2048, 4096],
 }
 BATCH_CHOICES = _TIER_BATCH[_GPU_TIER]
 
@@ -432,6 +434,7 @@ _TIER_SEQ = {
     'medium': [10, 15, 20, 30, 40],
     'large':  [10, 15, 20, 30, 40, 50],
     'xlarge': [15, 20, 30, 40, 50, 60],
+    'tpu':    [15, 20, 30, 40, 50, 60],
 }
 SEQ_CHOICES = _TIER_SEQ[_GPU_TIER]
 
@@ -444,6 +447,7 @@ _TIER_TIMEOUT = {
     'medium': 1200,   # 20分
     'large':  1800,   # 30分
     'xlarge': 2400,   # 40分
+    'tpu':    2400,   # 40分
 }
 TRIAL_TIMEOUT = _TIER_TIMEOUT[_GPU_TIER]
 
