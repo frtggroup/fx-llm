@@ -402,7 +402,19 @@ def api_status():
                       'best_result.json', 'report.html'):
             if fname in bl:
                 bl[fname] = _rewrite_s3_url_to_proxy(bl[fname])
-    return JSONResponse(st)
+    return JSONResponse(_sanitize_json(st))
+
+
+def _sanitize_json(obj):
+    """inf / nan を None に置換して JSON シリアライズエラーを防ぐ"""
+    import math
+    if isinstance(obj, dict):
+        return {k: _sanitize_json(v) for k, v in obj.items()}
+    if isinstance(obj, list):
+        return [_sanitize_json(v) for v in obj]
+    if isinstance(obj, float) and (math.isinf(obj) or math.isnan(obj)):
+        return None
+    return obj
 
 
 @app.get('/api/top100')
