@@ -14,13 +14,48 @@ GTX 1080 Ti / ローカル対応  ─  FastAPI  port 8080
   GET  /download/log          → 学習ログ
   GET  /health                → ヘルスチェック
 """
-import io, json, os, threading, zipfile
+import io, json, os, threading, time, zipfile
 from datetime import datetime
 from pathlib import Path
 
 from fastapi import FastAPI, HTTPException
 from fastapi.middleware.cors import CORSMiddleware
 from fastapi.responses import HTMLResponse, JSONResponse, StreamingResponse, FileResponse, PlainTextResponse
+
+# ── S3 設定 (環境変数から取得) ────────────────────────────────────────────────
+_S3_ENDPOINT   = os.environ.get('S3_ENDPOINT',   '')
+_S3_BUCKET     = os.environ.get('S3_BUCKET',     '')
+_S3_PREFIX     = os.environ.get('S3_PREFIX',     'mix')
+_S3_ACCESS_KEY = os.environ.get('S3_ACCESS_KEY', '')
+_S3_SECRET_KEY = os.environ.get('S3_SECRET_KEY', '')
+_S3_REGION     = os.environ.get('S3_REGION',     'us-east-1')
+
+def _s3_public_url(key: str) -> str:
+    """S3 パブリック URL (path-style)"""
+    prefix = _S3_PREFIX.rstrip('/') + '/' if _S3_PREFIX else ''
+    return f"{_S3_ENDPOINT}/{_S3_BUCKET}/{prefix}{key}"
+
+def _s3_client_srv():
+    import boto3, urllib3
+    from botocore.config import Config
+    urllib3.disable_warnings(urllib3.exceptions.InsecureRequestWarning)
+    return boto3.client(
+        's3',
+        endpoint_url=_S3_ENDPOINT,
+        aws_access_key_id=_S3_ACCESS_KEY,
+        aws_secret_access_key=_S3_SECRET_KEY,
+        region_name=_S3_REGION,
+        config=Config(
+            signature_version='s3v4',
+            s3={'addressing_style': 'path'},
+            connect_timeout=10, read_timeout=20,
+        ),
+        verify=False,
+    )
+
+# catalog キャッシュ (S3 を毎秒叩かないよう 60秒 TTL)
+_catalog_cache: dict = {}
+_catalog_lock  = threading.Lock()
 
 WORKSPACE     = Path('/workspace')
 AI_EA_DIR     = WORKSPACE / 'ai_ea'
@@ -319,6 +354,93 @@ def health():
     return {'ok': True, 'time': datetime.now().isoformat()}
 
 
+@app.get('/api/s3_catalog')
+def api_s3_catalog():
+    """全ノードの S3 上モデル・レポート一覧を返す (60秒キャッシュ)"""
+    global _catalog_cache
+    with _catalog_lock:
+        cached = _catalog_cache
+        if cached.get('_ts', 0) + 60 > time.time():
+            return JSONResponse(cached)
+
+    if not _S3_ENDPOINT or not _S3_BUCKET:
+        return JSONResponse({'error': 'S3未設定', 'nodes': {}, 'top_global': []})
+
+    try:
+        s3     = _s3_client_srv()
+        prefix = (_S3_PREFIX.rstrip('/') + '/') if _S3_PREFIX else ''
+
+        # results_*.json から全ノードIDを列挙
+        resp     = s3.list_objects_v2(Bucket=_S3_BUCKET, Prefix=prefix + 'results_')
+        node_ids = []
+        for obj in resp.get('Contents', []):
+            fname = obj['Key'].split('/')[-1]
+            if fname.startswith('results_') and fname.endswith('.json'):
+                node_ids.append(fname[len('results_'):-len('.json')])
+
+        nodes       = {}
+        all_results = []
+
+        for nid in node_ids:
+            # results JSON をダウンロード
+            try:
+                obj     = s3.get_object(Bucket=_S3_BUCKET, Key=prefix + f'results_{nid}.json')
+                results = json.loads(obj['Body'].read())
+            except Exception:
+                results = []
+
+            # PF>0 の試行のみ、PF降順でソート
+            valid = sorted(
+                [r for r in results if r.get('pf', 0) > 0 and r.get('trades', 0) >= 200],
+                key=lambda x: x.get('pf', 0), reverse=True
+            )
+            best = valid[0] if valid else {}
+
+            # per-node rank → S3 top100 パスに対応 (PF降順インデックス)
+            for rank_idx, r in enumerate(valid[:100]):
+                r2 = dict(r)
+                r2['node_id']    = nid
+                r2['node_rank']  = rank_idx      # ノード内 rank (0-based)
+                r2['model_url']  = _s3_public_url(f'top100_{nid}/rank_{rank_idx:03d}/fx_model.onnx')
+                r2['params_url'] = _s3_public_url(f'top100_{nid}/rank_{rank_idx:03d}/norm_params.json')
+                all_results.append(r2)
+
+            nodes[nid] = {
+                'best_pf':    round(best.get('pf', 0), 4),
+                'best_trial': best.get('trial', 0),
+                'best_arch':  best.get('arch', '-'),
+                'count':      len(results),
+                'files': {
+                    'model':  _s3_public_url(f'best_{nid}/fx_model_best.onnx'),
+                    'params': _s3_public_url(f'best_{nid}/norm_params_best.json'),
+                    'result': _s3_public_url(f'best_{nid}/best_result.json'),
+                    'report': _s3_public_url(f'best_{nid}/report.html'),
+                },
+            }
+
+        # 全ノードをまたいだグローバル top 50 (PF降順)
+        top_global = sorted(all_results, key=lambda x: x.get('pf', 0), reverse=True)[:50]
+        # 不要な大きいフィールドを除去してレスポンスを軽量化
+        for r in top_global:
+            r.pop('feature_importance', None)
+
+        result = {
+            '_ts':        time.time(),
+            'updated':    datetime.now().strftime('%Y-%m-%d %H:%M:%S'),
+            'nodes':      nodes,
+            'top_global': top_global,
+        }
+        with _catalog_lock:
+            _catalog_cache = result
+        return JSONResponse(result)
+
+    except Exception as e:
+        err = {'error': str(e), 'nodes': {}, 'top_global': [], '_ts': time.time()}
+        with _catalog_lock:
+            _catalog_cache = err
+        return JSONResponse(err)
+
+
 # ─────────────────────────────────────────────────────────────────────────────
 # ダッシュボード HTML
 # ─────────────────────────────────────────────────────────────────────────────
@@ -502,6 +624,41 @@ tr:hover td{background:#1c2128}
 <div class="card" id="best-links-card" style="margin-bottom:12px;display:none">
   <h2>📥 ベストモデル ダウンロード</h2>
   <div id="best-links-body" style="font-size:.85em"></div>
+</div>
+
+<!-- 全ノード S3 ダウンロードセンター -->
+<div class="card" id="s3-catalog-card" style="margin-bottom:12px">
+  <div style="display:flex;justify-content:space-between;align-items:center;margin-bottom:10px">
+    <h2 style="margin:0">☁️ 全ノード モデル・レポート (S3)</h2>
+    <div style="display:flex;gap:8px;align-items:center">
+      <span id="s3-updated" style="font-size:.72em;color:#8b949e"></span>
+      <button class="btn btn-gray btn-sm" onclick="loadS3Catalog(true)">🔄 更新</button>
+    </div>
+  </div>
+  <!-- ノード別ベストモデル -->
+  <div id="s3-nodes-wrap" style="display:flex;flex-wrap:wrap;gap:10px;margin-bottom:14px">
+    <span style="color:#8b949e;font-size:.82em">読込中...</span>
+  </div>
+  <!-- グローバル TOP50 テーブル -->
+  <details id="s3-top-details" open>
+    <summary style="cursor:pointer;font-size:.8em;color:#8b949e;margin-bottom:8px;user-select:none">
+      ▼ グローバル TOP 50 (全ノード合算・PF降順)
+    </summary>
+    <div style="overflow-x:auto;max-height:400px;overflow-y:auto">
+      <table id="s3-top-table">
+        <thead>
+          <tr>
+            <th>#</th><th>ノード</th><th>Trial</th><th>PF</th><th>SR</th>
+            <th>純利益</th><th>取引</th><th>Arch</th><th>Hidden</th>
+            <th>モデル</th><th>パラメータ</th>
+          </tr>
+        </thead>
+        <tbody id="s3-top-tbody">
+          <tr><td colspan="11" style="text-align:center;color:#8b949e">読込中...</td></tr>
+        </tbody>
+      </table>
+    </div>
+  </details>
 </div>
 
 <!-- TOP100 テーブル -->
@@ -935,9 +1092,103 @@ async function poll() {
   if (top100Timer >= 10) { top100Timer = 0; updateTop100(); }
 }
 
+// ── S3 カタログ ─────────────────────────────────────────────────────────────
+let s3CatalogTimer = 0;
+
+async function loadS3Catalog(force=false) {
+  try {
+    const r = await fetch('/api/s3_catalog');
+    const d = await r.json();
+    if (d.error) {
+      document.getElementById('s3-nodes-wrap').innerHTML =
+        `<span style="color:#f85149;font-size:.82em">⚠ ${d.error}</span>`;
+      return;
+    }
+    document.getElementById('s3-updated').textContent = d.updated ? `更新: ${d.updated}` : '';
+
+    // ── ノード別ベストモデルカード ─────────────────────────────────────
+    const nodes = d.nodes || {};
+    const nodeKeys = Object.keys(nodes).sort();
+    if (nodeKeys.length === 0) {
+      document.getElementById('s3-nodes-wrap').innerHTML =
+        '<span style="color:#8b949e;font-size:.82em">S3 にデータなし</span>';
+    } else {
+      const pfColor = pf => pf >= 2 ? '#f0883e' : pf >= 1.5 ? '#3fb950' : pf >= 1.2 ? '#ffa657' : '#79c0ff';
+      document.getElementById('s3-nodes-wrap').innerHTML = nodeKeys.map(nid => {
+        const n = nodes[nid];
+        const f = n.files || {};
+        const pc = pfColor(n.best_pf || 0);
+        const dlLink = (url, icon, label) =>
+          `<a href="${url}" target="_blank" download
+            style="display:inline-flex;align-items:center;gap:3px;padding:4px 9px;
+                   background:#21262d;border:1px solid #30363d;border-radius:5px;
+                   color:#58a6ff;text-decoration:none;font-size:.76em">${icon} ${label}</a>`;
+        return `<div style="background:#0d1117;border:1px solid #30363d;border-radius:8px;padding:12px;min-width:220px;flex:1">
+          <div style="font-size:.72em;color:#8b949e;margin-bottom:4px">ノード</div>
+          <div style="font-size:1em;font-weight:700;color:#e3b341;margin-bottom:2px">${nid.toUpperCase()}</div>
+          <div style="font-size:.78em;color:#8b949e;margin-bottom:8px">
+            試行: ${n.count}件 &nbsp;|&nbsp; arch: ${n.best_arch||'-'}
+          </div>
+          <div style="font-size:.72em;color:#8b949e">ベスト PF</div>
+          <div style="font-size:1.5em;font-weight:700;color:${pc};margin-bottom:8px">
+            ${(n.best_pf||0).toFixed(4)}
+            <span style="font-size:.5em;color:#8b949e">trial#${n.best_trial||'-'}</span>
+          </div>
+          <div style="display:flex;flex-wrap:wrap;gap:5px">
+            ${f.model  ? dlLink(f.model,  '🧠', 'ONNX') : ''}
+            ${f.params ? dlLink(f.params, '📐', 'Params') : ''}
+            ${f.result ? dlLink(f.result, '📊', 'JSON') : ''}
+            ${f.report ? dlLink(f.report, '📈', 'Report') : ''}
+          </div>
+        </div>`;
+      }).join('');
+    }
+
+    // ── グローバル TOP50 テーブル ──────────────────────────────────────
+    const top = d.top_global || [];
+    if (top.length === 0) {
+      document.getElementById('s3-top-tbody').innerHTML =
+        '<tr><td colspan="11" style="text-align:center;color:#8b949e">データなし</td></tr>';
+    } else {
+      const pfColor = pf => pf >= 2 ? '#f0883e' : pf >= 1.5 ? '#3fb950' : pf >= 1.2 ? '#ffa657' : '#79c0ff';
+      document.getElementById('s3-top-tbody').innerHTML = top.map((r, i) => {
+        const pf  = (r.pf  || 0).toFixed(4);
+        const sr  = (r.sr  || 0).toFixed(3);
+        const pnl = r.net_pnl ? Math.round(r.net_pnl).toLocaleString() + '円' : '-';
+        const pc  = pfColor(r.pf || 0);
+        const mdl = r.model_url
+          ? `<a href="${r.model_url}" target="_blank" download
+               style="color:#58a6ff;font-size:.8em" title="ONNX DL">🧠</a>` : '-';
+        const prm = r.params_url
+          ? `<a href="${r.params_url}" target="_blank" download
+               style="color:#58a6ff;font-size:.8em" title="Params DL">📐</a>` : '-';
+        return `<tr>
+          <td style="color:#8b949e">${i+1}</td>
+          <td style="color:#e3b341;font-weight:600">${(r.node_id||'').toUpperCase()}</td>
+          <td style="color:#79c0ff">#${r.trial||'-'}</td>
+          <td style="color:${pc};font-weight:700">${pf}</td>
+          <td>${sr}</td>
+          <td>${pnl}</td>
+          <td>${r.trades||0}</td>
+          <td style="color:#e3b341">${r.arch||'-'}</td>
+          <td>${r.hidden||'-'}</td>
+          <td style="text-align:center">${mdl}</td>
+          <td style="text-align:center">${prm}</td>
+        </tr>`;
+      }).join('');
+    }
+  } catch(e) {
+    document.getElementById('s3-nodes-wrap').innerHTML =
+      `<span style="color:#f85149;font-size:.82em">⚠ 取得エラー: ${e.message}</span>`;
+  }
+}
+
 poll();
 updateTop100();
+loadS3Catalog();
 setInterval(poll, 1000);
+// S3 カタログは 60秒ごとに更新
+setInterval(() => loadS3Catalog(), 60000);
 </script>
 </body>
 </html>
