@@ -147,7 +147,9 @@ esac
 if [ "$DEVICE_TYPE" = "TPU" ]; then
     export XLA_CACHE_DIR=/workspace/xla_cache
     mkdir -p "${XLA_CACHE_DIR}"
-    export XLA_FLAGS="${XLA_FLAGS:+${XLA_FLAGS} }--xla_persistent_cache_dir=${XLA_CACHE_DIR}"
+    # XLA_FLAGS に書くと torch_xla が GPU 専用フラグを追加してTPUでFatalクラッシュする。
+    # 正しいTPU向けキャッシュ設定は XLA_PERSISTENT_CACHE_PATH 環境変数を使う。
+    export XLA_PERSISTENT_CACHE_PATH="${XLA_CACHE_DIR}"
     echo "[*] XLA キャッシュ設定: ${XLA_CACHE_DIR}"
 fi
 
