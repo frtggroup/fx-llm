@@ -27,6 +27,7 @@ script = (
     " --privileged"
     f" -e PJRT_DEVICE=TPU"
     f" -e NODE_ID=tpu_v6e"
+    f" -e TPU_NUM_DEVICES=1"
     f" -e GDRIVE_FOLDER_ID={GDRIVE_FOLDER_ID}"
     f" -e GDRIVE_OAUTH_CLIENT_ID={GDRIVE_OAUTH_CLIENT_ID}"
     f" -e GDRIVE_OAUTH_CLIENT_SECRET={GDRIVE_OAUTH_CLIENT_SECRET}"

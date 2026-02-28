@@ -374,9 +374,10 @@ def _detect_device():
     if _dt == "TPU":
         try:
             import torch_xla.core.xla_model as xm  # type: ignore
-            return xm.xla_device(), 'xla'
-        except Exception:
-            print("  [WARN] DEVICE_TYPE=TPU だが torch_xla が利用不可 — CPU にフォールバック")
+            dev = xm.xla_device()
+            return dev, 'xla'
+        except Exception as _e:
+            print(f"  [WARN] DEVICE_TYPE=TPU だが torch_xla が利用不可 ({type(_e).__name__}: {str(_e)[:150]}) — CPU にフォールバック")
             return torch.device('cpu'), 'cpu'
 
     # DEVICE_TYPE 未設定 (直接 python 起動など): 従来通りの自動検出
