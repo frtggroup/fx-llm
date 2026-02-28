@@ -1493,34 +1493,37 @@ def save_checkpoint(results: list, best_pf: float) -> None:
 
         if REMOTE_ENABLED():
             tag = 'GDrive' if GDRIVE_ENABLED else 'S3'
-            # 軽量ファイル (結果JSON / best / meta) は同期でアップロード
-            ok = 0
-            if remote_upload(CHECKPOINT_DIR / own_key, own_key): ok += 1
-            if remote_upload(CHECKPOINT_DIR / meta_name, meta_name): ok += 1
-            for name in [f'best_{NODE_ID}/fx_model_best.onnx',
-                         f'best_{NODE_ID}/norm_params_best.json',
-                         f'best_{NODE_ID}/best_result.json']:
-                p = CHECKPOINT_DIR / name
-                if p.exists() and remote_upload(p, name): ok += 1
+            # 全リモートアップロードをバックグラウンドスレッドで実行
+            # → メインループ (write_progress等) を一切ブロックしない
+            _own_key_snap   = own_key
+            _meta_name_snap = meta_name
+            _top_dst_snap   = top_dst
+            _node_id_snap   = NODE_ID
 
-            # top100 (大量ファイル) はバックグラウンドスレッドで差分のみアップロード
-            # → メインループをブロックしない
-            def _upload_top100_bg(top_dst=top_dst):
+            def _upload_all_bg(own_key=_own_key_snap, meta_name=_meta_name_snap,
+                               top_dst=_top_dst_snap, node_id=_node_id_snap):
+                ok = 0
+                if remote_upload(CHECKPOINT_DIR / own_key, own_key): ok += 1
+                if remote_upload(CHECKPOINT_DIR / meta_name, meta_name): ok += 1
+                for name in [f'best_{node_id}/fx_model_best.onnx',
+                             f'best_{node_id}/norm_params_best.json',
+                             f'best_{node_id}/best_result.json']:
+                    p = CHECKPOINT_DIR / name
+                    if p.exists() and remote_upload(p, name): ok += 1
+
                 top100_ok = 0
-                if not top_dst.exists():
-                    return
-                for f in top_dst.rglob('*'):
-                    if not f.is_file():
-                        continue
-                    rel = f'top100_{NODE_ID}/{f.relative_to(top_dst)}'.replace('\\', '/')
-                    if remote_upload(f, rel):
-                        top100_ok += 1
-                if top100_ok:
-                    print(f'  [{tag}]  top100アップロード完了 ({top100_ok}件)')
+                if top_dst.exists():
+                    for f in top_dst.rglob('*'):
+                        if not f.is_file():
+                            continue
+                        rel = f'top100_{node_id}/{f.relative_to(top_dst)}'.replace('\\', '/')
+                        if remote_upload(f, rel):
+                            top100_ok += 1
+                print(f'  [{tag}]  BG アップロード完了 node={node_id} ({ok}件 + top100:{top100_ok}件)')
 
             import threading
-            threading.Thread(target=_upload_top100_bg, daemon=True).start()
-            print(f'  [{tag}]  アップロード完了 node={NODE_ID} ({ok}件 + top100:BG)')
+            threading.Thread(target=_upload_all_bg, daemon=True).start()
+            print(f'  [{tag}]  バックグラウンドアップロード開始 node={NODE_ID}')
         else:
             print(f'  [CKPT] リモートストレージ未設定 → ローカルのみ保存 ({CHECKPOINT_DIR})')
     except Exception as e:

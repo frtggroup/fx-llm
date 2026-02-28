@@ -140,30 +140,46 @@ def _find_file(folder_id: str, name: str) -> Optional[str]:
     return files[0]['id'] if files else None
 
 
-def upload(local_path: Path, rel_key: str) -> bool:
+def upload(local_path: Path, rel_key: str, timeout: float = 120.0) -> bool:
     """
-    local_path のファイルを GDrive の rel_key に同期アップロード。
+    local_path のファイルを GDrive の rel_key にアップロード。
     既存ファイルがあれば上書き (update)、なければ新規作成。
+    timeout 秒以内に完了しない場合は False を返す (メインループのブロック防止)。
     Returns True on success.
     """
     if not GDRIVE_ENABLED:
         return False
-    try:
-        from googleapiclient.http import MediaFileUpload
-        svc = _svc()
-        folder_id, fname = _resolve_folder(rel_key)
-        mime = _guess_mime(fname)
-        media = MediaFileUpload(str(local_path), mimetype=mime, resumable=False)
-        existing_id = _find_file(folder_id, fname)
-        if existing_id:
-            svc.files().update(fileId=existing_id, media_body=media).execute()
-        else:
-            meta = {'name': fname, 'parents': [folder_id]}
-            svc.files().create(body=meta, media_body=media, fields='id').execute()
-        return True
-    except Exception as e:
-        print(f'  [GDrive] upload失敗 {rel_key}: {e}')
+
+    result = [False]
+    error  = [None]
+
+    def _do_upload():
+        try:
+            from googleapiclient.http import MediaFileUpload
+            svc = _svc()
+            folder_id, fname = _resolve_folder(rel_key)
+            mime = _guess_mime(fname)
+            media = MediaFileUpload(str(local_path), mimetype=mime, resumable=False)
+            existing_id = _find_file(folder_id, fname)
+            if existing_id:
+                svc.files().update(fileId=existing_id, media_body=media).execute()
+            else:
+                meta = {'name': fname, 'parents': [folder_id]}
+                svc.files().create(body=meta, media_body=media, fields='id').execute()
+            result[0] = True
+        except Exception as e:
+            error[0] = e
+
+    t = threading.Thread(target=_do_upload, daemon=True)
+    t.start()
+    t.join(timeout)
+    if t.is_alive():
+        print(f'  [GDrive] upload タイムアウト ({timeout:.0f}s): {rel_key}')
         return False
+    if error[0]:
+        print(f'  [GDrive] upload失敗 {rel_key}: {error[0]}')
+        return False
+    return result[0]
 
 
 def download(rel_key: str, local_path: Path, timeout: float = 60.0) -> bool:
