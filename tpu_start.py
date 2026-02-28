@@ -1,7 +1,7 @@
 """
 TPU VM 起動スクリプト
-  - v6e-1 スポット VM を複数ゾーンで試行作成
-  - Docker CE インストール & frtggroup/fx-ea-v2 コンテナ起動
+  - v5e-4 スポット VM を複数ゾーンで試行作成
+  - Docker CE インストール & frtgroup/fx-ea コンテナ起動
   - 3時間後に自動で VM を停止・削除
   - Ctrl+C でも即時削除可能
 
@@ -16,22 +16,23 @@ from pathlib import Path
 
 # ── 設定 ──────────────────────────────────────────────────────────────────────
 DOCKER_IMAGE  = "frtgroup/fx-ea:latest"
-VM_NAME       = "fx-ea-tpu-v6e"
-ACCEL_TYPE    = "v6e-4"
-TPU_VERSION   = "v2-alpha-tpuv6e"
+VM_NAME       = "fx-ea-tpu-v5e"
+ACCEL_TYPE    = "v5litepod-4"
+TPU_VERSION   = "v2-alpha-tpuv5-lite"
 PROJECT       = "project-c7a2ed3f-0395-4b76-967"
 SSH_KEY       = str(Path.home() / ".ssh" / "google_compute_engine")
 SSH_USER      = "yu"
 AUTO_DELETE_H = 3   # デフォルト自動削除時間 (時間)
 
-# v6e-4 が利用可能なゾーン候補 (空き率が高い順)
+# v5e-4 (v5litepod-4) が利用可能なゾーン候補
 ZONES = [
-    "us-central1-b",
-    "us-central1-a",
-    "us-central1-c",
+    "us-east1-c",
+    "us-east1-d",
     "us-east5-a",
-    "us-east5-b",
-    "us-east5-c",
+    "us-central1-a",
+    "us-central1-b",
+    "us-central1-c",
+    "us-west4-a",
     "europe-west4-a",
     "europe-west4-b",
 ]
@@ -205,8 +206,8 @@ sudo docker run -d \\
   --restart=unless-stopped \\
   -e PJRT_DEVICE=TPU \\
   -e TPU_NUM_DEVICES=4 \\
-  -e TPU_ACCELERATOR_TYPE=v6e-4 \\
-  -e MAX_PARALLEL=1 \\
+  -e TPU_ACCELERATOR_TYPE=v5e-4 \\
+  -e MAX_PARALLEL=4 \\
   {image}
 
 sleep 8

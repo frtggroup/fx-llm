@@ -120,11 +120,7 @@ def set_seed(seed):
     torch.manual_seed(seed)
     if torch.cuda.is_available():
         torch.cuda.manual_seed_all(seed)
-    try:
-        import torch_xla.core.xla_model as xm  # type: ignore
-        xm.set_rng_state(torch.manual_seed(seed).get_state()[:])
-    except Exception:
-        pass
+    # XLA RNG: xmp.spawn前に xm を呼ぶと "Runtime already initialized" エラー → スキップ
 
 
 # ─── データ準備 ────────────────────────────────────────────────────────────
@@ -478,7 +474,9 @@ def train(args, X_tr, y_tr, X_te, y_te, mean, std, n_feat=None, _spawn_rank=None
     _is_tpu_env = os.environ.get('DEVICE_TYPE', '').upper() == 'TPU'
     _n_dev = _spmd_n_dev if _spmd_n_dev is not None else (
         int(os.environ.get('TPU_NUM_DEVICES', '1')) if _is_tpu_env else 1)
-    if _spawn_rank is None and _is_tpu_env and _n_dev > 1:
+    # xmp.spawn は subprocess.Popen 経由では使用不可 (XLA二重init問題)
+    # → MAX_PARALLEL=4 で各サブプロセスが xla:0 で独立学習 (1チップ×4並列)
+    if False and _spawn_rank is None and _is_tpu_env and _n_dev > 1:
         return _dispatch_spmd(args, X_tr, y_tr, X_te, y_te, mean, std, n_feat, _n_dev)
 
     _spmd_mode = _spawn_rank is not None   # xmp.spawn ワーカー内

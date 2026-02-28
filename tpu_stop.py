@@ -10,13 +10,15 @@ TPU VM 停止・削除スクリプト
 import subprocess, sys, argparse
 from pathlib import Path
 
-VM_NAME  = "fx-ea-tpu-v6e"
+VM_NAME  = "fx-ea-tpu-v5e"
 PROJECT  = "project-c7a2ed3f-0395-4b76-967"
 SSH_KEY  = str(Path.home() / ".ssh" / "google_compute_engine")
 SSH_USER = "yu"
 ZONES    = [
-    "us-central1-b", "us-central1-a", "us-central1-c",
+    "us-east1-c", "us-east1-d",
     "us-east5-a", "us-east5-b", "us-east5-c",
+    "us-central1-a", "us-central1-b", "us-central1-c",
+    "us-west4-a",
     "europe-west4-a", "europe-west4-b",
 ]
 

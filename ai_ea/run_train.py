@@ -1280,6 +1280,9 @@ class ParallelTrainer:
     def __init__(self):
         self.running: dict = {}   # trial_no -> {proc, params, start_time, trial_dir, log_fh}
         self.lock = threading.Lock()
+        # TPU チップ割り当て: TPU_NUM_DEVICES 枚のチップをラウンドロビンで分配
+        self._tpu_num_devices = int(os.environ.get('TPU_NUM_DEVICES', '1'))
+        self._tpu_slot_counter = 0  # ラウンドロビン用カウンタ
 
     def launch(self, trial_no: int, params: dict, best_pf: float, start_time: float,
                strategy: str = 'random'):
@@ -1300,8 +1303,20 @@ class ParallelTrainer:
         # start_new_session=True でプロセスグループを分離し、kill 時に子孫まで全終了できるようにする
         _popen_extra = {'start_new_session': True} if platform.system() != 'Windows' else {}
 
+        # TPU: 各サブプロセスに異なるチップを割り当て (ラウンドロビン)
+        # PJRT_LOCAL_PROCESS_RANK + TPU_VISIBLE_DEVICES で /dev/vfio/N の競合を防ぐ
+        env = os.environ.copy()
+        if _TPU_AVAILABLE and self._tpu_num_devices > 1:
+            rank = self._tpu_slot_counter % self._tpu_num_devices
+            self._tpu_slot_counter += 1
+            env['PJRT_LOCAL_PROCESS_RANK'] = str(rank)
+            env['LOCAL_RANK'] = str(rank)
+            # サブプロセスはチップ1枚のみ使用 (xmp.spawn は呼ばない)
+            env['TPU_NUM_DEVICES'] = '1'
+            env['TPU_VISIBLE_DEVICES'] = str(rank)
+
         proc = subprocess.Popen(cmd, stdout=log_fh, stderr=subprocess.STDOUT,
-                                **_popen_extra)
+                                env=env, **_popen_extra)
 
         with self.lock:
             self.running[trial_no] = {
