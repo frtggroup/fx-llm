@@ -218,6 +218,11 @@ def _gpu_stats() -> dict:
                 return {'gpu_pct': 0, 'vram_used_gb': used, 'vram_total_gb': total, 'gpu_name': name}
         except Exception:
             pass
+        _tpu_type = os.environ.get('TPU_ACCELERATOR_TYPE', '')
+        _dev_type = os.environ.get('DEVICE_TYPE', '').upper()
+        if _dev_type == 'TPU':
+            _name = f"TPU {_tpu_type}" if _tpu_type else "TPU"
+            return {'gpu_pct': 0, 'vram_used_gb': 0, 'vram_total_gb': 0, 'gpu_name': _name}
         return {'gpu_pct': 0, 'vram_used_gb': 0, 'vram_total_gb': 11, 'gpu_name': 'GTX 1080 Ti'}
 
 
