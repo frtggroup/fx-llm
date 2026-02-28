@@ -173,26 +173,22 @@ def _auto_gpu_config(node_id: str) -> tuple[str, float, float, int]:
 
     Returns: (tier, total_mem_gb, vram_per_trial_gb, max_parallel)
     """
-    # TPU 検出
-    if node_id.startswith('tpu'):
-        try:
-            import torch_xla.core.xla_model as xm  # type: ignore
-            # TPU v4/v5 は 1チップあたり 32 GB HBM
-            # Trillium (v6e) は 1チップあたり 32 GB
-            num_devices = int(os.environ.get('TPU_NUM_DEVICES', '4'))
-            mem_per_chip = {
-                'tpu_v3': 16.0, 'tpu_v4': 32.0,
-                'tpu_v5e': 16.0, 'tpu_v5p': 95.0,
-                'tpu_trillium': 32.0,
-                'tpu_v6e': 32.0,   # Trillium (v6e) = 32 GB HBM/chip
-            }.get(node_id, 32.0)
-            total_gb = mem_per_chip * num_devices
-            # TPU は並列度を 1チップ = 1試行 として計算
-            vpt = mem_per_chip * 0.75
-            par = max(1, num_devices)
-            return 'tpu', total_gb, vpt, par
-        except Exception:
-            pass
+    # TPU 検出 (torch_xla は import しない — PJRT 初期化を避けてサブプロセスに譲る)
+    # 親プロセスで torch_xla を初期化すると PJRT クライアントが占有され、
+    # サブプロセスが xm.xla_device() を呼ぶと "Failed to connect" で失敗する
+    if node_id.startswith('tpu') and os.environ.get('DEVICE_TYPE', '').upper() == 'TPU':
+        num_devices = int(os.environ.get('TPU_NUM_DEVICES', '1'))  # v6e-1 = 1チップ
+        mem_per_chip = {
+            'tpu_v3': 16.0, 'tpu_v4': 32.0,
+            'tpu_v5e': 16.0, 'tpu_v5p': 95.0,
+            'tpu_trillium': 32.0,
+            'tpu_v6e': 32.0,   # Trillium (v6e) = 32 GB HBM/chip
+        }.get(node_id, 32.0)
+        total_gb = mem_per_chip * num_devices
+        vpt = mem_per_chip * 0.75
+        # v6e-1 は 1チップ → 並列数 1 (1プロセスだけがTPUを占有できる)
+        par = max(1, num_devices)
+        return 'tpu', total_gb, vpt, par
 
     # entrypoint.sh が export した GPU_VRAM を最優先で使用（torch_xla 干渉を回避）
     total_gb = 0.0
@@ -258,14 +254,11 @@ def _get_gpu_display_name() -> str:
             return torch.cuda.get_device_name(0)
     except Exception:
         pass
-    # TPU チェック
-    try:
-        import torch_xla.core.xla_model as xm  # type: ignore
+    # TPU チェック (import なし — PJRT 占有を避ける)
+    if os.environ.get('DEVICE_TYPE', '').upper() == 'TPU':
         tpu_type = os.environ.get('TPU_ACCELERATOR_TYPE',
                    os.environ.get('TPU_NAME', 'TPU'))
         return f"TPU ({tpu_type})"
-    except Exception:
-        pass
     return "CPU (no GPU)"
 
 GPU_NAME = _get_gpu_display_name()
@@ -285,11 +278,9 @@ else:
     except Exception:
         _CUDA_AVAILABLE = False
 
-try:
-    import torch_xla.core.xla_model as _xm  # type: ignore
-    _TPU_AVAILABLE = (_device_type_env == "TPU")
-except Exception:
-    _TPU_AVAILABLE = False
+# torch_xla は親プロセスで import しない: PJRT 接続を占有しないためサブプロセスに譲る
+# 代わりに環境変数 DEVICE_TYPE=TPU だけで判定する
+_TPU_AVAILABLE = (_device_type_env == "TPU")
 
 if not _CUDA_AVAILABLE and not _TPU_AVAILABLE:
     print("[WARN] ⚠ CUDA/TPU が利用できません。CPU モードで実行します。")
