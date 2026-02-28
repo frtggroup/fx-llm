@@ -58,6 +58,51 @@ def _s3_client_srv():
 _catalog_cache: dict = {}
 _catalog_lock  = threading.Lock()
 
+# ── S3 ヘルパー ────────────────────────────────────────────────────────────────
+
+def _s3_get_bytes(rel_key: str) -> bytes | None:
+    """S3 からファイルを取得して bytes を返す。失敗時は None。"""
+    if not _S3_ENDPOINT or not _S3_BUCKET:
+        return None
+    try:
+        s3     = _s3_client_srv()
+        prefix = (_S3_PREFIX.rstrip('/') + '/') if _S3_PREFIX else ''
+        obj    = s3.get_object(Bucket=_S3_BUCKET, Key=prefix + rel_key)
+        return obj['Body'].read()
+    except Exception:
+        return None
+
+
+def _s3_node_ids(results: list) -> list:
+    """all_results から node_id 一覧を順番に返す。"""
+    seen: set = set()
+    nodes: list = []
+    for r in results:
+        nid = r.get('node_id', '')
+        if nid and nid not in seen:
+            seen.add(nid)
+            nodes.append(nid)
+    return nodes
+
+
+def _s3_fetch_rank_file(global_rank: int, fname: str, node_ids: list) -> bytes | None:
+    """top100_{node_id}/rank_{global_rank:03d}/{fname} を各ノードで順に試す。"""
+    for nid in node_ids:
+        data = _s3_get_bytes(f'top100_{nid}/rank_{global_rank:03d}/{fname}')
+        if data is not None:
+            return data
+    return None
+
+
+def _s3_trial_rank(results: list, trial_no: int) -> int:
+    """all_results から指定 trial の全体ランク (1始まり, 100超なら 0)。"""
+    valid   = [r for r in results if r.get('pf', 0) > 0 and r.get('trades', 0) >= 200]
+    top100  = sorted(valid, key=lambda x: -x['pf'])[:100]
+    for i, r in enumerate(top100):
+        if r.get('trial') == trial_no:
+            return i + 1
+    return 0
+
 WORKSPACE      = Path('/workspace')
 AI_EA_DIR      = WORKSPACE / 'ai_ea'
 PROGRESS_JSON  = AI_EA_DIR / 'progress.json'
@@ -244,15 +289,20 @@ def _get_top_n(n: int = 100) -> list:
         valid   = [r for r in results
                    if r.get('pf', 0) > 0 and r.get('trades', 0) >= 200]
         top     = sorted(valid, key=lambda x: -x['pf'])[:n]
+        s3_ok    = bool(_S3_ENDPOINT and _S3_BUCKET)
+        s3_nodes = _s3_node_ids(results) if s3_ok else []
         for i, r in enumerate(top):
             rank     = i + 1
             trial_no = r.get('trial', 0)
             r['rank']       = rank
             rank_dir        = TOP_DIR / f'rank_{rank:03d}'
             model_dir       = _find_model_dir(rank, trial_no)
-            r['has_model']  = model_dir is not None
-            r['has_report'] = (rank_dir / 'report.html').exists() or (
+            local_model  = model_dir is not None
+            local_report = (rank_dir / 'report.html').exists() or (
                 model_dir is not None and (model_dir / 'report.html').exists())
+            # S3 フォールバック: top100_{node_id}/rank_{global_rank:03d}/ に格納済み
+            r['has_model']  = local_model  or (s3_ok and bool(s3_nodes))
+            r['has_report'] = local_report or (s3_ok and bool(s3_nodes))
             # 特徴量重要度: all_results.json → rank_dir/result.json の順に取得
             imp = r.get('feature_importance')
             if not imp:
@@ -380,6 +430,18 @@ def get_report(trial_no: int):
     rp = trial_dir / 'report.html'
     if rp.exists():
         return HTMLResponse(rp.read_text(encoding='utf-8'))
+    # S3 フォールバック: global rank を使って top100_{node_id}/rank_{rank:03d}/ を参照
+    if _S3_ENDPOINT and _S3_BUCKET:
+        try:
+            results    = json.loads(ALL_RESULTS.read_text(encoding='utf-8'))
+            glob_rank  = _s3_trial_rank(results, trial_no)
+            if glob_rank > 0:
+                s3_nodes = _s3_node_ids(results)
+                data = _s3_fetch_rank_file(glob_rank, 'report.html', s3_nodes)
+                if data is not None:
+                    return HTMLResponse(data.decode('utf-8', errors='replace'))
+        except Exception:
+            pass
     raise HTTPException(404, f'試行 #{trial_no} のレポートがまだ生成されていません')
 
 
@@ -396,13 +458,31 @@ def download_model(rank: int):
     except Exception:
         pass
     model_dir = _find_model_dir(rank, trial_no)
-    if model_dir is None:
-        raise HTTPException(404, f'rank {rank} のモデルがまだ生成されていません (ONNX未出力 or PF<1.2)')
     buf = io.BytesIO()
     with zipfile.ZipFile(buf, 'w', zipfile.ZIP_DEFLATED) as zf:
-        for f in sorted(model_dir.iterdir()):
-            if f.suffix in ('.onnx', '.json'):
-                zf.write(f, f.name)
+        if model_dir is not None:
+            # ローカルにある場合: .onnx + .json + report.html を ZIP
+            for f in sorted(model_dir.iterdir()):
+                if f.suffix in ('.onnx', '.json') or f.name == 'report.html':
+                    zf.write(f, f.name)
+        elif _S3_ENDPOINT and _S3_BUCKET:
+            # S3 フォールバック: top100_{node_id}/rank_{global_rank:03d}/ から取得
+            # 各ノードが全ノードのマージ top100 をアップロードするため rank = global rank
+            try:
+                results  = json.loads(ALL_RESULTS.read_text(encoding='utf-8'))
+                s3_nodes = _s3_node_ids(results)
+            except Exception:
+                s3_nodes = []
+            found = False
+            for fname in ('fx_model.onnx', 'norm_params.json', 'report.html'):
+                data = _s3_fetch_rank_file(rank, fname, s3_nodes)
+                if data is not None:
+                    zf.writestr(fname, data)
+                    found = True
+            if not found:
+                raise HTTPException(404, f'rank {rank} のモデルが S3 にもありません')
+        else:
+            raise HTTPException(404, f'rank {rank} のモデルがまだ生成されていません (ONNX未出力 or PF<1.2)')
     buf.seek(0)
     return StreamingResponse(
         buf, media_type='application/zip',
