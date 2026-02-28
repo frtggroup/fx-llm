@@ -573,7 +573,7 @@ TRIAL_TIMEOUT = _TIER_TIMEOUT[_GPU_TIER]
 _is_tpu_env = (os.environ.get('DEVICE_TYPE', '').upper() == 'TPU'
                or os.environ.get('PJRT_DEVICE', '').upper() == 'TPU')
 EP_STALL_INIT_SEC  = 900 if _is_tpu_env else 600   # TPU:15分 / GPU:10分 (初期化・モデルコンパイル猶予)
-EP_STALL_TRAIN_SEC = 600 if _is_tpu_env else 120   # TPU:10分 / GPU:2分 (学習進捗なし→ハング判定)
+EP_STALL_TRAIN_SEC = 120   # TPU/GPU共通: 2分 (初期化後にエポックが進まなければハング判定)
 
 
 def _kill_with_group(pid_or_proc):
