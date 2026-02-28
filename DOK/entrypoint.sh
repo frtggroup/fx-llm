@@ -251,8 +251,11 @@ echo "[*] 並列ランダムサーチ開始"
 echo "    ダッシュボード: http://0.0.0.0:${DASHBOARD_PORT}"
 echo ""
 
+_STOP_REQUESTED=0
+
 _graceful_stop() {
     echo "[*] 停止シグナル受信..."
+    _STOP_REQUESTED=1
     [ -n "$TRAIN_PID" ] && kill -0 "$TRAIN_PID" 2>/dev/null && kill -TERM "$TRAIN_PID"
     sleep 5
     [ -n "$TRAIN_PID" ] && kill -0 "$TRAIN_PID" 2>/dev/null && kill -KILL "$TRAIN_PID" || true
@@ -260,14 +263,31 @@ _graceful_stop() {
 }
 trap '_graceful_stop' SIGTERM SIGINT
 
-python /workspace/ai_ea/run_train.py 2>&1 | tee /workspace/train_run.log &
-TRAIN_PID=$!
-wait $TRAIN_PID
-EXIT_CODE=$?
+# ── 自動再起動ループ ──────────────────────────────────────────────────────────
+# run_train.py がクラッシュしても自動復旧する。stop.flag があれば再起動しない。
+RESTART_COUNT=0
+while true; do
+    python /workspace/ai_ea/run_train.py 2>&1 | tee -a /workspace/train_run.log &
+    TRAIN_PID=$!
+    wait $TRAIN_PID
+    EXIT_CODE=$?
 
-[ $EXIT_CODE -eq 0 ] \
-  && echo "===== 学習完了 | ダッシュボード: http://0.0.0.0:${DASHBOARD_PORT} =====" \
-  || echo "[ERROR] 学習終了 (exit=${EXIT_CODE}) | ログ: /workspace/train_run.log"
+    # stop.flag または SIGTERM/SIGINT があれば終了
+    if [ "$_STOP_REQUESTED" -eq 1 ] || [ -f /workspace/stop.flag ]; then
+        echo "===== 学習完了 | ダッシュボード: http://0.0.0.0:${DASHBOARD_PORT} ====="
+        break
+    fi
+
+    # 正常終了も終了
+    if [ $EXIT_CODE -eq 0 ]; then
+        echo "===== 学習完了 | ダッシュボード: http://0.0.0.0:${DASHBOARD_PORT} ====="
+        break
+    fi
+
+    RESTART_COUNT=$((RESTART_COUNT + 1))
+    echo "[RESTART #${RESTART_COUNT}] run_train.py 異常終了 (exit=${EXIT_CODE}) → 5秒後に再起動..."
+    sleep 5
+done
 
 echo "[*] コンテナ待機中..."
 wait

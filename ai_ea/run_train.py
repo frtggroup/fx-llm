@@ -9,6 +9,10 @@ FX AI EA 自動トレーニング v8 - ハイブリッド遺伝的アルゴリ�
 import os, subprocess, sys, json, shutil, time, random, threading, signal, platform
 from pathlib import Path
 
+# GDrive/S3 バックグラウンドアップロードの同時実行を1に制限
+# (並列スレッドが Google API C ライブラリを同時呼び出すとヒープ破壊が発生するため)
+_remote_upload_sem = threading.Semaphore(1)
+
 sys.path.insert(0, str(Path(__file__).parent))
 from feature_sets import FEATURE_SETS
 
@@ -1628,26 +1632,26 @@ def save_checkpoint(results: list, best_pf: float) -> None:
 
             def _upload_all_bg(own_key=_own_key_snap, meta_name=_meta_name_snap,
                                top_dst=_top_dst_snap, node_id=_node_id_snap):
-                ok = 0
-                if remote_upload(CHECKPOINT_DIR / own_key, own_key): ok += 1
-                if remote_upload(CHECKPOINT_DIR / meta_name, meta_name): ok += 1
-                for name in [f'best_{node_id}/fx_model_best.onnx',
-                             f'best_{node_id}/norm_params_best.json',
-                             f'best_{node_id}/best_result.json']:
-                    p = CHECKPOINT_DIR / name
-                    if p.exists() and remote_upload(p, name): ok += 1
+                with _remote_upload_sem:   # 同時実行を1スレッドに制限
+                    ok = 0
+                    if remote_upload(CHECKPOINT_DIR / own_key, own_key): ok += 1
+                    if remote_upload(CHECKPOINT_DIR / meta_name, meta_name): ok += 1
+                    for name in [f'best_{node_id}/fx_model_best.onnx',
+                                 f'best_{node_id}/norm_params_best.json',
+                                 f'best_{node_id}/best_result.json']:
+                        p = CHECKPOINT_DIR / name
+                        if p.exists() and remote_upload(p, name): ok += 1
 
-                top100_ok = 0
-                if top_dst.exists():
-                    for f in top_dst.rglob('*'):
-                        if not f.is_file():
-                            continue
-                        rel = f'top100_{node_id}/{f.relative_to(top_dst)}'.replace('\\', '/')
-                        if remote_upload(f, rel):
-                            top100_ok += 1
-                print(f'  [{tag}]  BG アップロード完了 node={node_id} ({ok}件 + top100:{top100_ok}件)')
+                    top100_ok = 0
+                    if top_dst.exists():
+                        for f in top_dst.rglob('*'):
+                            if not f.is_file():
+                                continue
+                            rel = f'top100_{node_id}/{f.relative_to(top_dst)}'.replace('\\', '/')
+                            if remote_upload(f, rel):
+                                top100_ok += 1
+                    print(f'  [{tag}]  BG アップロード完了 node={node_id} ({ok}件 + top100:{top100_ok}件)')
 
-            import threading
             threading.Thread(target=_upload_all_bg, daemon=True).start()
             print(f'  [{tag}]  バックグラウンドアップロード開始 node={NODE_ID}')
         else:
@@ -2168,49 +2172,46 @@ def main():
                     _trial_dir_snap = info['trial_dir']
                     def _share_best(pf_snap=_best_pf_snap, tno_snap=_tno_snap,
                                     trial_dir=_trial_dir_snap):
-                        links = {}
-                        # ベストモデルファイル
-                        upload_targets = [
-                            (BEST_ONNX, f'best_{NODE_ID}/fx_model_best.onnx'),
-                            (BEST_NORM, f'best_{NODE_ID}/norm_params_best.json'),
-                            (BEST_JSON, f'best_{NODE_ID}/best_result.json'),
-                        ]
-                        # レポートHTML (trial_dir/report.html を best_<NODE_ID>/report.html に)
-                        report_src = trial_dir / 'report.html'
-                        if not report_src.exists():
-                            # top_cache にある場合
-                            report_src = TOP_CACHE_DIR / f'trial_{tno_snap:06d}' / 'report.html'
-                        if report_src.exists():
-                            upload_targets.append(
-                                (report_src, f'best_{NODE_ID}/report.html'))
+                        with _remote_upload_sem:   # 同時実行を1スレッドに制限 (ヒープ破壊防止)
+                            links = {}
+                            upload_targets = [
+                                (BEST_ONNX, f'best_{NODE_ID}/fx_model_best.onnx'),
+                                (BEST_NORM, f'best_{NODE_ID}/norm_params_best.json'),
+                                (BEST_JSON, f'best_{NODE_ID}/best_result.json'),
+                            ]
+                            report_src = trial_dir / 'report.html'
+                            if not report_src.exists():
+                                report_src = TOP_CACHE_DIR / f'trial_{tno_snap:06d}' / 'report.html'
+                            if report_src.exists():
+                                upload_targets.append(
+                                    (report_src, f'best_{NODE_ID}/report.html'))
 
-                        for local_p, key in upload_targets:
-                            if not local_p.exists():
-                                continue
-                            # S3優先でアップロード (バケットポリシーで期限なし直接URL)
-                            if S3_ENABLED:
-                                s3_ensure_public_policy()
-                                if s3_upload(local_p, key):
-                                    links[local_p.name] = s3_public_url(key)
-                            elif GDRIVE_ENABLED:
-                                url = _gdrive.upload_and_share(local_p, key)
-                                if url:
-                                    links[local_p.name] = url
+                            for local_p, key in upload_targets:
+                                if not local_p.exists():
+                                    continue
+                                if S3_ENABLED:
+                                    s3_ensure_public_policy()
+                                    if s3_upload(local_p, key):
+                                        links[local_p.name] = s3_public_url(key)
+                                elif GDRIVE_ENABLED:
+                                    url = _gdrive.upload_and_share(local_p, key)
+                                    if url:
+                                        links[local_p.name] = url
 
-                        if links:
-                            links['pf']         = pf_snap
-                            links['node_id']    = NODE_ID
-                            links['trial']      = tno_snap
-                            links['updated_at'] = time.strftime('%Y-%m-%d %H:%M:%S')
-                            links['storage']    = 'S3' if S3_ENABLED else 'GDrive'
-                            try:
-                                BEST_LINKS.write_text(
-                                    json.dumps(links, ensure_ascii=False, indent=2),
-                                    encoding='utf-8')
-                                tag = links['storage']
-                                print(f"  [{tag}] DLリンク更新: {[k for k in links if '.' in k]}")
-                            except Exception as _e:
-                                print(f"  [REMOTE] リンク保存失敗: {_e}")
+                            if links:
+                                links['pf']         = pf_snap
+                                links['node_id']    = NODE_ID
+                                links['trial']      = tno_snap
+                                links['updated_at'] = time.strftime('%Y-%m-%d %H:%M:%S')
+                                links['storage']    = 'S3' if S3_ENABLED else 'GDrive'
+                                try:
+                                    BEST_LINKS.write_text(
+                                        json.dumps(links, ensure_ascii=False, indent=2),
+                                        encoding='utf-8')
+                                    tag = links['storage']
+                                    print(f"  [{tag}] DLリンク更新: {[k for k in links if '.' in k]}")
+                                except Exception as _e:
+                                    print(f"  [REMOTE] リンク保存失敗: {_e}")
                     threading.Thread(target=_share_best, daemon=True).start()
             else:
                 print(f"  [DONE] 試行#{tno:4d}  PF={pf:.4f}  SR={sr:.3f}  "
