@@ -309,23 +309,29 @@ PYEOF
 _xla_cache_download() {
     [ "$DEVICE_TYPE" != "TPU" ] && return 0
     [ -z "$S3_ENDPOINT" ] && return 0
-    echo "[*] XLA キャッシュを S3 から復元中..."
+    echo "[*] XLA キャッシュを S3 から復元中 (並列16スレッド)..."
     python3 - <<'PYEOF'
-import os, sys, pathlib
+import os, pathlib
+from concurrent.futures import ThreadPoolExecutor, as_completed
 try:
     import boto3, urllib3
     urllib3.disable_warnings()
     cache_dir = pathlib.Path(os.environ.get('XLA_CACHE_DIR', '/workspace/xla_cache'))
     cache_dir.mkdir(parents=True, exist_ok=True)
-    s3 = boto3.client('s3',
-        endpoint_url=os.environ.get('S3_ENDPOINT', ''),
-        aws_access_key_id=os.environ.get('S3_ACCESS_KEY', ''),
-        aws_secret_access_key=os.environ.get('S3_SECRET_KEY', ''),
-        verify=False)
     bucket    = os.environ.get('S3_BUCKET',  'fxea')
     s3_prefix = os.environ.get('S3_PREFIX',  'mix') + '/xla_cache/'
+
+    def make_client():
+        return boto3.client('s3',
+            endpoint_url=os.environ.get('S3_ENDPOINT', ''),
+            aws_access_key_id=os.environ.get('S3_ACCESS_KEY', ''),
+            aws_secret_access_key=os.environ.get('S3_SECRET_KEY', ''),
+            verify=False)
+
+    # ファイル一覧を取得
+    s3 = make_client()
     paginator = s3.get_paginator('list_objects_v2')
-    count = 0
+    tasks = []
     for page in paginator.paginate(Bucket=bucket, Prefix=s3_prefix):
         for obj in page.get('Contents', []):
             key = obj['Key']
@@ -333,13 +339,33 @@ try:
             if not rel:
                 continue
             dst = cache_dir / rel
-            dst.parent.mkdir(parents=True, exist_ok=True)
-            s3.download_file(bucket, key, str(dst))
-            count += 1
-    if count:
-        print(f'[OK] XLA キャッシュ復元: {count}件')
+            # 既存ファイルはスキップ (サイズ一致チェック)
+            if dst.exists() and dst.stat().st_size == obj['Size']:
+                continue
+            tasks.append((key, dst, obj['Size']))
+
+    if not tasks:
+        print(f'[OK] XLA キャッシュ: 全ファイル既存またはS3未存在 (スキップ)')
     else:
-        print('[INFO] XLA キャッシュ: S3 にまだ存在しません (初回)')
+        print(f'[*] XLA キャッシュ: {len(tasks)}件をダウンロード中...', flush=True)
+        def download(args):
+            key, dst, _ = args
+            dst.parent.mkdir(parents=True, exist_ok=True)
+            make_client().download_file(bucket, key, str(dst))
+            return dst.name
+
+        done = 0
+        with ThreadPoolExecutor(max_workers=16) as ex:
+            futs = {ex.submit(download, t): t for t in tasks}
+            for f in as_completed(futs):
+                try:
+                    f.result()
+                    done += 1
+                    if done % 50 == 0:
+                        print(f'  ... {done}/{len(tasks)}', flush=True)
+                except Exception as e:
+                    print(f'  [WARN] DL失敗: {e}')
+        print(f'[OK] XLA キャッシュ復元完了: {done}/{len(tasks)}件')
 except Exception as e:
     print(f'[INFO] XLA キャッシュ復元スキップ: {e}')
 PYEOF
