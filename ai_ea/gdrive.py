@@ -224,53 +224,82 @@ def list_keys(prefix: str = '') -> list[str]:
         return []
 
 
-def list_keys_recursive(folder_prefix: str) -> list[str]:
+def list_keys_recursive(folder_prefix: str, timeout: float = 30.0) -> list[str]:
     """
     GDrive ルート配下の folder_prefix フォルダを再帰的に辿り、
-    全ファイルの相対パス (例: 'top100_h100/rank_001/fx_model.onnx') を返す。
+    全ファイルの相対パスを返す。timeout 秒でハングした場合は空リストを返す。
     """
     if not GDRIVE_ENABLED:
         return []
-    svc = _svc()
-    results: list[str] = []
 
-    def _recurse(parent_id: str, rel_base: str):
-        q = f"'{parent_id}' in parents and trashed=false"
-        page_token = None
-        while True:
-            kwargs = dict(q=q, fields='files(id,name,mimeType)', pageSize=200)
-            if page_token:
-                kwargs['pageToken'] = page_token
-            res = svc.files().list(**kwargs).execute()
-            for item in res.get('files', []):
-                rel = f'{rel_base}/{item["name"]}' if rel_base else item['name']
-                if item['mimeType'] == 'application/vnd.google-apps.folder':
-                    _recurse(item['id'], rel)
-                else:
-                    results.append(rel)
-            page_token = res.get('nextPageToken')
-            if not page_token:
-                break
+    result: list[list] = [[]]
+    error:  list[Exception] = [None]
 
-    try:
-        # ルート直下の folder_prefix にマッチするフォルダを探す
-        q = (f"'{GDRIVE_FOLDER_ID}' in parents and trashed=false and "
-             f"mimeType='application/vnd.google-apps.folder'")
-        res = svc.files().list(q=q, fields='files(id,name)', pageSize=100).execute()
-        for f in res.get('files', []):
-            if f['name'].startswith(folder_prefix):
-                _recurse(f['id'], f['name'])
-    except Exception as e:
-        print(f'  [GDrive] list_recursive失敗: {e}')
-    return results
+    def _do():
+        try:
+            svc = _svc()
+            found: list[str] = []
+
+            def _recurse(parent_id: str, rel_base: str):
+                q = f"'{parent_id}' in parents and trashed=false"
+                page_token = None
+                while True:
+                    kwargs = dict(q=q, fields='files(id,name,mimeType)', pageSize=200)
+                    if page_token:
+                        kwargs['pageToken'] = page_token
+                    res = svc.files().list(**kwargs).execute()
+                    for item in res.get('files', []):
+                        rel = f'{rel_base}/{item["name"]}' if rel_base else item['name']
+                        if item['mimeType'] == 'application/vnd.google-apps.folder':
+                            _recurse(item['id'], rel)
+                        else:
+                            found.append(rel)
+                    page_token = res.get('nextPageToken')
+                    if not page_token:
+                        break
+
+            q = (f"'{GDRIVE_FOLDER_ID}' in parents and trashed=false and "
+                 f"mimeType='application/vnd.google-apps.folder'")
+            res = svc.files().list(q=q, fields='files(id,name)', pageSize=100).execute()
+            for f in res.get('files', []):
+                if f['name'].startswith(folder_prefix):
+                    _recurse(f['id'], f['name'])
+            result[0] = found
+        except Exception as e:
+            error[0] = e
+
+    t = _threading.Thread(target=_do, daemon=True)
+    t.start()
+    t.join(timeout=timeout)
+    if t.is_alive():
+        print(f'  [GDrive] list_recursive タイムアウト ({timeout:.0f}s): {folder_prefix}* → スキップ')
+        return []
+    if error[0]:
+        print(f'  [GDrive] list_recursive失敗: {error[0]}')
+        return []
+    return result[0]
 
 
-def list_node_keys(glob_prefix: str) -> list[str]:
+def list_node_keys(glob_prefix: str, timeout: float = 20.0) -> list[str]:
     """
-    全ノードの同種ファイル一覧 (例: 'results_' → ['results_h100.json', 'results_gtx1080ti.json'])
-    ルートレベルのみ検索。
+    全ノードの同種ファイル一覧 (例: 'results_' → ['results_h100.json', ...])
+    ルートレベルのみ。timeout 秒でハングした場合は空リストを返す。
     """
-    return list_keys(glob_prefix)
+    if not GDRIVE_ENABLED:
+        return []
+
+    result: list[list] = [[]]
+
+    def _do():
+        result[0] = list_keys(glob_prefix)
+
+    t = _threading.Thread(target=_do, daemon=True)
+    t.start()
+    t.join(timeout=timeout)
+    if t.is_alive():
+        print(f'  [GDrive] list_node_keys タイムアウト ({timeout:.0f}s): {glob_prefix}* → スキップ')
+        return []
+    return result[0]
 
 
 def upload_bytes(data: bytes, rel_key: str) -> bool:

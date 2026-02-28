@@ -1536,18 +1536,17 @@ def restore_checkpoint() -> bool:
         # 全ノードの meta_*.json をダウンロード
         for mk in remote_list_node_keys('meta_'):
             remote_download(mk, CHECKPOINT_DIR / mk)
-        # このノード + 他ノードの best モデルをダウンロード (サブフォルダ内ファイル)
-        for bk in remote_list_best_keys():   # 例: best_h100/fx_model_best.onnx
-            remote_download(bk, CHECKPOINT_DIR / bk)
-        # 全ノードの top100 をダウンロード (ONNX含む全ファイル) ─ 最大 300 ファイル
-        top100_count = 0
-        for rel in list(remote_list_top100_keys())[:300]:
-            dest = CHECKPOINT_DIR / rel
-            dest.parent.mkdir(parents=True, exist_ok=True)
-            if remote_download(rel, dest):
-                top100_count += 1
-        if top100_count:
-            print(f'  [{tag}]  top100 {top100_count}ファイル取得 (全ノード)')
+        # このノード + 他ノードの best モデル (サブフォルダ内ファイル)
+        print(f'  [{tag}]  best モデル取得中 ...', end='', flush=True)
+        best_keys = remote_list_best_keys()
+        best_count = 0
+        for bk in best_keys:
+            if remote_download(bk, CHECKPOINT_DIR / bk):
+                best_count += 1
+        print(f' {best_count}件')
+        # top100 は ONNX が大量になるためスキップ → results から再構築する
+        # (起動時間の短縮: 数百ファイル × 数MB のダウンロードを回避)
+        print(f'  [{tag}]  top100 は results から再構築します (ダウンロードスキップ)')
 
     # ── 全ノードの results_*.json をマージ ───────────────────────────────────
     result_files = list(CHECKPOINT_DIR.glob('results_*.json'))
