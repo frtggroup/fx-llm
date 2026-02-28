@@ -1,23 +1,19 @@
 # ─────────────────────────────────────────────────────────────────────────────
-# FX AI EA ランダムサーチ  TPU (Google Cloud TPU v4/v5/Trillium) 対応
+# FX AI EA ランダムサーチ  TPU (Google Cloud TPU v4/v5/v6e Trillium) 対応
 #
-# ベースイメージ: PyTorch XLA 公式 (torch_xla + libtpu 同梱)
+# ベースイメージ: python:3.11-slim
+# torch_xla は pip から取得 (GCR 認証不要 → GitHub Actions でビルド可能)
 #
 # デプロイ先: Google Cloud TPU VM
-#   gcloud compute tpus tpu-vm create fx-ea-tpu \
-#     --zone=us-central2-b --accelerator-type=v4-8 \
-#     --version=tpu-ubuntu2204-base
-#   gcloud compute tpus tpu-vm ssh fx-ea-tpu --zone=us-central2-b \
-#     --command="docker run -d --privileged --net=host \
-#       -e DATA_URL=<url> \
-#       frtggroup/fx-ea-tpu:latest"
-#
-# 環境変数 (すべて自動検出のため通常設定不要):
-#   NODE_ID         : 自動 (tpu_v4 など)
-#   TPU_NUM_DEVICES : TPU チップ数 (デフォルト 4)
-#   DATA_URL        : CSV ダウンロード URL (GDrive になければ指定)
+#   gcloud compute tpus tpu-vm create fx-ea-tpu-v6e \
+#     --zone=us-central1-b --accelerator-type=v6e-1 \
+#     --version=v2-alpha-tpuv6e --spot
+#   ssh <tpu-vm>
+#   docker run -d --privileged --net=host \
+#     -e PJRT_DEVICE=TPU -e TPU_NUM_DEVICES=1 \
+#     frtggroup/fx-ea-tpu:latest
 # ─────────────────────────────────────────────────────────────────────────────
-FROM us-central1-docker.pkg.dev/tpu-pytorch/torch-xla-release/torch_xla:r2.5
+FROM python:3.11-slim
 
 ENV DEBIAN_FRONTEND=noninteractive \
     PYTHONUNBUFFERED=1 \
@@ -25,9 +21,9 @@ ENV DEBIAN_FRONTEND=noninteractive \
     PJRT_DEVICE=TPU \
     # XLA フラグ: TPU メモリ断片化防止
     XLA_PYTHON_CLIENT_PREALLOCATE=false \
-    # PyTorch XLA: プロファイリング無効化 (本番では不要)
+    # PyTorch XLA: プロファイリング無効化
     PT_XLA_DEBUG=0 \
-    # v6e-1 などシングルチップ構成のデフォルト (自動検出される場合は不要)
+    # デフォルト TPU チップ数 (v6e-1 = 1チップ)
     TPU_NUM_DEVICES=1 \
     DATA_PATH=/workspace/data/USDJPY_H1.csv \
     WORKSPACE=/workspace \
@@ -61,11 +57,19 @@ RUN apt-get update && apt-get install -y --no-install-recommends \
         gcc \
         g++ \
         build-essential \
+        libssl-dev \
+        ca-certificates \
     && apt-get clean && rm -rf /var/lib/apt/lists/*
 
-# ── Python packages ──────────────────────────────────────────────────────────
+# ── Python packages (torch + torch_xla TPU 版) ───────────────────────────────
+# torch_xla[tpu] は libtpu を pip から取得するため GCR 認証不要
 COPY DOK_TPU/requirements.txt /tmp/requirements.txt
 RUN pip install --upgrade pip && \
+    pip install --no-cache-dir \
+        torch==2.5.1 \
+        torch_xla[tpu]==2.5.1 \
+        -f https://storage.googleapis.com/libtpu-releases/index.html \
+        -f https://storage.googleapis.com/jax-releases/jax_cuda_releases.html && \
     pip install --no-cache-dir -r /tmp/requirements.txt
 
 # ── SSH setup ────────────────────────────────────────────────────────────────
