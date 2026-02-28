@@ -371,7 +371,7 @@ fi
 
 # ── XLA 全パターン事前コンパイル (TPU のみ / キャッシュ未完了時のみ) ───────────
 if [ "$DEVICE_TYPE" = "TPU" ]; then
-    # PJRT (tpu-runtime) は1プロセスのみ接続可能 → シングルプロセスで全パターンをコンパイル
+    # xmp.spawn で TPU_NUM_DEVICES 枚を並列コンパイル (シングルチップ時はシングル実行)
     python3 /workspace/ai_ea/warmup_xla.py 2>&1 | tee -a /workspace/train_run.log
     # warmup 後にキャッシュを S3 へ保存
     _xla_cache_upload || true

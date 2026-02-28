@@ -8,10 +8,8 @@ XLA_PERSISTENT_CACHE_PATH にコンパイル済みグラフをキャッシュす
 単一チップ:
     python warmup_xla.py
 
-並列 (v6e-4 など): entrypoint.sh が 4プロセス起動
-    PJRT_LOCAL_RANK=0 TPU_NUM_DEVICES=1 python warmup_xla.py --rank 0 --world-size 4
-    PJRT_LOCAL_RANK=1 TPU_NUM_DEVICES=1 python warmup_xla.py --rank 1 --world-size 4
-    ...
+複数チップ (v6e-4 など): xmp.spawn で TPU_NUM_DEVICES 枚を自動並列化
+    TPU_NUM_DEVICES=4 python warmup_xla.py
 
 進捗は /workspace/xla_warmup_rank_{rank}.json に保存され、
 ダッシュボードの /api/status がランクファイルを集計して表示する。
@@ -100,10 +98,6 @@ def _save_rank(rank: int, world_size: int, all_patterns: list,
 
 
 def warmup(rank: int = 0, world_size: int = 1, dry_run: bool = False):
-    # このプロセスが使うチップを固定
-    os.environ['PJRT_LOCAL_RANK'] = str(rank)
-    os.environ['TPU_NUM_DEVICES'] = '1'
-
     sys.path.insert(0, str(Path(__file__).parent))
     from model import build_model  # noqa
 
@@ -168,8 +162,24 @@ def warmup(rank: int = 0, world_size: int = 1, dry_run: bool = False):
 
 if __name__ == '__main__':
     parser = argparse.ArgumentParser()
-    parser.add_argument('--rank',       type=int, default=0, help='このプロセスのランク (0始まり)')
-    parser.add_argument('--world-size', type=int, default=1, help='並列プロセス総数')
-    parser.add_argument('--dry-run',    action='store_true',  help='実際のコンパイルをスキップ')
+    parser.add_argument('--dry-run', action='store_true', help='実際のコンパイルをスキップ')
     args = parser.parse_args()
-    warmup(rank=args.rank, world_size=args.world_size, dry_run=args.dry_run)
+
+    n_dev = int(os.environ.get('TPU_NUM_DEVICES', '1'))
+
+    if n_dev > 1:
+        # xmp.spawn で全チップを並列コンパイル (PJRT デバイス割り当ては xmp が制御)
+        try:
+            import torch_xla.distributed.xla_multiprocessing as xmp  # type: ignore
+            print(f"[WARMUP] xmp.spawn: {n_dev} チップ並列コンパイル開始", flush=True)
+
+            def _spawn_worker(rank):
+                warmup(rank=rank, world_size=n_dev, dry_run=args.dry_run)
+
+            xmp.spawn(_spawn_worker, nprocs=n_dev, start_method='fork')
+            print(f"[WARMUP] 全 {n_dev} チップ コンパイル完了", flush=True)
+        except Exception as e:
+            print(f"[WARMUP] xmp.spawn 失敗: {e} → シングルチップにフォールバック", flush=True)
+            warmup(rank=0, world_size=1, dry_run=args.dry_run)
+    else:
+        warmup(rank=0, world_size=1, dry_run=args.dry_run)

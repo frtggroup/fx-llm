@@ -397,9 +397,54 @@ def _detect_device():
     return torch.device('cpu'), 'cpu'
 
 
-def train(args, X_tr, y_tr, X_te, y_te, mean, std, n_feat=None):
+def _dispatch_spmd(args, X_tr, y_tr, X_te, y_te, mean, std, n_feat, n_dev):
+    """xmp.spawn で n_dev チップに学習を分散する。
+    この関数は XLA/PJRT を初期化する前に呼び出す必要がある。"""
+    try:
+        import torch_xla.distributed.xla_multiprocessing as xmp  # type: ignore
+    except ImportError:
+        print("[WARN] xla_multiprocessing が利用不可 → シングルチップにフォールバック", flush=True)
+        return train(args, X_tr, y_tr, X_te, y_te, mean, std, n_feat, _spawn_rank=0)
+
+    tmp_path = f'/dev/shm/xmp_{os.getpid()}.pt'
+    print(f"\n=== SPMD 並列学習 [{n_dev} チップ] ===", flush=True)
+
+    def _worker(rank):
+        train(args, X_tr, y_tr, X_te, y_te, mean, std, n_feat, _spawn_rank=rank)
+
+    xmp.spawn(_worker, nprocs=n_dev, start_method='fork')
+
+    # rank 0 が保存したモデルをロード
+    seq_len = X_tr.shape[1]
+    n_in    = n_feat or N_FEATURES
+    arch    = getattr(args, 'arch', 'gru_attn')
+    model   = build_model(arch, n_in, seq_len, args.hidden, args.layers, args.dropout)
+    try:
+        state = torch.load(tmp_path, map_location='cpu', weights_only=True)
+        model.load_state_dict(state)
+        print(f"  [SPMD] モデルロード完了", flush=True)
+    except Exception as _e:
+        print(f"  [WARN] SPMD モデルロード失敗: {_e}", flush=True)
+    try:
+        Path(tmp_path).unlink()
+    except Exception:
+        pass
+    return model
+
+
+def train(args, X_tr, y_tr, X_te, y_te, mean, std, n_feat=None, _spawn_rank=None):
+    # ── SPMD ディスパッチ (XLA 初期化前に実行) ──────────────────────────────
+    _is_tpu_env = os.environ.get('DEVICE_TYPE', '').upper() == 'TPU'
+    _n_dev = int(os.environ.get('TPU_NUM_DEVICES', '1')) if _is_tpu_env else 1
+    if _spawn_rank is None and _is_tpu_env and _n_dev > 1:
+        return _dispatch_spmd(args, X_tr, y_tr, X_te, y_te, mean, std, n_feat, _n_dev)
+
+    _spmd_mode = _spawn_rank is not None   # xmp.spawn ワーカー内
+    _is_main   = not _spmd_mode or _spawn_rank == 0   # rank 0 か シングル
+
     device, dev_type = _detect_device()
-    print(f"\n=== 学習 [{device}] ===")
+    if _is_main:
+        print(f"\n=== 学習 [{device}] ===")
 
     # デバイス別の最適化設定
     is_h100    = False
@@ -423,12 +468,14 @@ def train(args, X_tr, y_tr, X_te, y_te, mean, std, n_feat=None):
         else:
             print(f"  FP16 AMP モード")
     elif is_tpu:
-        try:
-            import torch_xla.core.xla_model as xm  # type: ignore
-            tpu_info = xm.get_xla_supported_devices()
-            print(f"  TPU モード: デバイス数={len(tpu_info)}  BF16 AMP 有効")
-        except Exception:
-            print(f"  TPU モード: BF16 AMP 有効")
+        if _is_main:
+            try:
+                import torch_xla.core.xla_model as xm  # type: ignore
+                tpu_info = xm.get_xla_supported_devices()
+                _spmd_tag = f" [SPMD rank={_spawn_rank}/{_n_dev}]" if _spmd_mode else ""
+                print(f"  TPU モード: デバイス数={len(tpu_info)}  BF16 AMP 有効{_spmd_tag}")
+            except Exception:
+                print(f"  TPU モード: BF16 AMP 有効")
 
     # TPU XLA: バッチサイズを1024に固定 + drop_last でグラフ形状を完全統一
     # → 同じ arch/hidden の2回目以降はXLAコンパイルキャッシュが効き高速化
@@ -440,6 +487,13 @@ def train(args, X_tr, y_tr, X_te, y_te, mean, std, n_feat=None):
         tpu_drop_last = True
     else:
         tpu_drop_last = False
+
+    # SPMD データシャーディング: このランクが担当するサンプルのみ使用
+    if _spmd_mode and _n_dev > 1:
+        _shard_idx = list(range(_spawn_rank, len(X_tr), _n_dev))
+        X_tr = X_tr[_shard_idx]
+        y_tr = y_tr[_shard_idx]
+        print(f"  [SPMD rank={_spawn_rank}] データシャード: {len(X_tr):,} / {len(_shard_idx)*_n_dev:,} サンプル", flush=True)
 
     tr_dl, va_dl = make_loaders(X_tr, y_tr, X_te, y_te, args, device,
                                 drop_last=tpu_drop_last)
@@ -563,7 +617,7 @@ def train(args, X_tr, y_tr, X_te, y_te, mean, std, n_feat=None):
                 _train_step(model, xb, yb,
                             optimizer, criterion, scheduler, scaler,
                             use_amp, amp_dtype, use_scaler,
-                            _amp_backend, is_tpu)
+                            _amp_backend, is_tpu, _spmd_mode)
                 for xb, yb in tr_dl
             ]
             t_loss = torch.stack(step_losses).mean().item()
@@ -601,30 +655,20 @@ def train(args, X_tr, y_tr, X_te, y_te, mean, std, n_feat=None):
 
         gap = v_loss - t_loss   # 過学習ギャップ
 
-        if epoch % 10 == 0 or epoch <= 5:
+        if _is_main and (epoch % 10 == 0 or epoch <= 5):
             lr_now  = optimizer.param_groups[0]['lr']
             _ep_sec = _time.time() - _ep_t0
             _n_samp = len(tr_dl) * tr_dl.bs
             _tput   = _n_samp / max(_ep_sec, 0.001)
             _tpu_tag = f"  {_tput:.0f}samp/s" if is_tpu else ""
-            # TPU duty_cycle_pct (libtpu.sdk - torch_xla 2.6.0+)
-            _duty = ""
-            if is_tpu:
-                try:
-                    from libtpu.sdk import tpumonitoring  # type: ignore
-                    _m = tpumonitoring.get_metric("duty_cycle_pct")
-                    _vals = _m.data()
-                    if _vals:
-                        _duty = f"  TPU使用率:{float(_vals[0]):.1f}%"
-                except Exception:
-                    pass
+            _spmd_tag = f" [r{_spawn_rank}]" if _spmd_mode else ""
             print(f"  Ep{epoch:4d}/{args.epochs}  "
                   f"tr={t_loss:.4f}  va={v_loss:.4f}  "
                   f"gap={gap:+.4f}  acc={acc:.3f}  lr={lr_now:.2e}"
-                  f"  [{_ep_sec:.1f}s{_tpu_tag}{_duty}]")
+                  f"  [{_ep_sec:.1f}s{_tpu_tag}]{_spmd_tag}")
 
-        # 進捗更新 (progress_every エポックごと / 非同期書き込み)
-        if epoch % progress_every == 0 or epoch <= 5:
+        # 進捗更新 (progress_every エポックごと / 非同期書き込み / rank 0 のみ)
+        if _is_main and (epoch % progress_every == 0 or epoch <= 5):
             _dash['epoch']       = epoch
             _dash['total_epochs']= args.epochs
             _dash['train_loss']  = round(t_loss, 5)
@@ -695,10 +739,11 @@ def train(args, X_tr, y_tr, X_te, y_te, mean, std, n_feat=None):
                 stop_reason = f'改善なし強制終了 (no_imp={no_imp} >= patience*2={patience*2})'
                 break
 
-    if stop_reason:
-        print(f"  [STOP] {stop_reason}  ep={epoch}  best_val={best_loss:.4f}")
-    else:
-        print(f"  [DONE] 全エポック完了  best_val={best_loss:.4f}")
+    if _is_main:
+        if stop_reason:
+            print(f"  [STOP] {stop_reason}  ep={epoch}  best_val={best_loss:.4f}")
+        else:
+            print(f"  [DONE] 全エポック完了  best_val={best_loss:.4f}")
 
     if best_state:
         # compiled model と元モデルの両方に best_state を反映
@@ -712,13 +757,26 @@ def train(args, X_tr, y_tr, X_te, y_te, mean, std, n_feat=None):
                 model_for_export.load_state_dict(best_state)
             except Exception:
                 pass
+
+    # SPMD rank 0 → モデルの重みを CPU に移して保存 (dispatch 側がロード)
+    if _spmd_mode and _spawn_rank == 0:
+        try:
+            import torch_xla.core.xla_model as xm  # type: ignore
+            tmp_path = f'/dev/shm/xmp_{os.getppid()}.pt'
+            state = {k: v.cpu() for k, v in model_for_export.state_dict().items()}
+            torch.save(state, tmp_path)
+            xm.mark_step()
+            print(f"  [SPMD rank=0] モデル保存 → {tmp_path}", flush=True)
+        except Exception as _e:
+            print(f"  [WARN] SPMD モデル保存失敗: {_e}", flush=True)
+
     return model_for_export  # ONNX export には compile前モデルを返す
 
 
 def _train_step(model, xb, yb, opt, crit, sched,
                 scaler=None, use_amp=False,
                 amp_dtype=torch.float16, use_scaler=False,
-                amp_backend='cuda', is_tpu=False):
+                amp_backend='cuda', is_tpu=False, spmd_mode=False):
     opt.zero_grad(set_to_none=True)
     with torch.amp.autocast(amp_backend, enabled=use_amp, dtype=amp_dtype):
         loss = crit(model(xb), yb)
@@ -732,12 +790,15 @@ def _train_step(model, xb, yb, opt, crit, sched,
         loss.backward()
         nn.utils.clip_grad_norm_(model.parameters(), 1.0)
         if is_tpu:
-            # TPU: optimizer.step() 後に mark_step() で XLA グラフを実行
-            # xm.optimizer_step() は dynamo 経由で Inductor を起動しデッドロックするため使わない
             try:
                 import torch_xla.core.xla_model as xm  # type: ignore
-                opt.step()
-                xm.mark_step()
+                if spmd_mode:
+                    # SPMD: 全チップのグラジェントを all_reduce してから step
+                    xm.optimizer_step(opt)
+                else:
+                    # シングルチップ: mark_step() のみ
+                    opt.step()
+                    xm.mark_step()
             except Exception:
                 opt.step()
         else:
