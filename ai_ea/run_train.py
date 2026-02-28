@@ -106,6 +106,7 @@ def _detect_node_id() -> str:
         import torch
         if torch.cuda.is_available():
             name = torch.cuda.get_device_name(0).lower()
+            if 'h200' in name:     return 'h200'
             if 'h100' in name:     return 'h100'
             if 'a100' in name:     return 'a100'
             if '3090' in name:     return 'rtx3090'
@@ -116,8 +117,55 @@ def _detect_node_id() -> str:
         pass
     return 'h100' if os.environ.get('H100_MODE', '0') == '1' else 'gtx1080ti'
 
+
+def _auto_gpu_config(node_id: str) -> tuple[str, float, float, int]:
+    """実際の GPU VRAM を読み取り、最適な並列数と VRAM 割当を自動計算する。
+
+    VRAM ティア基準:
+      xlarge : 120 GB+  (H200 SXM5  141 GB)
+      large  :  60 GB+  (H100 80 GB / H200 NVL 94 GB / A100 80 GB)
+      medium :  30 GB+  (A100 40 GB)
+      small  :  14 GB+  (RTX 3090/4090  24 GB)
+      micro  :   0 GB+  (GTX 1080 Ti 11 GB / その他)
+
+    Returns: (tier, total_vram_gb, vram_per_trial_gb, max_parallel)
+    """
+    total_gb = 0.0
+    try:
+        import torch
+        if torch.cuda.is_available():
+            total_gb = torch.cuda.get_device_properties(0).total_memory / 1e9
+    except Exception:
+        pass
+
+    if total_gb <= 0:
+        # GPU 未接続 or torch 未初期化 → node_id から推定
+        _fallback: dict[str, float] = {
+            'h200': 141.0, 'h100': 80.0, 'a100': 80.0,
+            'rtx4090': 24.0, 'rtx3090': 24.0, 'gtx1080ti': 11.0,
+        }
+        total_gb = _fallback.get(node_id, 11.0)
+
+    if   total_gb >= 120: tier = 'xlarge'
+    elif total_gb >=  60: tier = 'large'
+    elif total_gb >=  30: tier = 'medium'
+    elif total_gb >=  14: tier = 'small'
+    else:                 tier = 'micro'
+
+    # 1試行あたりのVRAM消費見積もり (モデル+勾配+Adam状態+アクティベーション)
+    # 大型GPU はバッチ・シーケンス・モデルが大きくなるため消費も増加
+    vpt_map = {'xlarge': 12.0, 'large': 10.0, 'medium': 8.0, 'small': 7.0, 'micro': 8.0}
+    vpt = vpt_map[tier]
+
+    # GPU VRAM の 85% を試行で使い切る想定で並列数を算出
+    par = max(1, int(total_gb * 0.85 / vpt))
+
+    return tier, total_gb, vpt, par
+
+
 NODE_ID = _detect_node_id()   # このノードの識別子 (例: 'h100', 'gtx1080ti')
 GPU_NAME = os.environ.get("GPU_NAME", NODE_ID.upper())  # GPU display name for dashboard
+_GPU_TIER, _GPU_VRAM_GB, _VPT_DEFAULT, _PAR_DEFAULT = _auto_gpu_config(NODE_ID)
 
 
 def _s3_client():
@@ -206,9 +254,27 @@ _important_scores: dict = {}          # 特徴量名 → 重要度スコア (重
 GA_FEAT_RATIO  = 0.40   # 特徴量探索フェーズ
 GA_PARAM_RATIO = 0.40   # パラメータチューニングフェーズ
 GA_CROSS_RATIO = 0.20   # 交叉フェーズ
-H100_MODE     = os.environ.get('H100_MODE', '0') == '1'
-MAX_PARALLEL  = int(os.environ.get('MAX_PARALLEL', '6' if H100_MODE else '1'))
-VRAM_PER_TRIAL= float(os.environ.get('VRAM_PER_TRIAL', '6' if H100_MODE else '8'))  # GB
+# large/xlarge/medium GPU = H100_MODE (大モデル・長シーケンスを有効化)
+# 環境変数 H100_MODE=1 で強制有効、H100_MODE=0 で強制無効も可能
+_h100_env = os.environ.get('H100_MODE', '').strip()
+H100_MODE = (
+    (_h100_env == '1') or
+    (_h100_env != '0' and _GPU_TIER in ('medium', 'large', 'xlarge'))
+)
+
+# MAX_PARALLEL / VRAM_PER_TRIAL:
+#   0 または未設定 → GPU VRAM から自動計算
+#   1以上の数値   → その値を強制使用
+def _resolve_int_env(key: str, default: int) -> int:
+    v = os.environ.get(key, '0').strip()
+    return int(v) if v not in ('0', '', 'auto') else default
+
+def _resolve_float_env(key: str, default: float) -> float:
+    v = os.environ.get(key, '0').strip()
+    return float(v) if v not in ('0', '', 'auto') else default
+
+MAX_PARALLEL   = _resolve_int_env('MAX_PARALLEL',   _PAR_DEFAULT)
+VRAM_PER_TRIAL = _resolve_float_env('VRAM_PER_TRIAL', _VPT_DEFAULT)
 
 # ── フリーズ検知: GPU無使用タイムアウト ──────────────────────────────────────
 # データロード・前処理フェーズに DATA_PREP_BUDGET 秒の猶予を与え、
@@ -222,7 +288,14 @@ ARCHS = [
     'cnn', 'tcn', 'cnn_gru', 'transformer', 'resnet', 'inception',
 ]
 
-HIDDEN_MAP_LOCAL = {
+# ── GPU ティア別ハイパーパラメータ探索空間 ──────────────────────────────────
+# micro  : GTX 1080 Ti  (11 GB)
+# small  : RTX 3090/4090 (24 GB)
+# medium : A100 40 GB
+# large  : H100 80 GB / A100 80 GB / H200 NVL 94 GB
+# xlarge : H200 SXM5 141 GB
+
+_HIDDEN_MICRO = {
     'mlp':         [32, 64, 128, 256, 512],
     'gru_attn':    [64, 128, 256, 512],
     'bigru':       [64, 128, 256],
@@ -234,7 +307,19 @@ HIDDEN_MAP_LOCAL = {
     'resnet':      [64, 128, 256, 512],
     'inception':   [64, 128, 256],
 }
-HIDDEN_MAP_H100 = {
+_HIDDEN_SMALL = {   # RTX 3090/4090: 中規模モデル
+    'mlp':         [128, 256, 512, 1024],
+    'gru_attn':    [128, 256, 512, 1024],
+    'bigru':       [128, 256, 512],
+    'lstm_attn':   [128, 256, 512, 1024],
+    'cnn':         [128, 256, 512, 1024],
+    'tcn':         [128, 256, 512, 1024],
+    'cnn_gru':     [128, 256, 512],
+    'transformer': [128, 256, 512],
+    'resnet':      [128, 256, 512, 1024],
+    'inception':   [128, 256, 512],
+}
+_HIDDEN_LARGE = {   # medium/large/xlarge: 大規模モデル
     'mlp':         [512, 1024, 2048],
     'gru_attn':    [256, 512, 1024],
     'bigru':       [256, 512, 1024],
@@ -246,15 +331,49 @@ HIDDEN_MAP_H100 = {
     'resnet':      [256, 512, 1024, 2048],
     'inception':   [256, 512, 1024],
 }
-HIDDEN_MAP     = HIDDEN_MAP_H100  if H100_MODE else HIDDEN_MAP_LOCAL
-# 並列3本 × 最大バッチを考慮: H100 80GB / 3 ≈ 26GB/試行
-# 大モデル(h≥1024)では小バッチ、小モデルでは大バッチ
-# H100: 小バッチで1エポックあたりのイテレーション数を増やしGPU稼働率を上げる
-# データ13K件 / 512 = 25バッチ/ep → GPU稼働率 ~60-80%
-BATCH_CHOICES  = [256, 512, 1024, 2048] if H100_MODE else [256, 512, 1024, 2048]
-SEQ_CHOICES    = [10, 15, 20, 30, 40, 50]  if H100_MODE else [5, 8, 10, 15, 20]
-EPOCH_COUNT    = 800   # H100/GTX 共通: モデルサイズが小さいので2000は過多
-TRIAL_TIMEOUT  = 1800 if H100_MODE else 600   # H100: 30分 / GTX: 10分
+
+_TIER_HIDDEN_MAP = {
+    'micro':  _HIDDEN_MICRO,
+    'small':  _HIDDEN_SMALL,
+    'medium': _HIDDEN_LARGE,
+    'large':  _HIDDEN_LARGE,
+    'xlarge': _HIDDEN_LARGE,
+}
+HIDDEN_MAP_LOCAL = _HIDDEN_MICRO   # 後方互換エイリアス
+HIDDEN_MAP_H100  = _HIDDEN_LARGE   # 後方互換エイリアス
+HIDDEN_MAP = _TIER_HIDDEN_MAP[_GPU_TIER]
+
+# バッチサイズ: 大VRAM ほど大きいバッチを探索
+_TIER_BATCH = {
+    'micro':  [64, 128, 256, 512],
+    'small':  [128, 256, 512, 1024],
+    'medium': [256, 512, 1024, 2048],
+    'large':  [256, 512, 1024, 2048],
+    'xlarge': [512, 1024, 2048, 4096],
+}
+BATCH_CHOICES = _TIER_BATCH[_GPU_TIER]
+
+# シーケンス長: 大VRAM ほど長いシーケンスを探索
+_TIER_SEQ = {
+    'micro':  [5, 8, 10, 15, 20],
+    'small':  [8, 10, 15, 20, 30],
+    'medium': [10, 15, 20, 30, 40],
+    'large':  [10, 15, 20, 30, 40, 50],
+    'xlarge': [15, 20, 30, 40, 50, 60],
+}
+SEQ_CHOICES = _TIER_SEQ[_GPU_TIER]
+
+EPOCH_COUNT = 800   # GPU 共通
+
+# 試行タイムアウト: 大モデルは学習に時間がかかる
+_TIER_TIMEOUT = {
+    'micro':   600,   # 10分
+    'small':   900,   # 15分
+    'medium': 1200,   # 20分
+    'large':  1800,   # 30分
+    'xlarge': 2400,   # 40分
+}
+TRIAL_TIMEOUT = _TIER_TIMEOUT[_GPU_TIER]
 
 
 # ── ハイパーパラメータサンプリング ───────────────────────────────────────────
@@ -263,11 +382,12 @@ def sample_params(rng: random.Random) -> dict:
     hidden  = rng.choice(HIDDEN_MAP[arch])
     layers  = rng.choice([1, 2, 3] if arch not in ('mlp', 'gru_attn') else [1, 2])
     dropout = round(rng.uniform(0.3, 0.6), 1)
-    lr      = rng.choice([1e-4, 3e-4, 5e-4, 8e-4, 1e-3, 2e-3]
-                         if H100_MODE else [1e-4, 3e-4, 5e-4, 8e-4, 1e-3])
-    # 大モデルでは小バッチ強制 (CUDA OOM防止: 3並列 × 26GB/trial)
-    if H100_MODE and hidden >= 1024:
-        batch = rng.choice([256, 512, 1024])
+    lr      = rng.choice([1e-4, 3e-4, 5e-4, 8e-4, 1e-3, 2e-3])
+    # 大モデル(hidden≥1024)は CUDA OOM 防止で小バッチ上限を設ける
+    # 上限はティアの BATCH_CHOICES 最大値の半分
+    if hidden >= 1024 and len(BATCH_CHOICES) > 1:
+        safe_batches = BATCH_CHOICES[:max(1, len(BATCH_CHOICES) - 1)]
+        batch = rng.choice(safe_batches)
     else:
         batch = rng.choice(BATCH_CHOICES)
     tp      = round(rng.uniform(1.5, 3.5), 1)
@@ -308,11 +428,12 @@ def _apply_one_mutation(p: dict, key: str, rng: random.Random) -> None:
     elif key == 'dropout':
         p['dropout'] = round(rng.uniform(0.2, 0.7), 1)
     elif key == 'lr':
-        p['lr']      = rng.choice([1e-4, 3e-4, 5e-4, 8e-4, 1e-3, 2e-3]
-                                   if H100_MODE else [1e-4, 3e-4, 5e-4, 8e-4, 1e-3])
+        p['lr']      = rng.choice([1e-4, 3e-4, 5e-4, 8e-4, 1e-3, 2e-3])
     elif key == 'batch':
-        p['batch']   = (rng.choice([2048, 4096, 8192]) if H100_MODE and p['hidden'] >= 1024
-                        else rng.choice(BATCH_CHOICES))
+        if p['hidden'] >= 1024 and len(BATCH_CHOICES) > 1:
+            p['batch'] = rng.choice(BATCH_CHOICES[:max(1, len(BATCH_CHOICES) - 1)])
+        else:
+            p['batch'] = rng.choice(BATCH_CHOICES)
     elif key == 'tp':
         p['tp']      = round(rng.uniform(1.2, 4.0), 1)
     elif key == 'sl':
@@ -655,7 +776,7 @@ def _gpu_info() -> dict:
                     'gpu_pct': 0, 'mem_pct': round(used / max(total, 1) * 100)}
     except Exception:
         pass
-    fallback_total = 80.0 if H100_MODE else 11.0
+    fallback_total = _GPU_VRAM_GB if _GPU_VRAM_GB > 0 else 11.0
     return {'free_gb': fallback_total, 'total_gb': fallback_total, 'used_gb': 0,
             'gpu_pct': 0, 'mem_pct': 0}
 
@@ -1385,13 +1506,13 @@ def main():
     TOP_DIR.mkdir(parents=True, exist_ok=True)
 
     gpu_name = NODE_ID.upper()
-    mode_str = f'{gpu_name}  並列={MAX_PARALLEL}  VRAM/試行={VRAM_PER_TRIAL}GB' \
-               if H100_MODE else f'{gpu_name}  並列={MAX_PARALLEL}'
     print('=' * 60)
     storage_tag = 'GDrive' if GDRIVE_ENABLED else ('S3' if S3_ENABLED else 'ローカルのみ')
-    print(f'FX AI EA v8 - 並列ランダムサーチ [{mode_str}]  ストレージ: {storage_tag}/{NODE_ID}')
+    print(f'FX AI EA v8 - 並列ランダムサーチ  ストレージ: {storage_tag}/{NODE_ID}')
+    print(f'  GPU     : {gpu_name}  ({_GPU_VRAM_GB:.0f} GB)  tier={_GPU_TIER}')
+    print(f'  並列数  : {MAX_PARALLEL}  VRAM/試行={VRAM_PER_TRIAL} GB  H100_MODE={H100_MODE}')
+    print(f'  モデル  : hidden={[v for v in HIDDEN_MAP.get("mlp",[])]}  batch={BATCH_CHOICES}')
     print(f'  TOP {TOP_N} 保存  タイムアウト {TRIAL_TIMEOUT//60}分  stop.flag: {STOP_FLAG}')
-    print(f'  GPU無使用タイムアウト: {NO_GPU_TIMEOUT//60}分  データ準備猶予: {DATA_PREP_BUDGET//60}分')
     print('=' * 60)
 
     # ── ストレージ接続確認 ─────────────────────────────────────────────────────

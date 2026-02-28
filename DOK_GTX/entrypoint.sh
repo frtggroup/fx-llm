@@ -41,51 +41,47 @@ fi
 
 # ── 環境変数 / パス ──────────────────────────────────────────────────────────
 export PYTHONPATH="/workspace/ai_ea:${PYTHONPATH}"
-export PYTORCH_CUDA_ALLOC_CONF="${PYTORCH_CUDA_ALLOC_CONF:-expandable_segments:True,max_split_size_mb:256}"
-export H100_MODE="${H100_MODE:-0}"
-export MAX_PARALLEL="${MAX_PARALLEL:-1}"
-export VRAM_PER_TRIAL="${VRAM_PER_TRIAL:-8}"
-export DATA_PATH="${DATA_PATH:-/workspace/data/USDJPY_M1.csv}"
+export DATA_PATH="${DATA_PATH:-/workspace/data/USDJPY_H1.csv}"
+# NODE_ID / H100_MODE / MAX_PARALLEL / VRAM_PER_TRIAL は
+# run_train.py が実測 GPU VRAM から自動計算するため設定不要
 
 echo "[*] 設定:"
-echo "    H100_MODE    : ${H100_MODE} (GTX=0)"
-echo "    MAX_PARALLEL : ${MAX_PARALLEL} 並列"
-echo "    VRAM/試行    : ${VRAM_PER_TRIAL} GB"
 echo "    DATA_PATH    : ${DATA_PATH}"
-echo "    S3_ENDPOINT  : ${S3_ENDPOINT:-未設定}"
-echo "    S3_BUCKET    : ${S3_BUCKET:-未設定}  PREFIX: ${S3_PREFIX:-未設定}"
-echo "    (チェックポイントはS3に保存 → 再起動時に自動復元)"
+echo "    GDRIVE       : ${GDRIVE_FOLDER_ID:-(未設定)}"
+echo "    GPU設定      : run_train.py 起動後に自動検出"
 
-# ── CSV データ自動ダウンロード ──────────────────────────────────────────────
+# ── CSV 自動ダウンロード: GDrive → DATA_URL の順で試みる ─────────────────────
 mkdir -p "$(dirname ${DATA_PATH})"
 if [ ! -f "${DATA_PATH}" ] || [ ! -s "${DATA_PATH}" ]; then
-    if [ -n "${DATA_URL}" ]; then
-        echo "[*] CSV ダウンロード中 (DATA_URL): ${DATA_URL}"
-        wget -q --show-progress -O "${DATA_PATH}" "${DATA_URL}" \
-          && echo "[OK] CSV ダウンロード完了 $(du -h ${DATA_PATH} | cut -f1)" \
-          || echo "[ERROR] CSV ダウンロード失敗"
-    elif [ -n "${S3_ENDPOINT}" ] && [ -n "${S3_BUCKET}" ]; then
-        echo "[*] CSV を S3 から自動ダウンロード中..."
-        python -c "
-import boto3, os, sys
-s3 = boto3.client('s3',
-    endpoint_url=os.environ['S3_ENDPOINT'],
-    region_name=os.environ.get('S3_REGION','jp-north-1'),
-    aws_access_key_id=os.environ['S3_ACCESS_KEY'],
-    aws_secret_access_key=os.environ['S3_SECRET_KEY']
-)
-dst = os.environ.get('DATA_PATH','/workspace/data/USDJPY_M1.csv')
+    echo "[*] CSV が見つかりません。自動ダウンロードを試みます..."
+    python -c "
+import sys, os
+sys.path.insert(0, '/workspace/ai_ea')
+from pathlib import Path
+import gdrive
+dst   = os.environ.get('DATA_PATH', '/workspace/data/USDJPY_H1.csv')
 fname = os.path.basename(dst)
-try:
-    s3.download_file(os.environ['S3_BUCKET'], fname, dst)
-    print(f'[OK] S3からCSVダウンロード完了: {fname} ({os.path.getsize(dst)/1e6:.1f}MB)')
-except Exception as e:
-    print(f'[WARN] S3 CSVダウンロード失敗: {e}')
+if not gdrive.GDRIVE_ENABLED:
+    print('[WARN] GDrive 無効')
     sys.exit(1)
-" && echo "[OK] CSVダウンロード完了" || echo "[WARN] S3にCSVなし — 手動でコピーしてください"
-    else
-        echo "[WARN] DATA_URL / S3 未設定 — ${DATA_PATH} を手動でコピーしてください"
-    fi
+ok = gdrive.download(fname, Path(dst))
+if ok and Path(dst).exists() and Path(dst).stat().st_size > 0:
+    print(f'[OK] GDrive から CSV ダウンロード完了 ({Path(dst).stat().st_size/1e6:.1f} MB): {fname}')
+    sys.exit(0)
+print('[WARN] GDrive に CSV (', fname, ') が見つかりません')
+sys.exit(1)
+" && echo "[OK] CSV 準備完了 (GDrive)" || {
+        if [ -n "${DATA_URL}" ]; then
+            echo "[*] DATA_URL からダウンロード中: ${DATA_URL}"
+            wget -q --show-progress -O "${DATA_PATH}" "${DATA_URL}" \
+              && echo "[OK] CSV ダウンロード完了 $(du -h ${DATA_PATH} | cut -f1)" \
+              || echo "[ERROR] CSV ダウンロード失敗"
+        else
+            echo "[WARN] GDrive にも DATA_URL にも CSV がありません"
+            echo "[WARN] $(basename ${DATA_PATH}) を GDrive フォルダにアップロードするか"
+            echo "[WARN] docker run -e DATA_URL=<url> で指定してください"
+        fi
+    }
 else
     echo "[*] CSV 既存: $(du -h ${DATA_PATH} | cut -f1)"
 fi
@@ -123,7 +119,7 @@ trap '_graceful_stop' SIGTERM SIGINT
 
 # ── 学習ループ起動 ──────────────────────────────────────────────────────────
 echo ""
-echo "[*] ランダムサーチ開始  (並列=${MAX_PARALLEL}  VRAM/試行=${VRAM_PER_TRIAL}GB)"
+echo "[*] ランダムサーチ開始  (GPU設定は自動検出)"
 echo ""
 python /workspace/ai_ea/run_train.py 2>&1 | tee /workspace/train_run.log &
 TRAIN_PID=$!

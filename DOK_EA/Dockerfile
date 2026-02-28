@@ -17,22 +17,12 @@ FROM pytorch/pytorch:2.5.1-cuda12.4-cudnn9-runtime
 
 ENV DEBIAN_FRONTEND=noninteractive \
     PYTHONUNBUFFERED=1 \
-    # H100 メモリ断片化防止
     PYTORCH_CUDA_ALLOC_CONF=expandable_segments:True,max_split_size_mb:512 \
-    # TF32 を明示的に有効化 (A100/H100 デフォルト)
     TORCH_ALLOW_TF32=1 \
-    # H100 モード: 大型モデル・バッチサイズ・エポック数
-    H100_MODE=1 \
-    # 並列数 / 1試行あたりの最低 VRAM (GB)
-    # H100 80GB: 6並列 × 6GB = 36GB使用, 残44GBはバッファ
-    MAX_PARALLEL=6 \
-    VRAM_PER_TRIAL=6 \
-    # データパス (H1 CSV 直接使用 → M1リサンプル不要で高速)
     DATA_PATH=/workspace/data/USDJPY_H1.csv \
     WORKSPACE=/workspace \
-    # Sakura DOK の nginx は port 7860 に転送する
     DASHBOARD_PORT=7860 \
-    # Sakura オブジェクトストレージ (docker-compose未使用時のフォールバック)
+    GDRIVE_FOLDER_ID=1RhIqnpyzQrSuEgIAD7KroNWfELdElS6L \
     S3_ENDPOINT=https://s3.isk01.sakurastorage.jp \
     S3_REGION=jp-north-1 \
     S3_ACCESS_KEY=9LZ71SXF347BKM7MEPPM \
@@ -42,13 +32,10 @@ ENV DEBIAN_FRONTEND=noninteractive \
 # S3_SECRET_KEY は = で始まるため別行で定義
 ENV S3_SECRET_KEY="=u/j64oP8sQvtRXjjNY33jF2S/gOY5WMVgYcdnqG"
 
-# Google Drive 共有ストレージ (S3 より優先)
-# OAuth2 シークレットはビルド時に --build-arg で注入、または実行時に -e で上書き
+# OAuth2 シークレットはビルド時に --build-arg で注入
 ARG GDRIVE_OAUTH_CLIENT_ID=""
 ARG GDRIVE_OAUTH_CLIENT_SECRET=""
 ARG GDRIVE_OAUTH_REFRESH_TOKEN=""
-ENV NODE_ID=h100 \
-    GDRIVE_FOLDER_ID=1RhIqnpyzQrSuEgIAD7KroNWfELdElS6L
 ENV GDRIVE_OAUTH_CLIENT_ID="${GDRIVE_OAUTH_CLIENT_ID}" \
     GDRIVE_OAUTH_CLIENT_SECRET="${GDRIVE_OAUTH_CLIENT_SECRET}" \
     GDRIVE_OAUTH_REFRESH_TOKEN="${GDRIVE_OAUTH_REFRESH_TOKEN}"

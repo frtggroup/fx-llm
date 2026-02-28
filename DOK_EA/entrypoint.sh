@@ -86,25 +86,16 @@ df -h "${ARTIFACT}" | tail -1
 
 # ── 4. 環境変数 / パス ──────────────────────────────────────────────────────
 export PYTHONPATH="/workspace/ai_ea:${PYTHONPATH}"
-export PYTORCH_CUDA_ALLOC_CONF="expandable_segments:True,max_split_size_mb:512"
-export H100_MODE="${H100_MODE:-1}"
-export MAX_PARALLEL="${MAX_PARALLEL:-3}"
-export VRAM_PER_TRIAL="${VRAM_PER_TRIAL:-10}"
-export DATA_PATH="${DATA_PATH:-/opt/artifact/data/USDJPY_M1.csv}"
-export NODE_ID="${NODE_ID:-h100}"
-# GDrive 環境変数は docker-compose から直接渡される (GDRIVE_FOLDER_ID / GDRIVE_CREDENTIALS_BASE64)
-# torch.compile inductor キャッシュを永続ストレージに置く
-# → コンテナ再起動後も同アーキテクチャは再コンパイル不要
+export DATA_PATH="${DATA_PATH:-/opt/artifact/data/USDJPY_H1.csv}"
+# NODE_ID / H100_MODE / MAX_PARALLEL / VRAM_PER_TRIAL は
+# run_train.py が実測 GPU VRAM から自動計算するため設定不要
 export TORCHINDUCTOR_CACHE_DIR="${ARTIFACT}/torch_inductor_cache"
 mkdir -p "${TORCHINDUCTOR_CACHE_DIR}"
 
 echo "[*] 設定:"
-echo "    NODE_ID      : ${NODE_ID}"
-echo "    H100_MODE    : ${H100_MODE}"
-echo "    MAX_PARALLEL : ${MAX_PARALLEL} 並列"
-echo "    VRAM/試行    : ${VRAM_PER_TRIAL} GB"
 echo "    DATA_PATH    : ${DATA_PATH}"
 echo "    GDRIVE       : ${GDRIVE_FOLDER_ID:-(未設定)}"
+echo "    GPU設定      : run_train.py 起動後に自動検出"
 
 # ── 5. ダッシュボードサーバーを先に起動 (CSV待ちで502にならないよう) ──────
 echo "[*] ダッシュボード起動 (port 8080)..."
@@ -119,36 +110,40 @@ else
     cat /workspace/dashboard.log 2>/dev/null | tail -20
 fi
 
-# ── 6. CSV データ自動ダウンロード (ダッシュボードと並行) ───────────────────
+# ── 6. CSV 自動ダウンロード: GDrive → DATA_URL の順で試みる ─────────────────
 mkdir -p "$(dirname ${DATA_PATH})"
 if [ ! -f "${DATA_PATH}" ] || [ ! -s "${DATA_PATH}" ]; then
-    if [ -n "${DATA_URL}" ]; then
-        echo "[*] CSV ダウンロード中 (DATA_URL): ${DATA_URL}"
-        wget -q --show-progress -O "${DATA_PATH}" "${DATA_URL}" \
-          && echo "[OK] CSV ダウンロード完了 $(du -h ${DATA_PATH} | cut -f1)" \
-          || echo "[ERROR] CSV ダウンロード失敗 — /workspace/data に手動でコピーしてください"
-    elif [ -n "${S3_ENDPOINT}" ] && [ -n "${S3_BUCKET}" ]; then
-        echo "[*] CSV を S3 から自動ダウンロード中..."
-        python -c "
-import boto3, os, sys
-s3 = boto3.client('s3',
-    endpoint_url=os.environ['S3_ENDPOINT'],
-    region_name=os.environ.get('S3_REGION','jp-north-1'),
-    aws_access_key_id=os.environ['S3_ACCESS_KEY'],
-    aws_secret_access_key=os.environ['S3_SECRET_KEY']
-)
-dst = os.environ.get('DATA_PATH','/workspace/data/USDJPY_M1.csv')
+    echo "[*] CSV が見つかりません。自動ダウンロードを試みます..."
+    # 1. Google Drive から取得 (ファイル名は DATA_PATH のベース名と一致させること)
+    python -c "
+import sys, os
+sys.path.insert(0, '/workspace/ai_ea')
+from pathlib import Path
+import gdrive
+dst  = os.environ.get('DATA_PATH', '/workspace/data/USDJPY_H1.csv')
 fname = os.path.basename(dst)
-try:
-    s3.download_file(os.environ['S3_BUCKET'], fname, dst)
-    print(f'[OK] S3からCSVダウンロード完了: {fname} ({os.path.getsize(dst)/1e6:.1f}MB)')
-except Exception as e:
-    print(f'[WARN] S3 CSVダウンロード失敗: {e}')
+if not gdrive.GDRIVE_ENABLED:
+    print('[WARN] GDrive 無効')
     sys.exit(1)
-" && echo "[OK] CSVダウンロード完了" || echo "[WARN] S3にCSVなし — 手動でコピーしてください"
-    else
-        echo "[WARN] DATA_URL / S3 未設定 — ${DATA_PATH} を手動で配置してください"
-    fi
+ok = gdrive.download(fname, Path(dst))
+if ok and Path(dst).exists() and Path(dst).stat().st_size > 0:
+    print(f'[OK] GDrive から CSV ダウンロード完了 ({Path(dst).stat().st_size/1e6:.1f} MB): {fname}')
+    sys.exit(0)
+print('[WARN] GDrive に CSV (', fname, ') が見つかりません')
+sys.exit(1)
+" && echo "[OK] CSV 準備完了 (GDrive)" || {
+        # 2. DATA_URL フォールバック
+        if [ -n "${DATA_URL}" ]; then
+            echo "[*] DATA_URL からダウンロード中: ${DATA_URL}"
+            wget -q --show-progress -O "${DATA_PATH}" "${DATA_URL}" \
+              && echo "[OK] CSV ダウンロード完了 $(du -h ${DATA_PATH} | cut -f1)" \
+              || echo "[ERROR] CSV ダウンロード失敗 — ${DATA_PATH} を手動で配置してください"
+        else
+            echo "[WARN] GDrive にも DATA_URL にも CSV がありません"
+            echo "[WARN] $(basename ${DATA_PATH}) を GDrive フォルダにアップロードするか"
+            echo "[WARN] docker run -e DATA_URL=<url> で指定してください"
+        fi
+    }
 else
     echo "[*] CSV 既存: $(du -h ${DATA_PATH} | cut -f1)"
 fi
@@ -158,8 +153,8 @@ rm -f /workspace/stop.flag
 
 # ── 8. 並列ランダムサーチ学習ループ起動 ────────────────────────────────────
 echo ""
-echo "[*] 並列ランダムサーチ開始  (並列=${MAX_PARALLEL}  VRAM/試行=${VRAM_PER_TRIAL}GB)"
-    echo "    停止するには: http://<DOK_IP>:8080  →「学習停止」ボタン"
+echo "[*] 並列ランダムサーチ開始  (GPU設定は run_train.py が自動検出)"
+echo "    停止するには: http://<IP>:8080  →「学習停止」ボタン"
 echo "    または:       touch /workspace/stop.flag"
 echo ""
 

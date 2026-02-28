@@ -1,25 +1,53 @@
-# SSH 秘密鍵 (絶対にコミットしない)
-DOK/ssh/id_ed25519_dok
-DOK/ssh/id_ed25519_dok.pub
+# ── 認証情報・シークレット (絶対にコミットしない) ──────────────────────────
+gdrive_creds.ps1
+*.env
+.env.*
+secrets/
 
-# Python
+# ── 大容量データファイル ────────────────────────────────────────────────────
+*.csv
+*.pkl
+*.npz
+*.parquet
+s3_backup*/
+volume/
+
+# ── 学習結果・ランタイムファイル ────────────────────────────────────────────
+ai_ea/trials/
+ai_ea/top100/
+ai_ea/top_cache/
+ai_ea/*.json
+ai_ea/*.onnx
+ai_ea/llm_checkpoint/
+ai_ea/llm_adapter/
+ai_ea/unsloth_compiled_cache/
+ai_ea/train_log.txt
+ai_ea/train_err.txt
+data/
+
+# ── ローカル分析スクリプト・結果ファイル ────────────────────────────────────
+*.log
+*.pkl
+*.npz
+results*.json
+configs*.json
+report*.html
+*_log.txt
+*_err.txt
+best_params.json
+best_triple_ma.json
+combo5_result.json
+selected_top5.json
+precomp*.npz
+usdjpy_*.pkl
+unsloth_compiled_cache/
+versions/
+
+# ── Python キャッシュ ───────────────────────────────────────────────────────
 __pycache__/
 *.pyc
 *.pyo
-.venv/
-venv/
+.pytest_cache/
 
-# データ・モデル (大容量)
-*.csv
-*.pt
-*.safetensors
-llm_adapter/
-llm_adapter_best/
-llm_checkpoint/
-hf_cache/
-
-# ログ・一時ファイル
-*.log
-*.tmp
-llm_progress.json
-llm_dashboard.html
+# ── Docker ─────────────────────────────────────────────────────────────────
+.docker/
