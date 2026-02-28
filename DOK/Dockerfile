@@ -74,6 +74,11 @@ RUN pip install --no-cache-dir \
     && echo "[OK] torch_xla 2.6.0 + libtpu SDK インストール完了" \
     || echo "[WARN] torch_xla インストールスキップ (GPU/CPU イメージとして続行)"
 
+# ── tpu-info (TPU チップ監視 CLI) ────────────────────────────────────────────
+RUN pip install --no-cache-dir tpu-info \
+    && echo "[OK] tpu-info インストール完了" \
+    || echo "[WARN] tpu-info インストールスキップ"
+
 # ── SSH setup ────────────────────────────────────────────────────────────────
 RUN mkdir -p /var/run/sshd /root/.ssh && \
     chmod 700 /root/.ssh && \

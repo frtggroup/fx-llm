@@ -200,10 +200,13 @@ sudo docker run -d \\
   --name fx-ea-tpu \\
   --privileged \\
   --net=host \\
+  --shm-size=16g \\
+  -v /dev/shm:/dev/shm \\
   --restart=unless-stopped \\
   -e PJRT_DEVICE=TPU \\
-  -e TPU_NUM_DEVICES=1 \\
+  -e TPU_NUM_DEVICES=4 \\
   -e TPU_ACCELERATOR_TYPE=v6e-4 \\
+  -e MAX_PARALLEL=1 \\
   {image}
 
 sleep 8
