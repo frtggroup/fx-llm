@@ -27,7 +27,11 @@ if [ -z "${CUDA_VISIBLE_DEVICES+x}" ] || [ "${CUDA_VISIBLE_DEVICES}" = "" ]; the
         echo "[*] CUDA_VISIBLE_DEVICES を 0 にリセット (torch_xla 干渉防止)"
     fi
 fi
-export PJRT_DEVICE=CUDA   # torch_xla が CPU にフォールバックするのを防ぐ
+# PJRT_DEVICE は docker run -e PJRT_DEVICE=TPU 等で明示的に指定された場合はそれを尊重
+# 未設定の場合のみ CUDA にデフォルト設定 (torch_xla が CPU にフォールバックするのを防ぐ)
+if [ -z "${PJRT_DEVICE}" ]; then
+    export PJRT_DEVICE=CUDA
+fi
 
 # ── 1. デバイス自動検出 (--gpus / --privileged 不要) ─────────────────────────
 echo "[*] デバイス検出中..."
@@ -117,6 +121,8 @@ case "$DEVICE_TYPE" in
         ;;
     TPU)
         echo "[OK] TPU 検出: ${GPU_NAME}"
+        # PJRT_DEVICE を確実に TPU に設定 (entrypoint の CUDA 上書きを打ち消す)
+        export PJRT_DEVICE=TPU
         # torch_xla 確認 / 未インストールならフォールバックインストール
         if python3 -c "import torch_xla" 2>/dev/null; then
             echo "[OK] torch_xla 利用可能"
