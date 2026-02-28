@@ -28,9 +28,14 @@ Google Drive 共有ストレージモジュール
 """
 
 from __future__ import annotations
-import base64, io, json, os, threading
+import base64, io, json, os, threading, time
 from pathlib import Path
 from typing import Optional
+
+
+def _glog(msg: str) -> None:
+    """タイムスタンプ付き GDrive ログ"""
+    print(f'  [GDrive {time.strftime("%H:%M:%S")}] {msg}', flush=True)
 
 GDRIVE_FOLDER_ID   = os.environ.get('GDRIVE_FOLDER_ID', '')
 GDRIVE_CREDS_B64   = os.environ.get('GDRIVE_CREDENTIALS_BASE64', '')
@@ -58,7 +63,8 @@ def _build_service():
     list/download/upload 含む全 API コールが無限待ちにならないようにする。
     """
     import socket
-    socket.setdefaulttimeout(_HTTP_TIMEOUT)   # 根本解決: 全ソケット操作にタイムアウト
+    socket.setdefaulttimeout(_HTTP_TIMEOUT)
+    _glog(f'_build_service: 開始 (socket_timeout={_HTTP_TIMEOUT}s, OAuth={_USE_OAUTH})')
 
     from googleapiclient.discovery import build
 
@@ -72,14 +78,19 @@ def _build_service():
             client_secret=GDRIVE_OAUTH_CLIENT_SECRET,
             token_uri='https://oauth2.googleapis.com/token',
         )
+        _glog('_build_service: OAuth2 token refresh 開始')
         creds.refresh(Request())
+        _glog('_build_service: OAuth2 token refresh 完了')
     else:
         from google.oauth2 import service_account
         creds_json = base64.b64decode(GDRIVE_CREDS_B64).decode('utf-8')
         info = json.loads(creds_json)
         creds = service_account.Credentials.from_service_account_info(info, scopes=_SCOPES)
+        _glog('_build_service: サービスアカウント認証設定完了')
 
-    return build('drive', 'v3', credentials=creds, cache_discovery=False)
+    svc = build('drive', 'v3', credentials=creds, cache_discovery=False)
+    _glog('_build_service: Drive API サービス構築完了')
+    return svc
 
 
 _svc_lock = threading.Lock()
@@ -101,6 +112,7 @@ def _get_or_create_folder(parent_id: str, name: str) -> str:
         if cache_key in _folder_cache:
             return _folder_cache[cache_key]
 
+    _t0 = time.time()
     svc = _svc()
     q = (f"'{parent_id}' in parents and name='{name}' "
          f"and mimeType='application/vnd.google-apps.folder' and trashed=false")
@@ -108,10 +120,12 @@ def _get_or_create_folder(parent_id: str, name: str) -> str:
     files = res.get('files', [])
     if files:
         fid = files[0]['id']
+        _glog(f'_get_or_create_folder: "{name}" 既存 ({time.time()-_t0:.1f}s)')
     else:
         meta = {'name': name, 'mimeType': 'application/vnd.google-apps.folder',
                 'parents': [parent_id]}
         fid = svc.files().create(body=meta, fields='id').execute()['id']
+        _glog(f'_get_or_create_folder: "{name}" 新規作成 ({time.time()-_t0:.1f}s)')
 
     with _cache_lock:
         _folder_cache[cache_key] = fid
@@ -212,6 +226,9 @@ def upload(local_path: Path, rel_key: str, timeout: float = 120.0) -> bool:
     if not GDRIVE_ENABLED:
         return False
 
+    size_kb = round(Path(local_path).stat().st_size / 1024, 1) if Path(local_path).exists() else 0
+    _glog(f'upload 開始: {rel_key} ({size_kb} KB, timeout={timeout:.0f}s)')
+    _t0 = time.time()
     result = [False]
     error  = [None]
 
@@ -219,15 +236,20 @@ def upload(local_path: Path, rel_key: str, timeout: float = 120.0) -> bool:
         try:
             from googleapiclient.http import MediaFileUpload
             svc = _svc()
+            _glog(f'upload [{rel_key}]: _resolve_folder 開始')
             folder_id, fname = _resolve_folder(rel_key)
+            _glog(f'upload [{rel_key}]: _find_file 開始')
             mime = _guess_mime(fname)
             media = MediaFileUpload(str(local_path), mimetype=mime, resumable=False)
             existing_id = _find_file(folder_id, fname)
             if existing_id:
+                _glog(f'upload [{rel_key}]: update().execute() 開始 (既存ファイル)')
                 svc.files().update(fileId=existing_id, media_body=media).execute()
             else:
+                _glog(f'upload [{rel_key}]: create().execute() 開始 (新規ファイル)')
                 meta = {'name': fname, 'parents': [folder_id]}
                 svc.files().create(body=meta, media_body=media, fields='id').execute()
+            _glog(f'upload [{rel_key}]: execute() 完了 ({time.time()-_t0:.1f}s)')
             result[0] = True
         except Exception as e:
             error[0] = e
@@ -235,12 +257,14 @@ def upload(local_path: Path, rel_key: str, timeout: float = 120.0) -> bool:
     t = threading.Thread(target=_do_upload, daemon=True)
     t.start()
     t.join(timeout)
+    elapsed = time.time() - _t0
     if t.is_alive():
-        print(f'  [GDrive] upload タイムアウト ({timeout:.0f}s): {rel_key}')
+        _glog(f'upload タイムアウト ({timeout:.0f}s): {rel_key}')
         return False
     if error[0]:
-        print(f'  [GDrive] upload失敗 {rel_key}: {error[0]}')
+        _glog(f'upload 失敗 {rel_key} ({elapsed:.1f}s): {error[0]}')
         return False
+    _glog(f'upload 成功: {rel_key} ({elapsed:.1f}s)')
     return result[0]
 
 
@@ -253,8 +277,8 @@ def download(rel_key: str, local_path: Path, timeout: float = 60.0) -> bool:
     if not GDRIVE_ENABLED:
         return False
 
-    import threading as _threading
-
+    _glog(f'download 開始: {rel_key} (timeout={timeout:.0f}s)')
+    _t0 = time.time()
     result = [False]
     error  = [None]
 
@@ -262,18 +286,27 @@ def download(rel_key: str, local_path: Path, timeout: float = 60.0) -> bool:
         try:
             from googleapiclient.http import MediaIoBaseDownload
             svc = _svc()
+            _glog(f'download [{rel_key}]: _resolve_folder 開始')
             folder_id, fname = _resolve_folder(rel_key)
+            _glog(f'download [{rel_key}]: _find_file 開始')
             fid = _find_file(folder_id, fname)
             if not fid:
+                _glog(f'download [{rel_key}]: ファイル未存在 → スキップ')
                 return
             local_path.parent.mkdir(parents=True, exist_ok=True)
+            _glog(f'download [{rel_key}]: get_media → チャンクDL開始')
             request = svc.files().get_media(fileId=fid)
             buf = io.BytesIO()
             dl = MediaIoBaseDownload(buf, request, chunksize=4 * 1024 * 1024)
             done = False
+            chunk_n = 0
             while not done:
                 _, done = dl.next_chunk()
+                chunk_n += 1
+                _glog(f'download [{rel_key}]: chunk #{chunk_n} 完了 done={done}')
+            size_kb = round(len(buf.getvalue()) / 1024, 1)
             local_path.write_bytes(buf.getvalue())
+            _glog(f'download [{rel_key}]: 書き込み完了 ({size_kb} KB, {time.time()-_t0:.1f}s)')
             result[0] = True
         except Exception as e:
             error[0] = e
@@ -281,11 +314,12 @@ def download(rel_key: str, local_path: Path, timeout: float = 60.0) -> bool:
     t = threading.Thread(target=_do_download, daemon=True)
     t.start()
     t.join(timeout=timeout)
+    elapsed = time.time() - _t0
     if t.is_alive():
-        print(f'  [GDrive] download タイムアウト ({timeout:.0f}s): {rel_key} → スキップ')
+        _glog(f'download タイムアウト ({timeout:.0f}s): {rel_key} → スキップ')
         return False
     if error[0]:
-        print(f'  [GDrive] download失敗 {rel_key}: {error[0]}')
+        _glog(f'download 失敗 {rel_key} ({elapsed:.1f}s): {error[0]}')
         return False
     return result[0]
 
@@ -319,6 +353,8 @@ def list_keys_recursive(folder_prefix: str, timeout: float = 30.0) -> list[str]:
     if not GDRIVE_ENABLED:
         return []
 
+    _glog(f'list_recursive 開始: {folder_prefix}* (timeout={timeout:.0f}s)')
+    _t0 = time.time()
     result: list[list] = [[]]
     error:  list[Exception] = [None]
 
@@ -330,11 +366,13 @@ def list_keys_recursive(folder_prefix: str, timeout: float = 30.0) -> list[str]:
             def _recurse(parent_id: str, rel_base: str):
                 q = f"'{parent_id}' in parents and trashed=false"
                 page_token = None
+                page_n = 0
                 while True:
                     kwargs = dict(q=q, fields='files(id,name,mimeType)', pageSize=200)
                     if page_token:
                         kwargs['pageToken'] = page_token
                     res = svc.files().list(**kwargs).execute()
+                    page_n += 1
                     for item in res.get('files', []):
                         rel = f'{rel_base}/{item["name"]}' if rel_base else item['name']
                         if item['mimeType'] == 'application/vnd.google-apps.folder':
@@ -344,13 +382,16 @@ def list_keys_recursive(folder_prefix: str, timeout: float = 30.0) -> list[str]:
                     page_token = res.get('nextPageToken')
                     if not page_token:
                         break
+                _glog(f'list_recursive [{rel_base}]: {page_n}ページ {len(found)}件')
 
+            _glog(f'list_recursive: ルートフォルダ一覧取得開始')
             q = (f"'{GDRIVE_FOLDER_ID}' in parents and trashed=false and "
                  f"mimeType='application/vnd.google-apps.folder'")
             res = svc.files().list(q=q, fields='files(id,name)', pageSize=100).execute()
-            for f in res.get('files', []):
-                if f['name'].startswith(folder_prefix):
-                    _recurse(f['id'], f['name'])
+            folders = [f for f in res.get('files', []) if f['name'].startswith(folder_prefix)]
+            _glog(f'list_recursive: 対象フォルダ {len(folders)}個: {[f["name"] for f in folders]}')
+            for f in folders:
+                _recurse(f['id'], f['name'])
             result[0] = found
         except Exception as e:
             error[0] = e
@@ -358,12 +399,14 @@ def list_keys_recursive(folder_prefix: str, timeout: float = 30.0) -> list[str]:
     t = threading.Thread(target=_do, daemon=True)
     t.start()
     t.join(timeout=timeout)
+    elapsed = time.time() - _t0
     if t.is_alive():
-        print(f'  [GDrive] list_recursive タイムアウト ({timeout:.0f}s): {folder_prefix}* → スキップ')
+        _glog(f'list_recursive タイムアウト ({timeout:.0f}s): {folder_prefix}* → スキップ')
         return []
     if error[0]:
-        print(f'  [GDrive] list_recursive失敗: {error[0]}')
+        _glog(f'list_recursive 失敗 ({elapsed:.1f}s): {error[0]}')
         return []
+    _glog(f'list_recursive 完了: {len(result[0])}件 ({elapsed:.1f}s)')
     return result[0]
 
 
@@ -393,22 +436,29 @@ def upload_bytes(data: bytes, rel_key: str) -> bool:
     """bytes データをファイルとして GDrive にアップロード"""
     if not GDRIVE_ENABLED:
         return False
+    _glog(f'upload_bytes 開始: {rel_key} ({len(data)/1024:.1f} KB)')
+    _t0 = time.time()
     try:
         from googleapiclient.http import MediaIoBaseUpload
         svc = _svc()
+        _glog(f'upload_bytes [{rel_key}]: _resolve_folder 開始')
         folder_id, fname = _resolve_folder(rel_key)
+        _glog(f'upload_bytes [{rel_key}]: _find_file 開始')
         mime = _guess_mime(fname)
         buf = io.BytesIO(data)
         media = MediaIoBaseUpload(buf, mimetype=mime, resumable=False)
         existing_id = _find_file(folder_id, fname)
         if existing_id:
+            _glog(f'upload_bytes [{rel_key}]: update().execute() 開始')
             svc.files().update(fileId=existing_id, media_body=media).execute()
         else:
+            _glog(f'upload_bytes [{rel_key}]: create().execute() 開始')
             meta = {'name': fname, 'parents': [folder_id]}
             svc.files().create(body=meta, media_body=media, fields='id').execute()
+        _glog(f'upload_bytes 成功: {rel_key} ({time.time()-_t0:.1f}s)')
         return True
     except Exception as e:
-        print(f'  [GDrive] upload_bytes失敗 {rel_key}: {e}')
+        _glog(f'upload_bytes 失敗 {rel_key} ({time.time()-_t0:.1f}s): {e}')
         return False
 
 
@@ -417,33 +467,41 @@ def download_bytes(rel_key: str, timeout: float = 60.0) -> Optional[bytes]:
     if not GDRIVE_ENABLED:
         return None
 
-    import threading as _threading
-
+    _glog(f'download_bytes 開始: {rel_key} (timeout={timeout:.0f}s)')
+    _t0 = time.time()
     result = [None]
 
     def _do():
         try:
             from googleapiclient.http import MediaIoBaseDownload
             svc = _svc()
+            _glog(f'download_bytes [{rel_key}]: _resolve_folder 開始')
             folder_id, fname = _resolve_folder(rel_key)
+            _glog(f'download_bytes [{rel_key}]: _find_file 開始')
             fid = _find_file(folder_id, fname)
             if not fid:
+                _glog(f'download_bytes [{rel_key}]: ファイル未存在')
                 return
+            _glog(f'download_bytes [{rel_key}]: get_media → チャンクDL開始')
             request = svc.files().get_media(fileId=fid)
             buf = io.BytesIO()
             dl = MediaIoBaseDownload(buf, request, chunksize=4 * 1024 * 1024)
             done = False
+            chunk_n = 0
             while not done:
                 _, done = dl.next_chunk()
+                chunk_n += 1
+            size_kb = round(len(buf.getvalue()) / 1024, 1)
+            _glog(f'download_bytes [{rel_key}]: 完了 ({size_kb} KB, {chunk_n}chunks, {time.time()-_t0:.1f}s)')
             result[0] = buf.getvalue()
         except Exception as e:
-            print(f'  [GDrive] download_bytes失敗 {rel_key}: {e}')
+            _glog(f'download_bytes 失敗 {rel_key} ({time.time()-_t0:.1f}s): {e}')
 
     t = threading.Thread(target=_do, daemon=True)
     t.start()
     t.join(timeout=timeout)
     if t.is_alive():
-        print(f'  [GDrive] download_bytes タイムアウト ({timeout:.0f}s): {rel_key}')
+        _glog(f'download_bytes タイムアウト ({timeout:.0f}s): {rel_key}')
         return None
     return result[0]
 
