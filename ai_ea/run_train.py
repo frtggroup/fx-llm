@@ -1052,25 +1052,34 @@ def save_checkpoint(results: list, best_pf: float) -> None:
         print(f'  [CKPT] ローカル保存完了 node={NODE_ID} ({len(own)}件 / bestPF={best_pf:.4f})')
 
         if S3_ENABLED:
+            # 軽量ファイル (結果JSON / best / meta) は同期でアップロード
             ok = 0
-            # 結果 JSON
             if s3_upload(CHECKPOINT_DIR / own_key, own_key): ok += 1
             if s3_upload(CHECKPOINT_DIR / meta_name, meta_name): ok += 1
-            # best model
             for name in [f'best_{NODE_ID}/fx_model_best.onnx',
                          f'best_{NODE_ID}/norm_params_best.json',
                          f'best_{NODE_ID}/best_result.json']:
                 p = CHECKPOINT_DIR / name
                 if p.exists() and s3_upload(p, name): ok += 1
-            # top100 モデルをアップロード
-            top100_ok = 0
-            if top_dst.exists():
+
+            # top100 (大量ファイル) はバックグラウンドスレッドで差分のみアップロード
+            # → メインループをブロックしない
+            def _upload_top100_bg(top_dst=top_dst):
+                top100_ok = 0
+                if not top_dst.exists():
+                    return
                 for f in top_dst.rglob('*'):
-                    if f.is_file():
-                        rel = str(f.relative_to(CHECKPOINT_DIR)).replace('\\', '/')
-                        s3_rel = f'top100_{NODE_ID}/{f.relative_to(top_dst)}'.replace('\\', '/')
-                        if s3_upload(f, s3_rel): top100_ok += 1
-            print(f'  [S3]  アップロード完了 node={NODE_ID} ({ok}件 + top100:{top100_ok}件) '
+                    if not f.is_file():
+                        continue
+                    s3_rel = f'top100_{NODE_ID}/{f.relative_to(top_dst)}'.replace('\\', '/')
+                    if s3_upload(f, s3_rel):
+                        top100_ok += 1
+                if top100_ok:
+                    print(f'  [S3]  top100アップロード完了 ({top100_ok}件)')
+
+            import threading
+            threading.Thread(target=_upload_top100_bg, daemon=True).start()
+            print(f'  [S3]  アップロード完了 node={NODE_ID} ({ok}件 + top100:BG) '
                   f'→ s3://{S3_BUCKET}/{S3_PREFIX}/')
         else:
             print(f'  [CKPT] S3未設定 → ローカルのみ保存 ({CHECKPOINT_DIR})')

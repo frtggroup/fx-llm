@@ -811,8 +811,9 @@ def _run_inference(sess, x: np.ndarray, mode: str) -> np.ndarray:
 
 def calc_feature_importance(model, X_te: np.ndarray,
                             feat_indices: list | None,
-                            n_samples: int = 300) -> list[tuple[str, float]]:
-    """Permutation Importance: 各特徴量をシャッフルして予測変化量を測定。
+                            n_samples: int = 100) -> list[tuple[str, float]]:
+    """Permutation Importance: 全特徴量を1バッチで並列シャッフル推論 (高速版)。
+    特徴量ごとのループをバッチ化してGPU転送回数を削減。
     Returns: [(feat_name, importance_score), ...] 降順ソート済み
     """
     import torch
@@ -823,22 +824,32 @@ def calc_feature_importance(model, X_te: np.ndarray,
     X_s = np.ascontiguousarray(X_te[:n])   # (n, seq, feat)
     n_feat = X_s.shape[2]
 
-    with torch.no_grad():
-        xb = torch.from_numpy(X_s).to(device)
-        base_probs = model(xb).float().cpu().numpy()   # (n, 3)
-
-    # baseline: 予測エントロピー (確信度の逆)
-    base_ent = float(-np.mean(base_probs * np.log(base_probs + 1e-9)))
-
     rng = np.random.default_rng(42)
+    # 全特徴量分のシャッフル済みデータを一括生成 (n_feat, n, seq, feat)
+    X_all = np.stack([X_s.copy() for _ in range(n_feat)], axis=0)
+    for i in range(n_feat):
+        perm = rng.permutation(n)
+        X_all[i, :, :, i] = X_all[i, perm, :, i]
+
+    with torch.no_grad():
+        # baseline
+        xb = torch.from_numpy(X_s).to(device)
+        base_probs = model(xb).float().cpu().numpy()
+        base_ent = float(-np.mean(base_probs * np.log(base_probs + 1e-9)))
+
+        # 全特徴量を結合してまとめて推論 (n_feat*n, seq, feat)
+        X_flat = X_all.reshape(n_feat * n, X_s.shape[1], n_feat)
+        bs = 512
+        perm_probs_list = []
+        for start in range(0, len(X_flat), bs):
+            xb = torch.from_numpy(np.ascontiguousarray(X_flat[start:start+bs])).to(device)
+            perm_probs_list.append(model(xb).float().cpu().numpy())
+        perm_probs_all = np.concatenate(perm_probs_list, axis=0).reshape(n_feat, n, 3)
+
     importances = []
     for i in range(n_feat):
-        X_p = X_s.copy()
-        X_p[:, :, i] = X_p[rng.permutation(n), :, i]   # shuffle feature i
-        with torch.no_grad():
-            xb = torch.from_numpy(np.ascontiguousarray(X_p)).to(device)
-            perm_probs = model(xb).float().cpu().numpy()
-        perm_ent = float(-np.mean(perm_probs * np.log(perm_probs + 1e-9)))
+        pp = perm_probs_all[i]
+        perm_ent = float(-np.mean(pp * np.log(pp + 1e-9)))
         score = abs(perm_ent - base_ent)
         global_idx = feat_indices[i] if feat_indices else i
         fname = FEATURE_COLS[global_idx] if global_idx < len(FEATURE_COLS) else f'feat_{global_idx}'
@@ -1257,11 +1268,12 @@ def run_trial_worker(trial_no: int, params: dict, trial_dir_str: str,
             except Exception as _e:
                 print(f"  [WARN] ONNX エクスポート失敗: {_e}")
 
-        # ── 特徴量重要度 (取引 >= 10 で計算) ────────────────────────────────────
+        # ── 特徴量重要度 (ONNX保存対象 trades>=200 のみ計算 / 軽量化)
+        # trades < 200 のゴミモデルに時間を使わない → H100 速度改善
         feat_imp = []
-        if r['trades'] >= 10:
+        if r['trades'] >= 200:
             try:
-                feat_imp = calc_feature_importance(wrapped, X_te, feat_indices, n_samples=200)
+                feat_imp = calc_feature_importance(wrapped, X_te, feat_indices, n_samples=100)
                 top5 = ', '.join(f'{n}({s:.4f})' for n, s in feat_imp[:5])
                 print(f"  特徴量重要度 TOP5: {top5}")
             except Exception as _e:
