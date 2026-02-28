@@ -57,9 +57,8 @@ if nv and nv not in ('none', 'void', 'NoDevFiles'):
             sys.exit(0)
     except Exception:
         pass
-    # それでも取れない場合: GPU は存在するが詳細不明として継続
-    print(f"GPU|Unknown GPU (NVDEV={nv})|0")
-    sys.exit(0)
+    # GPU 確認失敗 → TPU VM 上で NVIDIA_VISIBLE_DEVICES=all が誤設定されている可能性
+    # fall-through して TPU チェックに進む (Unknown GPU として終了しない)
 
 # ── 3. torch.cuda 直接確認 (NVIDIA_VISIBLE_DEVICES がない環境向け) ──────────
 try:

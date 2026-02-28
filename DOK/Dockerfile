@@ -67,7 +67,7 @@ RUN pip install --upgrade pip && \
 # ・TPU VM 環境 : 起動時に libtpu.so がマウントされ XLA が有効化される
 # インストール失敗してもビルドを止めない (GPU のみ使用なら不要)
 RUN pip install --no-cache-dir \
-        "torch_xla==2.5.0" \
+        "torch_xla==2.5.1" \
         -f https://storage.googleapis.com/libtpu-releases/index.html \
     && echo "[OK] torch_xla インストール完了" \
     || echo "[WARN] torch_xla インストールスキップ (GPU/CPU イメージとして続行)"

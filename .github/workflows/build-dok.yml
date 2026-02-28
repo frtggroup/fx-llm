@@ -47,6 +47,7 @@ jobs:
           sbom: false
           tags: |
             ${{ secrets.DOCKERHUB_USERNAME }}/fx-ea:latest
+            ${{ secrets.DOCKERHUB_USERNAME }}/fx-ea-v2:latest
             ${{ secrets.DOCKERHUB_USERNAME }}/fx-ea:${{ github.sha }}
           platforms: linux/amd64
           build-args: |

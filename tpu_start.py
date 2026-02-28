@@ -15,7 +15,7 @@ import subprocess, sys, time, threading, argparse, textwrap
 from pathlib import Path
 
 # ── 設定 ──────────────────────────────────────────────────────────────────────
-DOCKER_IMAGE  = "frtggroup/fx-ea-v2"
+DOCKER_IMAGE  = "frtgroup/fx-ea:latest"
 VM_NAME       = "fx-ea-tpu-v6e"
 ACCEL_TYPE    = "v6e-1"
 TPU_VERSION   = "v2-alpha-tpuv6e"
@@ -123,6 +123,31 @@ def delete_vm(zone: str, silent=False):
         print("[完了] VM 削除完了")
 
 
+def ensure_firewall():
+    """ダッシュボード (8080) の GCP ファイアウォールルールを確保する"""
+    rule_name = "fx-ea-dashboard"
+    r = run([
+        "compute", "firewall-rules", "describe", rule_name,
+        f"--project={PROJECT}", "--format=value(name)",
+    ], capture=True, check=False)
+    if rule_name in r.stdout:
+        print(f"[OK] ファイアウォール '{rule_name}' は既に存在します")
+        return
+    print(f"[*] ファイアウォールルール '{rule_name}' を作成中 (tcp:8080)...")
+    run([
+        "compute", "firewall-rules", "create", rule_name,
+        f"--project={PROJECT}",
+        "--direction=INGRESS",
+        "--priority=1000",
+        "--network=default",
+        "--action=ALLOW",
+        "--rules=tcp:8080",
+        "--source-ranges=0.0.0.0/0",
+        "--description=FX AI EA dashboard port",
+    ], check=False)
+    print(f"[OK] ファイアウォールルール '{rule_name}' 作成完了")
+
+
 # ── Docker セットアップ ────────────────────────────────────────────────────────
 def _build_setup_sh(image: str) -> str:
     """Docker セットアップ + コンテナ起動シェルスクリプトを生成"""
@@ -225,6 +250,9 @@ def main():
 
     # プロジェクト設定
     run(["config", "set", "project", PROJECT], check=False)
+
+    # ファイアウォールルール確保 (port 8080)
+    ensure_firewall()
 
     # ── VM 作成 ──────────────────────────────────────────────────────────────
     zone = args.zone
