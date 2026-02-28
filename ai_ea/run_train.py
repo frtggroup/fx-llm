@@ -1119,12 +1119,16 @@ class WorkerPool:
         self._futures: dict = {}   # trial_no -> Future
         self._meta:    dict = {}   # trial_no -> {params, strategy, start_time, trial_dir}
         self.lock           = threading.Lock()
-        print(f"  [WorkerPool] {max_workers}ワーカー起動中... (初回のみ数秒かかります)")
+        # GPU メモリを並列数で分割して OOM / segfault を防止
+        # micro (11GB) で 2並列なら 0.48 ずつ割り当て
+        self._gpu_mem_fraction = max(0.1, min(0.95, 0.96 / max(1, max_workers)))
+        print(f"  [WorkerPool] {max_workers}ワーカー起動中... "
+              f"GPU_MEM={self._gpu_mem_fraction:.2f}/worker (初回のみ数秒かかります)")
         self._executor = _cf.ProcessPoolExecutor(
             max_workers=max_workers,
             mp_context=_mp.get_context('spawn'),
             initializer=_worker_init_proxy,
-            initargs=(str(TRAIN_PY.parent), self._cache_path),
+            initargs=(str(TRAIN_PY.parent), self._cache_path, self._gpu_mem_fraction),
         )
         # ウォームアップ: ワーカーを全部起こしてCUDAを初期化させる
         import concurrent.futures as _cf2
@@ -1136,19 +1140,34 @@ class WorkerPool:
         """BrokenProcessPool 発生時に executor を再作成する"""
         import concurrent.futures as _cf
         import multiprocessing as _mp
+        import signal as _signal
         print(f"  [WorkerPool] executor 再起動中...")
+        # 旧 executor のワーカー PID を収集して kill
+        try:
+            old_pids = list(self._executor._processes.keys())
+        except Exception:
+            old_pids = []
         try:
             self._executor.shutdown(wait=False, cancel_futures=True)
         except Exception:
             pass
+        # ゾンビワーカーを強制終了
+        for pid in old_pids:
+            try:
+                import os as _os
+                _os.kill(pid, _signal.SIGKILL)
+                print(f"  [WorkerPool] ゾンビワーカー PID={pid} を KILL")
+            except Exception:
+                pass
         # 壊れた futures / meta を破棄
         self._futures.clear()
         self._meta.clear()
+        time.sleep(2)   # プロセス終了を待つ
         self._executor = _cf.ProcessPoolExecutor(
             max_workers=self._max_workers,
             mp_context=_mp.get_context('spawn'),
             initializer=_worker_init_proxy,
-            initargs=(str(TRAIN_PY.parent), self._cache_path),
+            initargs=(str(TRAIN_PY.parent), self._cache_path, self._gpu_mem_fraction),
         )
         print(f"  [WorkerPool] executor 再起動完了 ({self._max_workers}ワーカー)")
 
@@ -1192,9 +1211,19 @@ class WorkerPool:
               f"h={params['hidden']:4d}  feat={feat_info}")
 
     def poll_completed(self) -> list:
+        import concurrent.futures as _cf
         done = []
         now  = time.time()
         broken = False
+
+        # executor 自体が壊れているか直接チェック (segfault 等)
+        try:
+            exec_broken = getattr(self._executor, '_broken', False)
+            if exec_broken:
+                broken = True
+        except Exception:
+            pass
+
         with self.lock:
             for tno in list(self._futures.keys()):
                 future = self._futures[tno]
@@ -1202,14 +1231,19 @@ class WorkerPool:
                 elapsed = now - meta['start_time']
 
                 if future.done():
-                    # future が BrokenProcessPool で終了しているか確認
+                    # future.exception() 自体が BrokenExecutor を raise する場合がある
                     try:
                         exc = future.exception(timeout=0)
                         if exc is not None:
                             ename = type(exc).__name__
-                            if 'BrokenProcessPool' in ename or 'broken' in str(exc).lower():
+                            if ('BrokenProcessPool' in ename
+                                    or 'BrokenExecutor' in ename
+                                    or 'broken' in str(exc).lower()):
                                 broken = True
                             print(f"  [WARN] 試行#{tno} 例外終了: {ename}: {exc}")
+                    except _cf.BrokenExecutor as _be:
+                        broken = True
+                        print(f"  [WARN] 試行#{tno} executor破損検出: {_be}")
                     except Exception:
                         pass
                     done.append((tno, meta))
@@ -1221,8 +1255,14 @@ class WorkerPool:
                     done.append((tno, meta))
                     del self._futures[tno]
                     del self._meta[tno]
+                elif broken:
+                    # executor 破損 → 残り全ての future も強制削除
+                    done.append((tno, meta))
+                    del self._futures[tno]
+                    del self._meta[tno]
+
         if broken:
-            print(f"  [WorkerPool] BrokenProcessPool 検出 → executor 再起動")
+            print(f"  [WorkerPool] executor破損検出 → 再起動")
             self._restart_executor()
         return done
 
@@ -1249,10 +1289,19 @@ class WorkerPool:
         return min(len(self._futures), self._max_workers)
 
 
-def _worker_init_proxy(train_py_dir: str, cache_pkl_path: str) -> None:
+def _worker_init_proxy(train_py_dir: str, cache_pkl_path: str,
+                       gpu_mem_fraction: float = 0.0) -> None:
     """spawn ワーカーの初期化 (pickleできる関数でなければならない)"""
     import sys as _sys
     _sys.path.insert(0, train_py_dir)
+    # GPU メモリ上限を設定してワーカー間の OOM / segfault を防ぐ
+    if gpu_mem_fraction > 0.0:
+        try:
+            import torch
+            if torch.cuda.is_available():
+                torch.cuda.set_per_process_memory_fraction(gpu_mem_fraction, 0)
+        except Exception:
+            pass
     from train import worker_init
     worker_init(cache_pkl_path)
 
