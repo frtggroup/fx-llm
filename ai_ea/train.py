@@ -359,9 +359,14 @@ def _detect_device():
 
     # entrypoint.sh が GPU と判定済み → 即 CUDA を返す（torch_xla 干渉を回避）
     if _dt == "GPU":
+        # torch_xla がワーカープロセス起動時に CUDA_VISIBLE_DEVICES を空にする場合があるため
+        # DEVICE_TYPE=GPU が指定されていれば強制的にリセットしてから確認する
+        if not _os.environ.get('CUDA_VISIBLE_DEVICES'):
+            _os.environ['CUDA_VISIBLE_DEVICES'] = '0'
+        _os.environ['PJRT_DEVICE'] = 'CUDA'
         if torch.cuda.is_available():
             return torch.device('cuda'), 'cuda'
-        # GPU と言われても cuda が使えない場合は警告して続行
+        # それでも使えない場合は警告して続行
         print("  [WARN] DEVICE_TYPE=GPU だが torch.cuda.is_available()=False — CPU にフォールバック")
         return torch.device('cpu'), 'cpu'
 
