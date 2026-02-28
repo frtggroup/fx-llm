@@ -567,8 +567,11 @@ TRIAL_TIMEOUT = _TIER_TIMEOUT[_GPU_TIER]
 
 # ── epoch 進捗ストール検出 ──────────────────────────────────────────────────────
 # 固定タイムアウトではなく「epochが進まない時間」で強制終了する
-EP_STALL_INIT_SEC  = 180   # ep=0 のまま 3分 → CUDA初期化/データ準備ハング
-EP_STALL_TRAIN_SEC = 300   # ep>0 で epoch変化なし 5分 → 学習ハング
+# TPU (XLA) は初回グラフコンパイルに 5〜10 分かかるため長めに設定
+_is_tpu_env = (os.environ.get('DEVICE_TYPE', '').upper() == 'TPU'
+               or os.environ.get('PJRT_DEVICE', '').upper() == 'TPU')
+EP_STALL_INIT_SEC  = 900 if _is_tpu_env else 180   # TPU:15分 / GPU:3分
+EP_STALL_TRAIN_SEC = 600 if _is_tpu_env else 300   # TPU:10分 / GPU:5分
 
 
 def _read_trial_epoch(trial_dir) -> int:

@@ -41,6 +41,12 @@ export PYTHONPATH="/workspace/ai_ea:${PYTHONPATH}"
 export DATA_PATH="${DATA_PATH:-/workspace/data/USDJPY_H1.csv}"
 # NODE_ID / MAX_PARALLEL / VRAM_PER_TRIAL は run_train.py が TPU から自動検出
 
+# XLA コンパイルキャッシュ: 2回目以降のコンパイルを大幅高速化
+export XLA_FLAGS="${XLA_FLAGS} --xla_gpu_enable_persistent_cache=true"
+export XLA_CACHE_DIR="/tmp/xla_cache"
+mkdir -p /tmp/xla_cache
+echo "[OK] XLA キャッシュ: /tmp/xla_cache"
+
 echo "[*] 設定:"
 echo "    DATA_PATH    : ${DATA_PATH}"
 echo "    GDRIVE       : ${GDRIVE_FOLDER_ID:-(未設定)}"
