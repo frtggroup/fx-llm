@@ -62,15 +62,15 @@ COPY DOK/requirements.txt /tmp/requirements.txt
 RUN pip install --upgrade pip && \
     pip install --no-cache-dir -r /tmp/requirements.txt
 
-# ── torch_xla (GPU・TPU 両対応 / ビルド時に組み込み) ─────────────────────────
-# torch_xla の Python ホイールをインストール。
-# ・GPU/CPU 環境: import は通るが XLA デバイスは使われない (安全に無視される)
-# ・TPU VM 環境 : 起動時に libtpu.so がマウントされ XLA が有効化される
+# ── torch_xla + libtpu (GPU・TPU 両対応 / ビルド時に組み込み) ────────────────
+# torch_xla[tpu] で libtpu.so も含めてインストール。
+# ・GPU/CPU 環境: libtpu は読み込まれない (安全に無視される)
+# ・TPU VM 環境 : --net=host + tpu-runtime.service で XLA が有効化される
 # インストール失敗してもビルドを止めない (GPU のみ使用なら不要)
 RUN pip install --no-cache-dir \
-        "torch_xla==2.5.1" \
+        "torch_xla[tpu]==2.5.1" \
         -f https://storage.googleapis.com/libtpu-releases/index.html \
-    && echo "[OK] torch_xla インストール完了" \
+    && echo "[OK] torch_xla + libtpu インストール完了" \
     || echo "[WARN] torch_xla インストールスキップ (GPU/CPU イメージとして続行)"
 
 # ── SSH setup ────────────────────────────────────────────────────────────────
