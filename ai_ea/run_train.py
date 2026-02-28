@@ -1650,12 +1650,19 @@ def save_checkpoint(results: list, best_pf: float) -> None:
 
                     top100_ok = 0
                     if top_dst.exists():
-                        for f in top_dst.rglob('*'):
-                            if not f.is_file():
-                                continue
-                            rel = f'top100_{node_id}/{f.relative_to(top_dst)}'.replace('\\', '/')
-                            if remote_upload(f, rel):
-                                top100_ok += 1
+                        # rglob 前にファイルリストをスナップショット取得
+                        # (メインスレッドが shutil.rmtree で同ディレクトリを再作成する競合を回避)
+                        try:
+                            top_files = [(f, f'top100_{node_id}/{f.relative_to(top_dst)}'.replace('\\', '/'))
+                                         for f in top_dst.rglob('*') if f.is_file()]
+                        except (FileNotFoundError, OSError):
+                            top_files = []
+                        for f, rel in top_files:
+                            try:
+                                if remote_upload(f, rel):
+                                    top100_ok += 1
+                            except (FileNotFoundError, OSError):
+                                pass
                     print(f'  [{tag}]  BG アップロード完了 node={node_id} ({ok}件 + top100:{top100_ok}件)')
 
             threading.Thread(target=_upload_all_bg, daemon=True).start()
