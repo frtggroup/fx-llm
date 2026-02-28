@@ -9,19 +9,42 @@ echo "======================================================"
 echo "  FX AI EA 並列ランダムサーチ (統合イメージ)"
 echo "======================================================"
 
-# ── 1. GPU / TPU 確認 ────────────────────────────────────────────────────────
+# ── 1. GPU / TPU 確認 + torch_xla 自動インストール ───────────────────────────
 echo "[*] デバイス確認..."
 
-# NVIDIA GPU チェック
+# ── 1a. NVIDIA GPU チェック ──────────────────────────────────────────────────
 if nvidia-smi --query-gpu=name,memory.total,driver_version \
               --format=csv,noheader 2>/dev/null; then
     GPU_NAME=$(nvidia-smi --query-gpu=name --format=csv,noheader 2>/dev/null | head -1)
     echo "[OK] GPU 検出: ${GPU_NAME}"
-# TPU チェック (Google Cloud TPU)
-elif python3 -c "import torch_xla.core.xla_model as xm; print(xm.xla_device())" 2>/dev/null; then
+
+# ── 1b. TPU チェック ─────────────────────────────────────────────────────────
+# Google Cloud TPU: /dev/accel0 が存在するか、TPU 関連の環境変数が設定されている
+elif [ -e /dev/accel0 ] \
+  || [ -e /dev/vfio/0 ] \
+  || [ -n "${TPU_NAME}" ] \
+  || [ -n "${TPU_ACCELERATOR_TYPE}" ] \
+  || [ -n "${COLAB_TPU_ADDR}" ]; then
+
     TPU_TYPE="${TPU_ACCELERATOR_TYPE:-${TPU_NAME:-TPU}}"
+    echo "[OK] TPU 検出: ${TPU_TYPE}"
+
+    # torch_xla がまだインストールされていなければ自動インストール
+    if ! python3 -c "import torch_xla" 2>/dev/null; then
+        echo "[*] torch_xla をインストール中 (初回のみ 2〜3 分かかります)..."
+        # PyTorch バージョンに合わせた torch_xla を取得
+        TORCH_VER=$(python3 -c "import torch; print(torch.__version__.split('+')[0])" 2>/dev/null || echo "2.5.0")
+        pip install --no-cache-dir \
+            "torch_xla[tpu]==${TORCH_VER}" \
+            -f https://storage.googleapis.com/libtpu-releases/index.html \
+        && echo "[OK] torch_xla インストール完了" \
+        || echo "[WARN] torch_xla インストール失敗 — CPU モードで続行"
+    else
+        echo "[OK] torch_xla インストール済み"
+    fi
+
     GPU_NAME="TPU (${TPU_TYPE})"
-    echo "[OK] TPU 検出: ${GPU_NAME}"
+
 else
     GPU_NAME="CPU"
     echo "[WARN] GPU/TPU が検出できません (CPU モードで続行)"

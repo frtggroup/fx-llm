@@ -61,12 +61,8 @@ COPY DOK/requirements.txt /tmp/requirements.txt
 RUN pip install --upgrade pip && \
     pip install --no-cache-dir -r /tmp/requirements.txt
 
-# ── torch_xla (TPU サポート / オプション) ────────────────────────────────────
-# TPU 環境でのみ有効。インストール失敗はエラーとしない (GPU/CPU では不要)
-RUN pip install --no-cache-dir \
-        torch_xla[tpu]~=2.5.0 \
-        -f https://storage.googleapis.com/libtpu-releases/index.html \
-    2>/dev/null || echo "[INFO] torch_xla インストールスキップ (GPU/CPU 環境では不要)"
+# torch_xla は TPU 環境でのみ必要なため、起動時に entrypoint.sh が自動インストールします。
+# GPU / CPU 環境ではインストール不要 (イメージサイズ削減)。
 
 # ── SSH setup ────────────────────────────────────────────────────────────────
 RUN mkdir -p /var/run/sshd /root/.ssh && \
