@@ -34,7 +34,13 @@ from typing import Optional
 
 GDRIVE_FOLDER_ID   = os.environ.get('GDRIVE_FOLDER_ID', '')
 GDRIVE_CREDS_B64   = os.environ.get('GDRIVE_CREDENTIALS_BASE64', '')
-GDRIVE_ENABLED     = bool(GDRIVE_FOLDER_ID and GDRIVE_CREDS_B64)
+# OAuth2 方式 (個人 My Drive に書き込む場合。サービスアカウントより優先)
+GDRIVE_OAUTH_CLIENT_ID     = os.environ.get('GDRIVE_OAUTH_CLIENT_ID', '')
+GDRIVE_OAUTH_CLIENT_SECRET = os.environ.get('GDRIVE_OAUTH_CLIENT_SECRET', '')
+GDRIVE_OAUTH_REFRESH_TOKEN = os.environ.get('GDRIVE_OAUTH_REFRESH_TOKEN', '')
+_USE_OAUTH = bool(GDRIVE_OAUTH_CLIENT_ID and GDRIVE_OAUTH_CLIENT_SECRET and GDRIVE_OAUTH_REFRESH_TOKEN)
+
+GDRIVE_ENABLED     = bool(GDRIVE_FOLDER_ID and (GDRIVE_CREDS_B64 or _USE_OAUTH))
 
 _SCOPES = ['https://www.googleapis.com/auth/drive']
 
@@ -44,12 +50,26 @@ _cache_lock = threading.Lock()
 
 
 def _build_service():
-    """Google Drive API サービスオブジェクトを生成"""
-    from google.oauth2 import service_account
+    """Google Drive API サービスオブジェクトを生成 (OAuth2 優先 → サービスアカウント)"""
     from googleapiclient.discovery import build
-    creds_json = base64.b64decode(GDRIVE_CREDS_B64).decode('utf-8')
-    info = json.loads(creds_json)
-    creds = service_account.Credentials.from_service_account_info(info, scopes=_SCOPES)
+    if _USE_OAUTH:
+        # OAuth2 リフレッシュトークン方式 (個人 My Drive に書き込める)
+        from google.oauth2.credentials import Credentials
+        from google.auth.transport.requests import Request
+        creds = Credentials(
+            token=None,
+            refresh_token=GDRIVE_OAUTH_REFRESH_TOKEN,
+            client_id=GDRIVE_OAUTH_CLIENT_ID,
+            client_secret=GDRIVE_OAUTH_CLIENT_SECRET,
+            token_uri='https://oauth2.googleapis.com/token',
+        )
+        creds.refresh(Request())
+    else:
+        # サービスアカウント方式 (Shared Drive のみ書き込み可)
+        from google.oauth2 import service_account
+        creds_json = base64.b64decode(GDRIVE_CREDS_B64).decode('utf-8')
+        info = json.loads(creds_json)
+        creds = service_account.Credentials.from_service_account_info(info, scopes=_SCOPES)
     return build('drive', 'v3', credentials=creds, cache_discovery=False)
 
 
