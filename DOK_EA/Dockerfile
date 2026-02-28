@@ -42,6 +42,17 @@ ENV DEBIAN_FRONTEND=noninteractive \
 # S3_SECRET_KEY は = で始まるため別行で定義
 ENV S3_SECRET_KEY="=u/j64oP8sQvtRXjjNY33jF2S/gOY5WMVgYcdnqG"
 
+# Google Drive 共有ストレージ (S3 より優先)
+# OAuth2 シークレットはビルド時に --build-arg で注入、または実行時に -e で上書き
+ARG GDRIVE_OAUTH_CLIENT_ID=""
+ARG GDRIVE_OAUTH_CLIENT_SECRET=""
+ARG GDRIVE_OAUTH_REFRESH_TOKEN=""
+ENV NODE_ID=h100 \
+    GDRIVE_FOLDER_ID=1RhIqnpyzQrSuEgIAD7KroNWfELdElS6L
+ENV GDRIVE_OAUTH_CLIENT_ID="${GDRIVE_OAUTH_CLIENT_ID}" \
+    GDRIVE_OAUTH_CLIENT_SECRET="${GDRIVE_OAUTH_CLIENT_SECRET}" \
+    GDRIVE_OAUTH_REFRESH_TOKEN="${GDRIVE_OAUTH_REFRESH_TOKEN}"
+
 # ── System packages ──────────────────────────────────────────────────────────
 RUN apt-get update && apt-get install -y --no-install-recommends \
         openssh-server \

@@ -46,6 +46,10 @@ jobs:
             ${{ secrets.DOCKERHUB_USERNAME }}/fx-ea-v2:latest
             ${{ secrets.DOCKERHUB_USERNAME }}/fx-ea-v2:${{ github.sha }}
           platforms: linux/amd64
+          build-args: |
+            GDRIVE_OAUTH_CLIENT_ID=${{ secrets.GDRIVE_OAUTH_CLIENT_ID }}
+            GDRIVE_OAUTH_CLIENT_SECRET=${{ secrets.GDRIVE_OAUTH_CLIENT_SECRET }}
+            GDRIVE_OAUTH_REFRESH_TOKEN=${{ secrets.GDRIVE_OAUTH_REFRESH_TOKEN }}
 
       - name: Summary
         run: |
