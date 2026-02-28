@@ -200,7 +200,7 @@ def download(rel_key: str, local_path: Path, timeout: float = 60.0) -> bool:
         except Exception as e:
             error[0] = e
 
-    t = _threading.Thread(target=_do_download, daemon=True)
+    t = threading.Thread(target=_do_download, daemon=True)
     t.start()
     t.join(timeout=timeout)
     if t.is_alive():
@@ -277,7 +277,7 @@ def list_keys_recursive(folder_prefix: str, timeout: float = 30.0) -> list[str]:
         except Exception as e:
             error[0] = e
 
-    t = _threading.Thread(target=_do, daemon=True)
+    t = threading.Thread(target=_do, daemon=True)
     t.start()
     t.join(timeout=timeout)
     if t.is_alive():
@@ -302,7 +302,7 @@ def list_node_keys(glob_prefix: str, timeout: float = 20.0) -> list[str]:
     def _do():
         result[0] = list_keys(glob_prefix)
 
-    t = _threading.Thread(target=_do, daemon=True)
+    t = threading.Thread(target=_do, daemon=True)
     t.start()
     t.join(timeout=timeout)
     if t.is_alive():
@@ -361,7 +361,7 @@ def download_bytes(rel_key: str, timeout: float = 60.0) -> Optional[bytes]:
         except Exception as e:
             print(f'  [GDrive] download_bytes失敗 {rel_key}: {e}')
 
-    t = _threading.Thread(target=_do, daemon=True)
+    t = threading.Thread(target=_do, daemon=True)
     t.start()
     t.join(timeout=timeout)
     if t.is_alive():
