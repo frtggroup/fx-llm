@@ -15,8 +15,9 @@ GTX 1080 Ti / ローカル対応  ─  FastAPI  port 8080
   GET  /health                → ヘルスチェック
 """
 import io, json, os, threading, time, zipfile
-from datetime import datetime
+from datetime import datetime, timezone, timedelta
 from pathlib import Path
+from urllib import request as _ureq
 
 from fastapi import FastAPI, HTTPException
 from fastapi.middleware.cors import CORSMiddleware
@@ -108,6 +109,53 @@ def _read_warmup_status() -> dict:
         except Exception:
             pass
     return {}
+
+# ── TPU 使用率ポーリング (GCP Cloud Monitoring API / ~3分遅延) ──────────────────
+_tpu_duty_cycle: float | None = None   # 最新のTPU使用率 (%)
+_tpu_hbm_used_gb: float | None = None  # HBM使用量 GB (torch_xla から取得)
+
+def _gcp_metadata(path: str, timeout: int = 3) -> str:
+    """GCP メタデータサーバーから値を取得"""
+    req = _ureq.Request(
+        f'http://metadata.google.internal/computeMetadata/v1/{path}',
+        headers={'Metadata-Flavor': 'Google'})
+    return _ureq.urlopen(req, timeout=timeout).read().decode()
+
+def _poll_tpu_duty_cycle():
+    global _tpu_duty_cycle
+    while True:
+        try:
+            token     = json.loads(_gcp_metadata(
+                'instance/service-accounts/default/token'))['access_token']
+            project   = _gcp_metadata('project/project-id')
+            now       = datetime.now(timezone.utc)
+            start     = (now - timedelta(minutes=6)).strftime('%Y-%m-%dT%H:%M:%SZ')
+            end       = now.strftime('%Y-%m-%dT%H:%M:%SZ')
+            # v6e は tpu.googleapis.com/node/accelerator/duty_cycle
+            for metric in ('tpu.googleapis.com/node/accelerator/duty_cycle',
+                           'tpu.googleapis.com/node/duty_cycle'):
+                url = (f'https://monitoring.googleapis.com/v3/projects/{project}'
+                       f'/timeSeries?filter=metric.type%3D%22{metric}%22'
+                       f'&interval.startTime={start}&interval.endTime={end}')
+                req = _ureq.Request(url, headers={'Authorization': f'Bearer {token}'})
+                data = json.loads(_ureq.urlopen(req, timeout=10).read())
+                series = data.get('timeSeries', [])
+                if series:
+                    pts = sorted(series[0].get('points', []),
+                                 key=lambda p: p['interval']['endTime'], reverse=True)
+                    if pts:
+                        v = pts[0]['value']
+                        _tpu_duty_cycle = float(v.get('doubleValue',
+                                                v.get('int64Value', 0)))
+                        break
+        except Exception:
+            pass
+        time.sleep(60)   # 1分ごと (メトリクスは~3分遅延)
+
+_is_tpu_server = os.environ.get('DEVICE_TYPE', '').upper() == 'TPU'
+if _is_tpu_server:
+    threading.Thread(target=_poll_tpu_duty_cycle, daemon=True, name='tpu-monitor').start()
+
 
 app = FastAPI(title="FX AI EA Dashboard v2")
 app.add_middleware(CORSMiddleware, allow_origins=["*"],
@@ -248,6 +296,9 @@ def api_status():
     _ws = _read_warmup_status()
     if _ws:
         st.update(_ws)
+    # TPU 使用率 (GCP Cloud Monitoring / ~3分遅延)
+    if _tpu_duty_cycle is not None:
+        st['tpu_duty_cycle'] = round(_tpu_duty_cycle, 1)
     # best_links の S3直リンクをプロキシURLに変換 (自己署名証明書ブロック回避)
     if isinstance(st.get('best_links'), dict):
         bl = st['best_links']
@@ -626,6 +677,20 @@ tr:hover td{background:#1c2128}
       margin-left:10px">GPU: ...</span>
   </h1>
   <span class="badge badge-wait" id="phase-badge">待機中</span>
+</div>
+
+<!-- TPU 使用率 (GCP Cloud Monitoring / ~3分遅延) -->
+<div class="card" id="tpu-duty-card" style="display:none;margin-bottom:12px;border-color:#3fb95044">
+  <h2 style="color:#56d364">🔥 TPU 使用率 <span style="font-size:.7em;color:#8b949e">(~3分遅延)</span></h2>
+  <div style="display:flex;align-items:center;gap:16px;flex-wrap:wrap">
+    <div style="flex:1;min-width:200px">
+      <div style="background:#21262d;border-radius:6px;height:22px;overflow:hidden">
+        <div id="tpu-duty-bar" style="height:100%;background:linear-gradient(90deg,#3fb950,#56d364);
+          width:0%;transition:width 1s;border-radius:6px"></div>
+      </div>
+    </div>
+    <div style="white-space:nowrap;font-size:1.2em;font-weight:bold;color:#e6edf3" id="tpu-duty-text">--%</div>
+  </div>
 </div>
 
 <!-- XLA Warmup 進捗バー (TPU時のみ表示) -->
@@ -1095,6 +1160,19 @@ async function poll() {
 
     applyPhase(d.phase??'waiting');
     document.getElementById('msg').textContent = d.message??'';
+
+    // TPU 使用率 (GCP Cloud Monitoring)
+    const tpuDuty = document.getElementById('tpu-duty-card');
+    if (d.tpu_duty_cycle !== undefined && d.tpu_duty_cycle !== null) {
+      tpuDuty.style.display = 'block';
+      const pct = d.tpu_duty_cycle;
+      document.getElementById('tpu-duty-bar').style.width = pct+'%';
+      document.getElementById('tpu-duty-text').textContent = pct.toFixed(1)+'%';
+      document.getElementById('tpu-duty-bar').style.background =
+        pct > 70 ? 'linear-gradient(90deg,#3fb950,#56d364)' :
+        pct > 30 ? 'linear-gradient(90deg,#d29922,#e3b341)' :
+                   'linear-gradient(90deg,#f85149,#ff7b72)';
+    }
 
     // XLA Warmup 進捗バー
     const wCard = document.getElementById('warmup-card');
