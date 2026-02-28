@@ -1,133 +1,182 @@
 #!/bin/bash
 # ─────────────────────────────────────────────────────────────────────────────
-# FX LLM H100 コンテナ エントリポイント
-# 実行順序:
-#   1. UFW ファイアウォール設定
-#   2. SSH サーバー起動
-#   3. ダッシュボードサーバー起動 (バックグラウンド)
-#   4. パイプライン実行 (データセット → 訓練 → バックテスト)
+# FX AI EA 統合エントリポイント
+# GPU を自動検出し、Vast.ai / Sakura DOK / ローカル 全環境で動作します。
 # ─────────────────────────────────────────────────────────────────────────────
 set -e
-# UFW/sysctl などの非致命的エラーは無視するヘルパー
-ignore_err() { "$@" || true; }
 
 echo "======================================================"
-echo "  FX LLM Fine-tuning on Sakura DOK / H100 80GB"
+echo "  FX AI EA 並列ランダムサーチ (統合イメージ)"
 echo "======================================================"
 
-# ── 1. UFW ────────────────────────────────────────────────────────────────────
-# DOK コンテナは iptables 権限がないため UFW はスキップ
-# ポート管理は DOK の設定画面 (HTTP:7860, SSH:有効) で行う
-echo "[*] UFW: DOK コンテナでは不要 (DOKがポート管理) → スキップ"
+# ── 1. GPU 確認 ─────────────────────────────────────────────────────────────
+echo "[*] GPU 確認..."
+GPU_NAME=$(nvidia-smi --query-gpu=name --format=csv,noheader 2>/dev/null | head -1 || echo "CPU")
+nvidia-smi --query-gpu=name,memory.total,driver_version \
+           --format=csv,noheader 2>/dev/null \
+  && echo "[OK] GPU 検出: ${GPU_NAME}" \
+  || echo "[WARN] nvidia-smi 使用不可 (CPU モードで続行)"
 
-# ── 2. SSH サーバー ───────────────────────────────────────────────────────────
+# ── 2. CUDA MPS デーモン起動 (GPU並列スループット向上) ─────────────────────
+echo "[*] CUDA MPS デーモン起動..."
+export CUDA_MPS_PIPE_DIRECTORY=/tmp/nvidia-mps
+export CUDA_MPS_LOG_DIRECTORY=/tmp/nvidia-log
+mkdir -p /tmp/nvidia-mps /tmp/nvidia-log
+nvidia-cuda-mps-control -d 2>/dev/null \
+  && echo "[OK] CUDA MPS 起動完了" \
+  || echo "[WARN] CUDA MPS 起動失敗 (非特権モードまたは未対応GPU — 続行)"
+
+# ── 3. SSH サーバー ──────────────────────────────────────────────────────────
 echo "[*] SSH サーバー起動..."
 mkdir -p /var/run/sshd /root/.ssh
 chmod 700 /root/.ssh
-# authorized_keys が既に COPY されている場合はそのまま使用
-if [ ! -f /root/.ssh/authorized_keys ] || [ ! -s /root/.ssh/authorized_keys ]; then
-    echo "[WARN] authorized_keys が空です。SSH公開鍵を設定してください。"
-    echo "[WARN] docker exec <container> sh -c 'echo \"<pubkey>\" >> /root/.ssh/authorized_keys'"
+if [ ! -s /root/.ssh/authorized_keys ]; then
+    echo "[WARN] authorized_keys が空です"
 fi
 chmod 600 /root/.ssh/authorized_keys 2>/dev/null || true
+ssh-keygen -A 2>/dev/null || true
 /usr/sbin/sshd -D &
 SSH_PID=$!
-echo "[OK] SSH サーバー起動 (PID: $SSH_PID)"
-
-# ── 3. 環境変数 / パス ────────────────────────────────────────────────────────
-export PYTHONPATH="/workspace/ai_ea:/workspace/src:${PYTHONPATH}"
-export HF_HOME="/workspace/hf_cache"
-export TRANSFORMERS_CACHE="/workspace/hf_cache"
-export PYTORCH_CUDA_ALLOC_CONF="expandable_segments:True,max_split_size_mb:512"
-mkdir -p /workspace/data /workspace/output /workspace/reports /workspace/hf_cache
-
-# ── 3b. CSV データ自動ダウンロード ───────────────────────────────────────────
-CSV_DEST="/workspace/data/USDJPY_M1.csv"
-if [ ! -f "$CSV_DEST" ] || [ ! -s "$CSV_DEST" ]; then
-    if [ -n "${DATA_URL}" ]; then
-        echo "[*] CSV ダウンロード中: ${DATA_URL}"
-        wget -q --show-progress -O "$CSV_DEST" "${DATA_URL}" && \
-            echo "[OK] CSV ダウンロード完了: $(du -h $CSV_DEST | cut -f1)" || \
-            echo "[ERROR] CSV ダウンロード失敗"
-    else
-        echo "[WARN] DATA_URL 未設定。/workspace/data/USDJPY_M1.csv を手動配置してください"
-    fi
+sleep 1
+if kill -0 "$SSH_PID" 2>/dev/null; then
+    echo "[OK] SSH サーバー起動 (PID: $SSH_PID)"
 else
-    echo "[*] CSV 既存: $(du -h $CSV_DEST | cut -f1)"
+    echo "[WARN] SSH サーバー起動失敗 (続行)"
 fi
 
-# GPU確認
-echo "[*] GPU 確認..."
-nvidia-smi --query-gpu=name,memory.total,driver_version \
-           --format=csv,noheader 2>/dev/null || echo "  nvidia-smi 使用不可"
+# ── 4. 永続ストレージのセットアップ ─────────────────────────────────────────
+# Sakura DOK: /opt/artifact が存在する場合はそこにシンボリックリンクを張る
+# Vast.ai / ローカル: /workspace/ai_ea 直下を使用 (ボリュームマウントで永続化)
+ARTIFACT=/opt/artifact
+if [ -d "${ARTIFACT}" ] || [ -b "${ARTIFACT}" ]; then
+    echo "[*] Sakura DOK モード: /opt/artifact を永続ストレージとして使用"
+    mkdir -p "${ARTIFACT}/data" \
+             "${ARTIFACT}/ai_ea/trials" \
+             "${ARTIFACT}/ai_ea/top100" \
+             "${ARTIFACT}/ai_ea/top_cache" \
+             "${ARTIFACT}/checkpoint"
 
-# ── 4. ダッシュボード起動 (バックグラウンド) ──────────────────────────────────
-echo "[*] ダッシュボード起動 (port 7860)..."
-python /workspace/src/dashboard_server.py > /workspace/dashboard.log 2>&1 &
+    [ ! -L /workspace/data ]          && rm -rf /workspace/data          && ln -sf "${ARTIFACT}/data"             /workspace/data
+    [ ! -L /workspace/ai_ea/trials ]   && rm -rf /workspace/ai_ea/trials   && ln -sf "${ARTIFACT}/ai_ea/trials"    /workspace/ai_ea/trials
+    [ ! -L /workspace/ai_ea/top100 ]   && rm -rf /workspace/ai_ea/top100   && ln -sf "${ARTIFACT}/ai_ea/top100"    /workspace/ai_ea/top100
+    [ ! -L /workspace/ai_ea/top_cache ] && rm -rf /workspace/ai_ea/top_cache && ln -sf "${ARTIFACT}/ai_ea/top_cache" /workspace/ai_ea/top_cache
+
+    export TORCHINDUCTOR_CACHE_DIR="${ARTIFACT}/torch_inductor_cache"
+    mkdir -p "${TORCHINDUCTOR_CACHE_DIR}"
+    echo "[OK] 永続ストレージセットアップ完了 (Sakura DOK)"
+    df -h "${ARTIFACT}" | tail -1 || true
+else
+    echo "[*] Vast.ai / ローカルモード: /workspace を直接使用"
+    mkdir -p /workspace/data \
+             /workspace/ai_ea/trials \
+             /workspace/ai_ea/top100 \
+             /workspace/ai_ea/top_cache
+fi
+
+# ── 5. 環境変数 / パス ──────────────────────────────────────────────────────
+export PYTHONPATH="/workspace/ai_ea:${PYTHONPATH}"
+export DATA_PATH="${DATA_PATH:-/workspace/data/USDJPY_H1.csv}"
+DASHBOARD_PORT="${DASHBOARD_PORT:-8080}"
+export DASHBOARD_PORT
+
+echo "[*] 設定:"
+echo "    GPU          : ${GPU_NAME}"
+echo "    DATA_PATH    : ${DATA_PATH}"
+echo "    GDRIVE       : ${GDRIVE_FOLDER_ID:-(未設定)}"
+echo "    DASHBOARD    : port ${DASHBOARD_PORT}"
+echo "    GPU設定      : run_train.py 起動後に自動検出"
+
+# ── 6. ダッシュボードサーバー起動 ──────────────────────────────────────────
+echo "[*] ダッシュボード起動 (port ${DASHBOARD_PORT})..."
+python /workspace/ai_ea/server.py > /workspace/dashboard.log 2>&1 &
 DASH_PID=$!
-sleep 2
-echo "[OK] ダッシュボード起動 (PID: $DASH_PID)"
-echo "     → http://0.0.0.0:7860"
+sleep 3
+if kill -0 "$DASH_PID" 2>/dev/null; then
+    echo "[OK] ダッシュボード起動 (PID: $DASH_PID)"
+    echo "     -> http://0.0.0.0:${DASHBOARD_PORT}"
+else
+    echo "[WARN] ダッシュボード起動失敗 — ログ:"
+    tail -20 /workspace/dashboard.log 2>/dev/null || true
+fi
 
-# ── 5. パイプライン引数 ───────────────────────────────────────────────────────
-# 環境変数で上書き可能
-MODEL_ID="${LLM_MODEL_ID:-Qwen/Qwen3-8B}"
-EPOCHS="${LLM_EPOCHS:-10}"
-BATCH="${LLM_BATCH:-8}"
-GRAD_ACCUM="${LLM_GRAD_ACCUM:-8}"
-LORA_R="${LLM_LORA_R:-64}"
-LORA_ALPHA="${LLM_LORA_ALPHA:-128}"
-MAX_LENGTH="${LLM_MAX_LENGTH:-1024}"
-LR="${LLM_LR:-5e-5}"
-SKIP_DATASET="${LLM_SKIP_DATASET:-}"
-RESUME="${LLM_RESUME:-}"
-USE_V2="${LLM_V2:-}"
-USE_COT="${LLM_COT:-}"
+# ── 7. CSV 自動ダウンロード: GDrive → DATA_URL の順 ─────────────────────────
+mkdir -p "$(dirname ${DATA_PATH})"
+if [ ! -f "${DATA_PATH}" ] || [ ! -s "${DATA_PATH}" ]; then
+    echo "[*] CSV が見つかりません。自動ダウンロードを試みます..."
+    python -c "
+import sys, os
+sys.path.insert(0, '/workspace/ai_ea')
+from pathlib import Path
+import gdrive
+dst   = os.environ.get('DATA_PATH', '/workspace/data/USDJPY_H1.csv')
+fname = os.path.basename(dst)
+if not gdrive.GDRIVE_ENABLED:
+    print('[WARN] GDrive 無効')
+    sys.exit(1)
+ok = gdrive.download(fname, Path(dst))
+if ok and Path(dst).exists() and Path(dst).stat().st_size > 0:
+    print(f'[OK] GDrive から CSV ダウンロード完了 ({Path(dst).stat().st_size/1e6:.1f} MB): {fname}')
+    sys.exit(0)
+print('[WARN] GDrive に CSV (', fname, ') が見つかりません')
+sys.exit(1)
+" && echo "[OK] CSV 準備完了 (GDrive)" || {
+        if [ -n "${DATA_URL}" ]; then
+            echo "[*] DATA_URL からダウンロード中: ${DATA_URL}"
+            wget -q --show-progress -O "${DATA_PATH}" "${DATA_URL}" \
+              && echo "[OK] CSV ダウンロード完了 $(du -h ${DATA_PATH} | cut -f1)" \
+              || echo "[ERROR] CSV ダウンロード失敗 — DATA_PATH を手動で配置してください"
+        else
+            echo "[WARN] CSV がありません: GDrive フォルダに USDJPY_H1.csv をアップロードするか"
+            echo "[WARN] docker run -e DATA_URL=<url> で指定してください"
+        fi
+    }
+else
+    echo "[*] CSV 既存: $(du -h ${DATA_PATH} | cut -f1)"
+fi
 
-# 起動時に前回の停止フラグをクリア
+# ── 8. stop.flag をクリア ──────────────────────────────────────────────────
 rm -f /workspace/stop.flag
 
-echo "[*] パイプライン設定:"
-echo "    モデル      : ${MODEL_ID}"
-echo "    エポック数  : ${EPOCHS}"
-echo "    バッチサイズ: ${BATCH} x ${GRAD_ACCUM} = $((BATCH * GRAD_ACCUM)) (実効)"
-echo "    LoRA rank   : ${LORA_R}  alpha: ${LORA_ALPHA}"
-echo "    max_length  : ${MAX_LENGTH}"
-echo "    学習率      : ${LR}"
-
-PIPELINE_ARGS=(
-    "--model_id"   "${MODEL_ID}"
-    "--epochs"     "${EPOCHS}"
-    "--batch"      "${BATCH}"
-    "--grad_accum" "${GRAD_ACCUM}"
-    "--lora_r"     "${LORA_R}"
-    "--lora_alpha" "${LORA_ALPHA}"
-    "--max_length" "${MAX_LENGTH}"
-    "--lr"         "${LR}"
-)
-[ -n "${SKIP_DATASET}" ] && PIPELINE_ARGS+=("--skip_dataset")
-[ -n "${RESUME}"       ] && PIPELINE_ARGS+=("--resume")
-[ -n "${USE_V2}"       ] && PIPELINE_ARGS+=("--v2")
-[ -n "${USE_COT}"      ] && PIPELINE_ARGS+=("--cot")
-
-# ── 6. パイプライン実行 ───────────────────────────────────────────────────────
+# ── 9. 学習ループ起動 ────────────────────────────────────────────────────────
 echo ""
-echo "[*] パイプライン開始..."
-python /workspace/src/pipeline.py "${PIPELINE_ARGS[@]}"
+echo "[*] 並列ランダムサーチ開始  (GPU・並列数は自動検出)"
+echo "    停止するには: http://<IP>:${DASHBOARD_PORT}  →「学習停止」ボタン"
+echo "    または:       touch /workspace/stop.flag"
+echo ""
+
+TRAIN_PID=""
+_graceful_stop() {
+    echo "[*] シグナル受信 → run_train.py に SIGTERM を送信..."
+    if [ -n "$TRAIN_PID" ] && kill -0 "$TRAIN_PID" 2>/dev/null; then
+        kill -TERM "$TRAIN_PID"
+        for i in $(seq 1 30); do
+            kill -0 "$TRAIN_PID" 2>/dev/null || break
+            sleep 1
+        done
+        kill -0 "$TRAIN_PID" 2>/dev/null && kill -KILL "$TRAIN_PID" || true
+    fi
+    echo "[OK] graceful shutdown 完了"
+}
+trap '_graceful_stop' SIGTERM SIGINT
+
+python /workspace/ai_ea/run_train.py 2>&1 | tee /workspace/train_run.log &
+TRAIN_PID=$!
+wait $TRAIN_PID
 EXIT_CODE=$?
 
 echo ""
 if [ $EXIT_CODE -eq 0 ]; then
     echo "======================================================"
-    echo "  全工程完了！"
-    echo "  ダッシュボード: http://<DOK_IP>:7860"
-    echo "  レポートDL:     http://<DOK_IP>:7860/download/report"
-    echo "  モデルDL:       http://<DOK_IP>:7860/download/adapter"
+    echo "  学習完了!"
+    echo "  ダッシュボード : http://<IP>:${DASHBOARD_PORT}"
+    echo "  ベストモデル   : http://<IP>:${DASHBOARD_PORT}/download/best"
+    echo "  TOP100 DL      : http://<IP>:${DASHBOARD_PORT}/download/model/1"
+    echo "  全結果 JSON    : http://<IP>:${DASHBOARD_PORT}/download/results"
     echo "======================================================"
 else
-    echo "  [ERROR] パイプラインがエラーで終了しました (exit=$EXIT_CODE)"
+    echo "  [ERROR] 学習がエラーで終了しました (exit=${EXIT_CODE})"
+    echo "  ログ: /workspace/train_run.log"
 fi
 
-# コンテナを終了させずに待機 (ダッシュボードとSSHを維持)
 echo "[*] コンテナ待機中 (ダッシュボード・SSH は継続稼働)..."
 wait

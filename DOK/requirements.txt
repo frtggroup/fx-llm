@@ -1,28 +1,27 @@
-# ── Unsloth (Flash Attention / xformers は Unsloth が管理) ─────────────────
-unsloth
-# xformers と flash-attn は Unsloth が起動時に自動インストール
+# ── Web dashboard / API ───────────────────────────────────────────────────────
+fastapi>=0.115.0
+uvicorn[standard]>=0.30.0
 
-# ── Transformers ecosystem ────────────────────────────────────────────────
-transformers>=4.45.0
-peft>=0.13.0
-accelerate>=1.0.0
-bitsandbytes>=0.44.0
-trl>=0.11.0
-datasets
+# ── GPU 監視 ─────────────────────────────────────────────────────────────────
+nvidia-ml-py>=12.560.30
 
-# ── Web dashboard ─────────────────────────────────────────────────────────
-flask>=3.0.0
-flask-cors
+# ── ONNX ─────────────────────────────────────────────────────────────────────
+onnx>=1.16.0
+onnxruntime-gpu>=1.18.0
 
-# ── Data / ML ─────────────────────────────────────────────────────────────
-numpy
-pandas
-scipy
-scikit-learn
+# ── Data / ML ────────────────────────────────────────────────────────────────
+numpy>=1.26.0
+pandas>=2.2.0
+scipy>=1.12.0
+scikit-learn>=1.4.0
 
-# ── Misc ──────────────────────────────────────────────────────────────────
+# ── Misc ─────────────────────────────────────────────────────────────────────
 tqdm
-tokenizers
-sentencepiece
-huggingface_hub
-safetensors
+
+# ── Object Storage (Sakura S3互換) ────────────────────────────────────────────
+boto3>=1.34.0
+
+# ── Google Drive 共有ストレージ ───────────────────────────────────────────────
+google-api-python-client>=2.130.0
+google-auth>=2.29.0
+google-auth-httplib2>=0.2.0

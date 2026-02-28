@@ -1,11 +1,14 @@
-name: Build & Push DOK Docker Image
+name: Build & Push FX AI EA Docker Image (統合)
 
 on:
   push:
     paths:
       - 'DOK/**'
+      - 'DOK_EA/**'
+      - 'DOK_GTX/**'
+      - 'ai_ea/**'
       - '.github/workflows/build-dok.yml'
-  workflow_dispatch:   # 手動実行ボタンも有効
+  workflow_dispatch:
 
 jobs:
   build-and-push:
@@ -33,39 +36,36 @@ jobs:
           username: ${{ secrets.DOCKERHUB_USERNAME }}
           password: ${{ secrets.DOCKERHUB_TOKEN }}
 
-      - name: Build and Push (v1)
+      - name: Build and Push fx-ea (統合イメージ)
         uses: docker/build-push-action@v6
         with:
           context: .
           file: DOK/Dockerfile
           push: true
+          provenance: false
+          sbom: false
           tags: |
-            ${{ secrets.DOCKERHUB_USERNAME }}/fx-llm:latest
-            ${{ secrets.DOCKERHUB_USERNAME }}/fx-llm:${{ github.sha }}
-          cache-from: type=gha
-          cache-to:   type=gha,mode=max
+            ${{ secrets.DOCKERHUB_USERNAME }}/fx-ea:latest
+            ${{ secrets.DOCKERHUB_USERNAME }}/fx-ea:${{ github.sha }}
           platforms: linux/amd64
-
-      - name: Build and Push (v2)
-        uses: docker/build-push-action@v6
-        with:
-          context: .
-          file: DOK/Dockerfile.v2
-          push: true
-          tags: |
-            ${{ secrets.DOCKERHUB_USERNAME }}/fx-llm-v2:latest
-            ${{ secrets.DOCKERHUB_USERNAME }}/fx-llm-v2:${{ github.sha }}
-          cache-from: type=gha
-          cache-to:   type=gha,mode=max
-          platforms: linux/amd64
+          build-args: |
+            GDRIVE_OAUTH_CLIENT_ID=${{ secrets.GDRIVE_OAUTH_CLIENT_ID }}
+            GDRIVE_OAUTH_CLIENT_SECRET=${{ secrets.GDRIVE_OAUTH_CLIENT_SECRET }}
+            GDRIVE_OAUTH_REFRESH_TOKEN=${{ secrets.GDRIVE_OAUTH_REFRESH_TOKEN }}
 
       - name: Summary
         run: |
-          echo "## ✅ ビルド完了 (v1 + v2)" >> $GITHUB_STEP_SUMMARY
+          echo "## ✅ FX AI EA 統合イメージ ビルド完了" >> $GITHUB_STEP_SUMMARY
           echo "" >> $GITHUB_STEP_SUMMARY
-          echo "| バージョン | イメージ |" >> $GITHUB_STEP_SUMMARY
-          echo "|-----------|---------|" >> $GITHUB_STEP_SUMMARY
-          echo "| v1 (従来) | \`${{ secrets.DOCKERHUB_USERNAME }}/fx-llm:latest\` |" >> $GITHUB_STEP_SUMMARY
-          echo "| v2 (改善版) | \`${{ secrets.DOCKERHUB_USERNAME }}/fx-llm-v2:latest\` |" >> $GITHUB_STEP_SUMMARY
+          echo "| 項目 | 値 |" >> $GITHUB_STEP_SUMMARY
+          echo "|------|---|" >> $GITHUB_STEP_SUMMARY
+          echo "| イメージ | \`${{ secrets.DOCKERHUB_USERNAME }}/fx-ea:latest\` |" >> $GITHUB_STEP_SUMMARY
+          echo "| 対応GPU | GTX / RTX / H100 / H200 (自動検出) |" >> $GITHUB_STEP_SUMMARY
+          echo "| ダッシュボード | ポート \`8080\` |" >> $GITHUB_STEP_SUMMARY
+          echo "| SSH | ポート \`22\` |" >> $GITHUB_STEP_SUMMARY
           echo "" >> $GITHUB_STEP_SUMMARY
-          echo "**HTTP ポート:** \`7860\` | **SSH:** 有効" >> $GITHUB_STEP_SUMMARY
+          echo "**起動コマンド:**" >> $GITHUB_STEP_SUMMARY
+          echo "\`\`\`bash" >> $GITHUB_STEP_SUMMARY
+          echo "docker pull ${{ secrets.DOCKERHUB_USERNAME }}/fx-ea:latest" >> $GITHUB_STEP_SUMMARY
+          echo "docker run --gpus all --privileged --net=host ${{ secrets.DOCKERHUB_USERNAME }}/fx-ea:latest" >> $GITHUB_STEP_SUMMARY
+          echo "\`\`\`" >> $GITHUB_STEP_SUMMARY
