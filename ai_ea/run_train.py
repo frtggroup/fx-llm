@@ -330,18 +330,37 @@ def s3_download(s3_key: str, local_path: Path) -> bool:
         return False
 
 
-def s3_presign(s3_key: str, expires: int = 86400) -> str:
-    """S3オブジェクトの署名付きDL URL を生成 (デフォルト24時間有効)。失敗時は空文字。"""
+_s3_public_policy_set = False
+
+def s3_ensure_public_policy() -> bool:
+    """バケットに public-read ポリシーを設定 (一度だけ実行)。"""
+    global _s3_public_policy_set
+    if _s3_public_policy_set:
+        return True
     try:
-        url = _s3_client().generate_presigned_url(
-            'get_object',
-            Params={'Bucket': S3_BUCKET, 'Key': f'{S3_PREFIX}/{s3_key}'},
-            ExpiresIn=expires,
-        )
-        return url
+        import json as _json
+        policy = _json.dumps({
+            "Version": "2012-10-17",
+            "Statement": [{
+                "Sid": "PublicReadGetObject",
+                "Effect": "Allow",
+                "Principal": "*",
+                "Action": ["s3:GetObject"],
+                "Resource": [f"arn:aws:s3:::{S3_BUCKET}/*"]
+            }]
+        })
+        _s3_client().put_bucket_policy(Bucket=S3_BUCKET, Policy=policy)
+        _s3_public_policy_set = True
+        print(f'  [S3] バケットポリシー設定完了 (public-read)')
+        return True
     except Exception as e:
-        print(f'  [S3] presign失敗 {s3_key}: {e}')
-        return ''
+        print(f'  [S3] バケットポリシー設定失敗: {e}')
+        return False
+
+
+def s3_public_url(s3_key: str) -> str:
+    """期限なし直接URL を返す (バケットポリシーで public-read 設定済みが前提)。"""
+    return f'{S3_ENDPOINT}/{S3_BUCKET}/{S3_PREFIX}/{s3_key}'
 
 
 def s3_list_keys(prefix: str = '') -> list:
@@ -376,7 +395,7 @@ GA_PARENT_POOL     = 20     # 親候補を上位何件から選ぶか
 
 # ── 10分交互モード ─────────────────────────────────────────────────────────
 # ランダムサーチ 10分 → GA 10分 → ランダム 10分 → ... を繰り返す
-MODE_SWITCH_SEC    = 600    # 10分 = 600秒
+MODE_SWITCH_SEC    = 300    # 5分 = 300秒
 _mode_start_time   = 0.0    # main() で time.time() を設定
 
 # 重要特徴量 GA フェーチャ: 上位モデルから重視特徴量を収集して GA に使用
@@ -2123,12 +2142,11 @@ def main():
                         for local_p, key in upload_targets:
                             if not local_p.exists():
                                 continue
-                            # S3優先でアップロード
+                            # S3優先でアップロード (バケットポリシーで期限なし直接URL)
                             if S3_ENABLED:
+                                s3_ensure_public_policy()
                                 if s3_upload(local_p, key):
-                                    url = s3_presign(key, expires=86400 * 7)  # 7日間有効
-                                    if url:
-                                        links[local_p.name] = url
+                                    links[local_p.name] = s3_public_url(key)
                             elif GDRIVE_ENABLED:
                                 url = _gdrive.upload_and_share(local_p, key)
                                 if url:
