@@ -98,10 +98,23 @@ def REMOTE_ENABLED() -> bool:
 # ── ノードID (GTX / H100 / CPU) ─────────────────────────────────────────────
 # S3 上でノードごとにファイルを分離することで競合を回避する
 def _detect_node_id() -> str:
-    """GPU名からノードIDを自動決定。環境変数 NODE_ID で上書き可能"""
+    """デバイス名からノードIDを自動決定。環境変数 NODE_ID で上書き可能"""
     nid = os.environ.get('NODE_ID', '').strip()
     if nid:
         return nid.lower()
+    # TPU 検出 (torch_xla が利用可能な場合)
+    try:
+        import torch_xla.core.xla_model as xm  # type: ignore
+        dev_str = str(xm.xla_device()).lower()
+        tpu_type = os.environ.get('TPU_NAME', os.environ.get('TPU_ACCELERATOR_TYPE', 'tpu'))
+        # tpu_type 例: 'v4-8', 'v5litepod-8', 'trillium'
+        for ver in ('v5p', 'v5e', 'v5litepod', 'v4', 'v3', 'trillium'):
+            if ver in tpu_type.lower():
+                return f'tpu_{ver}'
+        return 'tpu'
+    except Exception:
+        pass
+    # GPU 検出
     try:
         import torch
         if torch.cuda.is_available():
@@ -119,17 +132,38 @@ def _detect_node_id() -> str:
 
 
 def _auto_gpu_config(node_id: str) -> tuple[str, float, float, int]:
-    """実際の GPU VRAM を読み取り、最適な並列数と VRAM 割当を自動計算する。
+    """実際のデバイスメモリを読み取り、最適な並列数と割当を自動計算する。
 
-    VRAM ティア基準:
-      xlarge : 120 GB+  (H200 SXM5  141 GB)
-      large  :  60 GB+  (H100 80 GB / H200 NVL 94 GB / A100 80 GB)
-      medium :  30 GB+  (A100 40 GB)
-      small  :  14 GB+  (RTX 3090/4090  24 GB)
-      micro  :   0 GB+  (GTX 1080 Ti 11 GB / その他)
+    ティア基準:
+      tpu    : Google TPU (v3/v4/v5/Trillium) — HBM ≥ 16 GB/chip
+      xlarge : VRAM 120 GB+  (H200 SXM5  141 GB)
+      large  : VRAM  60 GB+  (H100 80 GB / A100 80 GB / H200 NVL 94 GB)
+      medium : VRAM  30 GB+  (A100 40 GB)
+      small  : VRAM  14 GB+  (RTX 3090/4090  24 GB)
+      micro  : VRAM   0 GB+  (GTX 1080 Ti 11 GB / その他)
 
-    Returns: (tier, total_vram_gb, vram_per_trial_gb, max_parallel)
+    Returns: (tier, total_mem_gb, vram_per_trial_gb, max_parallel)
     """
+    # TPU 検出
+    if node_id.startswith('tpu'):
+        try:
+            import torch_xla.core.xla_model as xm  # type: ignore
+            # TPU v4/v5 は 1チップあたり 32 GB HBM
+            # Trillium (v6e) は 1チップあたり 32 GB
+            num_devices = int(os.environ.get('TPU_NUM_DEVICES', '4'))
+            mem_per_chip = {
+                'tpu_v3': 16.0, 'tpu_v4': 32.0,
+                'tpu_v5e': 16.0, 'tpu_v5p': 95.0,
+                'tpu_trillium': 32.0,
+            }.get(node_id, 32.0)
+            total_gb = mem_per_chip * num_devices
+            # TPU は並列度を 1チップ = 1試行 として計算
+            vpt = mem_per_chip * 0.75
+            par = max(1, num_devices)
+            return 'tpu', total_gb, vpt, par
+        except Exception:
+            pass
+
     total_gb = 0.0
     try:
         import torch
@@ -139,7 +173,6 @@ def _auto_gpu_config(node_id: str) -> tuple[str, float, float, int]:
         pass
 
     if total_gb <= 0:
-        # GPU 未接続 or torch 未初期化 → node_id から推定
         _fallback: dict[str, float] = {
             'h200': 141.0, 'h100': 80.0, 'a100': 80.0,
             'rtx4090': 24.0, 'rtx3090': 24.0, 'gtx1080ti': 11.0,
@@ -152,12 +185,8 @@ def _auto_gpu_config(node_id: str) -> tuple[str, float, float, int]:
     elif total_gb >=  14: tier = 'small'
     else:                 tier = 'micro'
 
-    # 1試行あたりのVRAM消費見積もり (モデル+勾配+Adam状態+アクティベーション)
-    # 大型GPU はバッチ・シーケンス・モデルが大きくなるため消費も増加
     vpt_map = {'xlarge': 12.0, 'large': 10.0, 'medium': 8.0, 'small': 7.0, 'micro': 8.0}
     vpt = vpt_map[tier]
-
-    # GPU VRAM の 85% を試行で使い切る想定で並列数を算出
     par = max(1, int(total_gb * 0.85 / vpt))
 
     return tier, total_gb, vpt, par
@@ -254,13 +283,14 @@ _important_scores: dict = {}          # 特徴量名 → 重要度スコア (重
 GA_FEAT_RATIO  = 0.40   # 特徴量探索フェーズ
 GA_PARAM_RATIO = 0.40   # パラメータチューニングフェーズ
 GA_CROSS_RATIO = 0.20   # 交叉フェーズ
-# large/xlarge/medium GPU = H100_MODE (大モデル・長シーケンスを有効化)
+# large/xlarge/medium/tpu = H100_MODE (大モデル・長シーケンスを有効化)
 # 環境変数 H100_MODE=1 で強制有効、H100_MODE=0 で強制無効も可能
 _h100_env = os.environ.get('H100_MODE', '').strip()
 H100_MODE = (
     (_h100_env == '1') or
-    (_h100_env != '0' and _GPU_TIER in ('medium', 'large', 'xlarge'))
+    (_h100_env != '0' and _GPU_TIER in ('medium', 'large', 'xlarge', 'tpu'))
 )
+TPU_MODE = (_GPU_TIER == 'tpu')
 
 # MAX_PARALLEL / VRAM_PER_TRIAL:
 #   0 または未設定 → GPU VRAM から自動計算
@@ -1087,15 +1117,45 @@ class WorkerPool:
         _cf2.wait(warmup_futs, timeout=120)
         print(f"  [WorkerPool] 全{max_workers}ワーカー準備完了")
 
+    def _restart_executor(self) -> None:
+        """BrokenProcessPool 発生時に executor を再作成する"""
+        import concurrent.futures as _cf
+        import multiprocessing as _mp
+        print(f"  [WorkerPool] executor 再起動中...")
+        try:
+            self._executor.shutdown(wait=False, cancel_futures=True)
+        except Exception:
+            pass
+        # 壊れた futures / meta を破棄
+        self._futures.clear()
+        self._meta.clear()
+        self._executor = _cf.ProcessPoolExecutor(
+            max_workers=self._max_workers,
+            mp_context=_mp.get_context('spawn'),
+            initializer=_worker_init_proxy,
+            initargs=(str(TRAIN_PY.parent), self._cache_path),
+        )
+        print(f"  [WorkerPool] executor 再起動完了 ({self._max_workers}ワーカー)")
+
     def launch(self, trial_no: int, params: dict, best_pf: float, start_time: float,
                strategy: str = 'random'):
         trial_dir = TRIALS_DIR / f'trial_{trial_no:06d}'
         trial_dir.mkdir(parents=True, exist_ok=True)
-        future = self._executor.submit(
-            _run_trial_proxy,
-            str(TRAIN_PY.parent),
-            trial_no, params, str(trial_dir), best_pf, start_time,
-        )
+        try:
+            future = self._executor.submit(
+                _run_trial_proxy,
+                str(TRAIN_PY.parent),
+                trial_no, params, str(trial_dir), best_pf, start_time,
+            )
+        except Exception as e:
+            # BrokenProcessPool や shutdown 後の submit → executor を再作成して再試行
+            print(f"  [WorkerPool] submit失敗 ({type(e).__name__}: {e}) → executor再起動")
+            self._restart_executor()
+            future = self._executor.submit(
+                _run_trial_proxy,
+                str(TRAIN_PY.parent),
+                trial_no, params, str(trial_dir), best_pf, start_time,
+            )
         with self.lock:
             self._futures[trial_no] = future
             self._meta[trial_no] = {
@@ -1119,6 +1179,7 @@ class WorkerPool:
     def poll_completed(self) -> list:
         done = []
         now  = time.time()
+        broken = False
         with self.lock:
             for tno in list(self._futures.keys()):
                 future = self._futures[tno]
@@ -1126,16 +1187,28 @@ class WorkerPool:
                 elapsed = now - meta['start_time']
 
                 if future.done():
+                    # future が BrokenProcessPool で終了しているか確認
+                    try:
+                        exc = future.exception(timeout=0)
+                        if exc is not None:
+                            ename = type(exc).__name__
+                            if 'BrokenProcessPool' in ename or 'broken' in str(exc).lower():
+                                broken = True
+                            print(f"  [WARN] 試行#{tno} 例外終了: {ename}: {exc}")
+                    except Exception:
+                        pass
                     done.append((tno, meta))
                     del self._futures[tno]
                     del self._meta[tno]
                 elif elapsed > TRIAL_TIMEOUT:
-                    # タイムアウト: future をキャンセル (実行中なら無視され次の試行で上書き)
                     future.cancel()
                     print(f"  [TIMEOUT] 試行#{tno} ({elapsed/60:.0f}分超) → スキップ")
                     done.append((tno, meta))
                     del self._futures[tno]
                     del self._meta[tno]
+        if broken:
+            print(f"  [WorkerPool] BrokenProcessPool 検出 → executor 再起動")
+            self._restart_executor()
         return done
 
     def terminate_all(self):
@@ -1631,7 +1704,9 @@ def main():
     write_progress(trainer.running, results, best_pf, start)
 
     # ── メインループ ────────────────────────────────────────────────────────
+    _loop_errors = 0
     while True:
+      try:
         # stop.flag チェック
         if STOP_FLAG.exists():
             print(f"\n[STOP] stop.flag 検出 → 実行中の試行を待機して終了")
@@ -1775,6 +1850,24 @@ def main():
             completed_since_ckpt = 0
 
         time.sleep(1 if isinstance(trainer, WorkerPool) else 5)
+        _loop_errors = 0  # 正常ループが回ればエラーカウントリセット
+
+      except KeyboardInterrupt:
+          print(f"\n[STOP] KeyboardInterrupt → 終了処理")
+          trainer.terminate_all()
+          break
+      except Exception as _loop_exc:
+          import traceback as _tb
+          _loop_errors += 1
+          print(f"  [ERROR] メインループ例外 ({_loop_errors}回目): "
+                f"{type(_loop_exc).__name__}: {_loop_exc}")
+          _tb.print_exc()
+          if _loop_errors >= 10:
+              print(f"  [ERROR] 連続エラー10回 → 終了")
+              trainer.terminate_all()
+              break
+          time.sleep(5)
+          continue
 
     # ── 終了処理 ────────────────────────────────────────────────────────────
     write_progress({}, results, best_pf, start)

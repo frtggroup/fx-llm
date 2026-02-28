@@ -120,6 +120,11 @@ def set_seed(seed):
     torch.manual_seed(seed)
     if torch.cuda.is_available():
         torch.cuda.manual_seed_all(seed)
+    try:
+        import torch_xla.core.xla_model as xm  # type: ignore
+        xm.set_rng_state(torch.manual_seed(seed).get_state()[:])
+    except Exception:
+        pass
 
 
 # ─── データ準備 ────────────────────────────────────────────────────────────
@@ -325,81 +330,98 @@ def make_loaders(X_tr, y_tr, X_te, y_te, args, device):
 
 
 # ─── 学習 ────────────────────────────────────────────────────────────────────
+def _detect_device():
+    """実行デバイスを検出。TPU (XLA) → GPU (CUDA) → CPU の優先順で試みる。"""
+    try:
+        import torch_xla.core.xla_model as xm  # type: ignore
+        return xm.xla_device(), 'xla'
+    except Exception:
+        pass
+    if torch.cuda.is_available():
+        return torch.device('cuda'), 'cuda'
+    return torch.device('cpu'), 'cpu'
+
+
 def train(args, X_tr, y_tr, X_te, y_te, mean, std, n_feat=None):
-    device = torch.device('cuda' if torch.cuda.is_available() else 'cpu')
+    device, dev_type = _detect_device()
     print(f"\n=== 学習 [{device}] ===")
 
-    # GPU 能力を検出して最適化を選択
+    # デバイス別の最適化設定
     is_h100    = False
-    amp_dtype  = torch.float16
-    if device.type == 'cuda':
+    is_tpu     = (dev_type == 'xla')
+    # TPU は BF16 ネイティブ。CUDA (CC9=H100/CC8=A100) も BF16 が高速
+    amp_dtype  = torch.bfloat16 if is_tpu else torch.float16
+
+    if dev_type == 'cuda':
         gpu_name = torch.cuda.get_device_name(0)
         cc       = torch.cuda.get_device_capability(0)
         print(f"  GPU: {gpu_name}  CC={cc[0]}.{cc[1]}")
         torch.backends.cudnn.benchmark    = True
         torch.backends.cudnn.deterministic = False
-        if cc[0] >= 8:          # A100 (8.0) / H100 (9.0)
-            # TF32: デフォルトで有効だが明示的に設定
+        if cc[0] >= 8:
             torch.backends.cuda.matmul.allow_tf32 = True
             torch.backends.cudnn.allow_tf32       = True
-        if cc[0] >= 9:          # H100 SXM5 (9.0)
+        if cc[0] >= 9:
             is_h100   = True
-            amp_dtype = torch.bfloat16   # H100 は BF16 が FP16 より高速
+            amp_dtype = torch.bfloat16
             print(f"  H100 モード: BF16 + TF32 + torch.compile 有効")
         else:
             print(f"  FP16 AMP モード")
+    elif is_tpu:
+        try:
+            import torch_xla.core.xla_model as xm  # type: ignore
+            tpu_info = xm.get_xla_supported_devices()
+            print(f"  TPU モード: デバイス数={len(tpu_info)}  BF16 AMP 有効")
+        except Exception:
+            print(f"  TPU モード: BF16 AMP 有効")
 
     tr_dl, va_dl = make_loaders(X_tr, y_tr, X_te, y_te, args, device)
 
-    # use_amp を H100 torch.compile ウォームアップより前に定義
-    use_amp    = (device.type == 'cuda')
-    use_scaler = use_amp and (amp_dtype == torch.float16)
-    scaler     = torch.amp.GradScaler('cuda', enabled=use_scaler)
+    # AMP 設定: TPU は BF16 (GradScaler 不要), CUDA FP16 は Scaler 使用
+    use_amp    = True  # GPU/TPU ともに混合精度を使用
+    use_scaler = (dev_type == 'cuda') and (amp_dtype == torch.float16)
+    _amp_backend = dev_type if dev_type in ('cuda', 'xla') else 'cpu'
+    scaler     = torch.amp.GradScaler('cuda', enabled=use_scaler) if dev_type == 'cuda' else None
 
     seq_len  = X_tr.shape[1]
     arch     = getattr(args, 'arch', 'gru_attn')
     n_in     = n_feat if n_feat is not None else N_FEATURES
+
+    def _build_and_place():
+        return build_model(arch, n_in, seq_len,
+                           args.hidden, args.layers, args.dropout).to(device)
+
     try:
-        model = build_model(
-            arch, n_in, seq_len,
-            args.hidden, args.layers, args.dropout,
-        ).to(device)
-    except torch.cuda.OutOfMemoryError:
-        # OOM: バッチ半減・モデル縮小でリトライ
-        print(f"  [OOM] モデル生成 OOM → hidden/2, batch/2 でリトライ")
-        torch.cuda.empty_cache()
+        model = _build_and_place()
+    except (RuntimeError, torch.cuda.OutOfMemoryError) as e:
+        # OOM (CUDA) または XLA メモリ不足: バッチ半減・モデル縮小でリトライ
+        print(f"  [OOM] モデル生成失敗 ({type(e).__name__}) → hidden/2, batch/2 でリトライ")
+        if dev_type == 'cuda':
+            torch.cuda.empty_cache()
         args.hidden = max(64, args.hidden // 2)
         args.batch  = max(256, args.batch  // 2)
         tr_dl, va_dl = make_loaders(X_tr, y_tr, X_te, y_te, args, device)
-        model = build_model(
-            arch, n_in, seq_len,
-            args.hidden, args.layers, args.dropout,
-        ).to(device)
+        model = _build_and_place()
 
-    # H100: torch.compile で GPU カーネル効率を向上
-    # ONNX エクスポート用に compile 前のオリジナルモデルを保持
+    # H100: torch.compile で GPU カーネル効率を向上 (TPU は XLA が自動最適化するためスキップ)
     model_for_export = model
-    # 並列ワーカーモード (out_dir が設定される) では compile をスキップ:
-    #   → アーキテクチャが試行ごとに変わるため毎回再コンパイルが発生し逆に遅くなる
-    #   → 探索フェーズは compile なしで高速に試行数を稼ぐ
     _is_worker = bool(getattr(args, 'out_dir', ''))
-    if is_h100 and not _is_worker:
+    if is_h100 and not _is_worker and not is_tpu:
         compile_mode = 'max-autotune'
         try:
             compiled_model = torch.compile(model, mode=compile_mode)
             print(f"  torch.compile({compile_mode}) 有効 → ウォームアップ実行中...")
             _wup_x, _wup_y = next(iter(tr_dl))
-            _use_amp = bool(use_amp)
-            _amp_dtype = amp_dtype
-            with torch.amp.autocast('cuda', enabled=_use_amp, dtype=_amp_dtype):
+            with torch.amp.autocast(_amp_backend, enabled=use_amp, dtype=amp_dtype):
                 _ = compiled_model(_wup_x)
             del _wup_x, _wup_y
             torch.cuda.synchronize()
             print(f"  torch.compile ウォームアップ完了")
-            model = compiled_model  # ウォームアップ成功時のみ compiled モデルを使用
+            model = compiled_model
         except Exception as e:
             print(f"  torch.compile スキップ: {e}")
-            # model は compile 前のまま (model_for_export と同一)
+    elif is_tpu:
+        print(f"  XLA 自動最適化 (torch.compile スキップ)")
     elif is_h100 and _is_worker:
         print(f"  torch.compile スキップ (並列ワーカーモード: 探索優先)")
 
@@ -458,18 +480,20 @@ def train(args, X_tr, y_tr, X_te, y_te, mean, std, n_feat=None):
     for epoch in range(1, args.epochs + 1):
         model.train()
         try:
-            # GPU上でlossを集計 → エポック終わりに1回だけ同期 (GPU稼働率向上)
             step_losses = [
                 _train_step(model, xb, yb,
                             optimizer, criterion, scheduler, scaler,
-                            use_amp, amp_dtype, use_scaler)
+                            use_amp, amp_dtype, use_scaler,
+                            _amp_backend, is_tpu)
                 for xb, yb in tr_dl
             ]
-            t_loss = torch.stack(step_losses).mean().item()  # ここで1回だけ同期
-        except torch.cuda.OutOfMemoryError:
-            torch.cuda.empty_cache()
-            print(f"  [OOM] ep{epoch} CUDA OOM → 学習打ち切り")
-            stop_reason = f'CUDA OOM (ep{epoch})'
+            t_loss = torch.stack(step_losses).mean().item()
+        except (RuntimeError, torch.cuda.OutOfMemoryError) as e:
+            if dev_type == 'cuda':
+                torch.cuda.empty_cache()
+            oom_msg = 'CUDA OOM' if dev_type == 'cuda' else 'XLA OOM'
+            print(f"  [OOM] ep{epoch} {oom_msg} → 学習打ち切り: {e}")
+            stop_reason = f'{oom_msg} (ep{epoch})'
             break
 
         # validation は val_every エポックごとに実行 (不要なGPU同期を削減)
@@ -480,7 +504,7 @@ def train(args, X_tr, y_tr, X_te, y_te, mean, std, n_feat=None):
             total_sum   = 0
             with torch.no_grad():
                 for xb, yb in va_dl:
-                    with torch.amp.autocast('cuda', enabled=use_amp, dtype=amp_dtype):
+                    with torch.amp.autocast(_amp_backend, enabled=use_amp, dtype=amp_dtype):
                         lo = model(xb)
                     v_loss_sum  += criterion(lo, yb).detach()
                     correct_sum += (lo.argmax(1) == yb).sum()
@@ -590,9 +614,10 @@ def train(args, X_tr, y_tr, X_te, y_te, mean, std, n_feat=None):
 
 def _train_step(model, xb, yb, opt, crit, sched,
                 scaler=None, use_amp=False,
-                amp_dtype=torch.float16, use_scaler=False):
+                amp_dtype=torch.float16, use_scaler=False,
+                amp_backend='cuda', is_tpu=False):
     opt.zero_grad(set_to_none=True)
-    with torch.amp.autocast('cuda', enabled=use_amp, dtype=amp_dtype):
+    with torch.amp.autocast(amp_backend, enabled=use_amp, dtype=amp_dtype):
         loss = crit(model(xb), yb)
     if use_scaler and scaler is not None:
         scaler.scale(loss).backward()
@@ -603,9 +628,16 @@ def _train_step(model, xb, yb, opt, crit, sched,
     else:
         loss.backward()
         nn.utils.clip_grad_norm_(model.parameters(), 1.0)
-        opt.step()
+        if is_tpu:
+            # TPU: XLA グラフをコンパイル・実行して同期
+            try:
+                import torch_xla.core.xla_model as xm  # type: ignore
+                xm.optimizer_step(opt)
+            except Exception:
+                opt.step()
+        else:
+            opt.step()
     sched.step()
-    # .item()を呼ばず GPU上テンソルのまま返す → GPU同期を減らす
     return loss.detach()
 
 
