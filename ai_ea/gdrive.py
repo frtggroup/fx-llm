@@ -187,14 +187,15 @@ def download(rel_key: str, local_path: Path) -> bool:
 
 def list_keys(prefix: str = '') -> list[str]:
     """
-    GDrive ルートフォルダ直下のファイル一覧 (prefix 一致) を返す。
-    サブフォルダは再帰しない (ルートレベルのみ)。
+    GDrive ルートフォルダ直下の「ファイル」一覧 (prefix 一致) を返す。
+    フォルダは除外。サブフォルダは再帰しない (ルートレベルのみ)。
     """
     if not GDRIVE_ENABLED:
         return []
     try:
         svc = _svc()
-        q = f"'{GDRIVE_FOLDER_ID}' in parents and trashed=false"
+        q = (f"'{GDRIVE_FOLDER_ID}' in parents and trashed=false "
+             f"and mimeType!='application/vnd.google-apps.folder'")
         res = svc.files().list(q=q, fields='files(id,name)', pageSize=200).execute()
         names = [f['name'] for f in res.get('files', [])]
         if prefix:

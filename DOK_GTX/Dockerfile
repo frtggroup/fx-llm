@@ -1,8 +1,8 @@
 # ─────────────────────────────────────────────────────────────────────────────
-# FX AI EA ランダムサーチ - GTX 1080 Ti / ローカル Docker 対応版
+# FX AI EA ランダムサーチE- GTX 1080 Ti / ローカル Docker 対応版
 #
 # H100版との違い:
-#   - H100_MODE=0 (FP16 AMP, torch.compile無効, 小型モデル優先)
+#   - H100_MODE=0 (FP16 AMP, torch.compile無効, 小型モチE��優允E
 #   - MAX_PARALLEL=1 (VRAM 11GB)
 #   - VRAM_PER_TRIAL=8
 #   - /opt/artifact 不使用 (ローカルボリュームマウントで永続化)
@@ -21,14 +21,14 @@ FROM pytorch/pytorch:2.5.1-cuda12.4-cudnn9-runtime
 
 ENV DEBIAN_FRONTEND=noninteractive \
     PYTHONUNBUFFERED=1 \
-    # GTX 1080 Ti: メモリ断片化防止
+    # GTX 1080 Ti: メモリ断牁E��防止
     PYTORCH_CUDA_ALLOC_CONF=expandable_segments:True,max_split_size_mb:256 \
-    # GTX 1080 Ti (Pascal CC6.1): TF32/BF16非対応 → FP16 AMPのみ
+    # GTX 1080 Ti (Pascal CC6.1): TF32/BF16非対忁EↁEFP16 AMPのみ
     H100_MODE=0 \
-    # GTX 1080 Ti VRAM 11GB → 2並列 × 5GB = 10GB
+    # GTX 1080 Ti VRAM 11GB ↁE2並刁EÁE5GB = 10GB
     MAX_PARALLEL=2 \
     VRAM_PER_TRIAL=5 \
-    # データパス (H1 CSV 直接使用 → M1リサンプル不要で高速)
+    # チE�Eタパス (H1 CSV 直接使用 ↁEM1リサンプル不要で高送E
     DATA_PATH=/workspace/data/USDJPY_H1.csv \
     WORKSPACE=/workspace \
     # Sakura オブジェクトストレージ
@@ -80,13 +80,13 @@ RUN mkdir -p /var/run/sshd /root/.ssh && \
     echo "PermitUserEnvironment yes"        >> /etc/ssh/sshd_config
 RUN echo 'if [[ $- != *i* ]]; then return; fi' >> /root/.bashrc
 
-# H100版と同じSSHキーを共用
+# H100版と同じSSHキーを�E用
 COPY DOK_EA/ssh/authorized_keys /root/.ssh/authorized_keys
 RUN chmod 600 /root/.ssh/authorized_keys
 
 # ── Source files ─────────────────────────────────────────────────────────────
 COPY ai_ea/ /workspace/ai_ea/
-# 学習実行時に生成されるランタイムファイルをイメージから除去
+# 学習実行時に生�Eされるランタイムファイルをイメージから除去
 RUN rm -f /workspace/ai_ea/all_results.json \
           /workspace/ai_ea/best_result.json \
           /workspace/ai_ea/last_result.json \
@@ -97,7 +97,7 @@ RUN rm -f /workspace/ai_ea/all_results.json \
 COPY DOK_GTX/entrypoint.sh /workspace/entrypoint.sh
 RUN chmod +x /workspace/entrypoint.sh
 
-# ── ディレクトリ作成 ─────────────────────────────────────────────────────────
+# ── チE��レクトリ作�E ─────────────────────────────────────────────────────────
 RUN mkdir -p /workspace/data \
              /workspace/ai_ea/trials \
              /workspace/ai_ea/top100 \

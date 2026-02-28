@@ -83,6 +83,15 @@ def remote_list_top100_keys() -> list[str]:
     return []
 
 
+def remote_list_best_keys() -> list[str]:
+    """best_* 以下の全ファイル相対パス一覧 (GDrive > S3)"""
+    if GDRIVE_ENABLED:
+        return _gdrive.list_keys_recursive('best_')
+    if S3_ENABLED:
+        return s3_list_node_keys('best_')
+    return []
+
+
 def REMOTE_ENABLED() -> bool:
     return GDRIVE_ENABLED or S3_ENABLED
 
@@ -1188,8 +1197,8 @@ def restore_checkpoint() -> bool:
         # 全ノードの meta_*.json をダウンロード
         for mk in remote_list_node_keys('meta_'):
             remote_download(mk, CHECKPOINT_DIR / mk)
-        # このノード + 他ノードの best モデルをダウンロード
-        for bk in remote_list_node_keys('best_'):
+        # このノード + 他ノードの best モデルをダウンロード (サブフォルダ内ファイル)
+        for bk in remote_list_best_keys():   # 例: best_h100/fx_model_best.onnx
             remote_download(bk, CHECKPOINT_DIR / bk)
         # 全ノードの top100 をダウンロード (ONNX含む全ファイル)
         top100_count = 0
