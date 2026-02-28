@@ -331,14 +331,36 @@ def make_loaders(X_tr, y_tr, X_te, y_te, args, device):
 
 # ─── 学習 ────────────────────────────────────────────────────────────────────
 def _detect_device():
-    """実行デバイスを検出。TPU (XLA) → GPU (CUDA) → CPU の優先順で試みる。"""
+    """実行デバイスを検出。entrypoint.sh の DEVICE_TYPE 環境変数を最優先で参照し、
+    torch_xla がインストールされていても GPU 環境で誤って XLA を使わないようにする。"""
+    import os as _os
+    _dt = _os.environ.get("DEVICE_TYPE", "").upper()
+
+    # entrypoint.sh が GPU と判定済み → 即 CUDA を返す（torch_xla 干渉を回避）
+    if _dt == "GPU":
+        if torch.cuda.is_available():
+            return torch.device('cuda'), 'cuda'
+        # GPU と言われても cuda が使えない場合は警告して続行
+        print("  [WARN] DEVICE_TYPE=GPU だが torch.cuda.is_available()=False — CPU にフォールバック")
+        return torch.device('cpu'), 'cpu'
+
+    # entrypoint.sh が TPU と判定済み → XLA を使用
+    if _dt == "TPU":
+        try:
+            import torch_xla.core.xla_model as xm  # type: ignore
+            return xm.xla_device(), 'xla'
+        except Exception:
+            print("  [WARN] DEVICE_TYPE=TPU だが torch_xla が利用不可 — CPU にフォールバック")
+            return torch.device('cpu'), 'cpu'
+
+    # DEVICE_TYPE 未設定 (直接 python 起動など): 従来通りの自動検出
+    if torch.cuda.is_available():
+        return torch.device('cuda'), 'cuda'
     try:
         import torch_xla.core.xla_model as xm  # type: ignore
         return xm.xla_device(), 'xla'
     except Exception:
         pass
-    if torch.cuda.is_available():
-        return torch.device('cuda'), 'cuda'
     return torch.device('cpu'), 'cpu'
 
 
