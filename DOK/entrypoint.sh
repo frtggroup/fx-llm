@@ -185,19 +185,46 @@ kill -0 "$DASH_PID" 2>/dev/null \
 mkdir -p "$(dirname ${DATA_PATH})"
 if [ ! -s "${DATA_PATH}" ]; then
     python3 - <<'PYEOF'
-import sys, os
+import sys, os, urllib.request, ssl
 sys.path.insert(0, '/workspace/ai_ea')
 from pathlib import Path
-import gdrive
+
 dst = Path(os.environ.get('DATA_PATH', '/workspace/data/USDJPY_H1.csv'))
-fname = dst.name
-if not gdrive.GDRIVE_ENABLED:
-    print('[WARN] GDrive 無効'); sys.exit(1)
-ok = gdrive.download(fname, dst)
-if ok and dst.exists() and dst.stat().st_size > 0:
-    print(f'[OK] CSV 取得完了 ({dst.stat().st_size/1e6:.1f} MB)')
-    sys.exit(0)
-print('[WARN] GDrive に CSV が見つかりません'); sys.exit(1)
+
+# 方法1: S3 直接URL (最優先・高速)
+S3_ENDPOINT = os.environ.get('S3_ENDPOINT', 'https://frorit-2022.softether.net:18004')
+S3_BUCKET   = os.environ.get('S3_BUCKET',   'fxea')
+S3_PREFIX   = os.environ.get('S3_PREFIX',   'mix')
+s3_url = f'{S3_ENDPOINT}/{S3_BUCKET}/{S3_PREFIX}/data/USDJPY_H1.csv'
+print(f'[*] S3 から CSV 取得中: {s3_url}')
+try:
+    ctx = ssl.create_default_context()
+    ctx.check_hostname = False
+    ctx.verify_mode = ssl.CERT_NONE
+    with urllib.request.urlopen(s3_url, context=ctx, timeout=30) as resp:
+        data = resp.read()
+    if len(data) > 100000:
+        dst.parent.mkdir(parents=True, exist_ok=True)
+        dst.write_bytes(data)
+        print(f'[OK] S3 CSV 取得完了 ({len(data)/1e6:.1f} MB)')
+        sys.exit(0)
+    print(f'[WARN] S3 レスポンスが小さすぎる ({len(data)} bytes)')
+except Exception as e:
+    print(f'[WARN] S3 取得失敗: {e}')
+
+# 方法2: GDrive フォールバック
+try:
+    import gdrive
+    if gdrive.GDRIVE_ENABLED:
+        print('[*] GDrive から CSV 取得中...')
+        ok = gdrive.download(dst.name, dst)
+        if ok and dst.exists() and dst.stat().st_size > 0:
+            print(f'[OK] GDrive CSV 取得完了 ({dst.stat().st_size/1e6:.1f} MB)')
+            sys.exit(0)
+except Exception as e:
+    print(f'[WARN] GDrive 取得失敗: {e}')
+
+print('[ERROR] CSV 取得失敗'); sys.exit(1)
 PYEOF
     STATUS=$?
     if [ $STATUS -ne 0 ] && [ -n "${DATA_URL}" ]; then
