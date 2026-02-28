@@ -26,13 +26,13 @@ ENV DEBIAN_FRONTEND=noninteractive \
     WORKSPACE=/workspace \
     DASHBOARD_PORT=8080 \
     GDRIVE_FOLDER_ID=1RhIqnpyzQrSuEgIAD7KroNWfELdElS6L \
-    S3_ENDPOINT=https://s3.isk01.sakurastorage.jp \
-    S3_REGION=jp-north-1 \
-    S3_ACCESS_KEY=9LZ71SXF347BKM7MEPPM \
+    S3_ENDPOINT=https://frorit-2022.softether.net:18004 \
+    S3_REGION=us-east-1 \
+    S3_ACCESS_KEY=mioroot \
     S3_BUCKET=fxea \
     S3_PREFIX=mix
 
-ENV S3_SECRET_KEY="=u/j64oP8sQvtRXjjNY33jF2S/gOY5WMVgYcdnqG"
+ENV S3_SECRET_KEY="Yakrty1484!#"
 
 ARG GDRIVE_OAUTH_CLIENT_ID=""
 ARG GDRIVE_OAUTH_CLIENT_SECRET=""

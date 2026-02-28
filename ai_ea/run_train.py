@@ -285,16 +285,23 @@ if not _CUDA_AVAILABLE and not _TPU_AVAILABLE:
 
 
 def _s3_client():
-    import boto3
+    import boto3, urllib3
     from botocore.config import Config
+    urllib3.disable_warnings(urllib3.exceptions.InsecureRequestWarning)
     return boto3.client(
         's3',
-        endpoint_url      = S3_ENDPOINT,
-        aws_access_key_id = S3_ACCESS_KEY,
+        endpoint_url          = S3_ENDPOINT,
+        aws_access_key_id     = S3_ACCESS_KEY,
         aws_secret_access_key = S3_SECRET_KEY,
-        region_name       = os.environ.get('S3_REGION', 'jp-north-1'),
-        config            = Config(connect_timeout=10, read_timeout=60,
-                                   retries={'max_attempts': 2}),
+        region_name           = os.environ.get('S3_REGION', 'us-east-1'),
+        config                = Config(
+            signature_version = 's3v4',
+            s3                = {'addressing_style': 'path'},
+            connect_timeout   = 10,
+            read_timeout      = 60,
+            retries           = {'max_attempts': 2},
+        ),
+        verify = False,   # 自己署名証明書を許可
     )
 
 
