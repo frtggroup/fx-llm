@@ -33,17 +33,32 @@ except Exception:
 # ── 2. NVIDIA_VISIBLE_DEVICES チェック (Vast.ai 等はこれで確認できる) ────────
 nv = os.environ.get('NVIDIA_VISIBLE_DEVICES', '')
 if nv and nv not in ('none', 'void', 'NoDevFiles'):
-    # torch.cuda で GPU 名を取得 (torch_xla の干渉より前に nvidia-smi で判定済み)
+    # PJRT_DEVICE=CUDA を設定して torch_xla が CPU にデフォルトしないようにする
+    os.environ['PJRT_DEVICE'] = 'CUDA'
     try:
         import torch
         if torch.cuda.is_available():
             name = torch.cuda.get_device_name(0)
             vram = round(torch.cuda.get_device_properties(0).total_memory / 1e9, 1)
             print(f"GPU|{name}|{vram}")
-        else:
-            print(f"GPU|Unknown GPU (NVDEV={nv})|0")
+            sys.exit(0)
     except Exception:
-        print(f"GPU|Unknown GPU (NVDEV={nv})|0")
+        pass
+    # torch.cuda が使えない場合: nvidia-smi を再試行 (引数なしで存在確認)
+    try:
+        r2 = subprocess.run(['nvidia-smi', '--query-gpu=name,memory.total',
+                             '--format=csv,noheader,nounits'],
+                            capture_output=True, text=True, timeout=10)
+        if r2.returncode == 0 and r2.stdout.strip():
+            parts = r2.stdout.strip().split(',')
+            name2 = parts[0].strip()
+            vram2 = round(float(parts[1].strip()) / 1024, 1) if len(parts) > 1 else 0
+            print(f"GPU|{name2}|{vram2}")
+            sys.exit(0)
+    except Exception:
+        pass
+    # それでも取れない場合: GPU は存在するが詳細不明として継続
+    print(f"GPU|Unknown GPU (NVDEV={nv})|0")
     sys.exit(0)
 
 # ── 3. torch.cuda 直接確認 (NVIDIA_VISIBLE_DEVICES がない環境向け) ──────────

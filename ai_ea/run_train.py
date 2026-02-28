@@ -98,36 +98,52 @@ def REMOTE_ENABLED() -> bool:
 # ── ノードID (GTX / H100 / CPU) ─────────────────────────────────────────────
 # S3 上でノードごとにファイルを分離することで競合を回避する
 def _detect_node_id() -> str:
-    """デバイス名からノードIDを自動決定。環境変数 NODE_ID で上書き可能"""
+    """デバイス名からノードIDを自動決定。環境変数 NODE_ID で上書き可能。
+    DEVICE_TYPE 環境変数 (entrypoint.sh が export) を最優先にして
+    torch_xla がインストールされていても GPU 環境で tpu と誤判定しない。"""
     nid = os.environ.get('NODE_ID', '').strip()
     if nid:
         return nid.lower()
-    # TPU 検出 (torch_xla が利用可能な場合)
-    try:
-        import torch_xla.core.xla_model as xm  # type: ignore
-        dev_str = str(xm.xla_device()).lower()
+
+    device_type = os.environ.get('DEVICE_TYPE', '').upper()  # GPU / TPU / CPU
+
+    # ── TPU 専用パス ──────────────────────────────────────────────────────────
+    if device_type == 'TPU':
         tpu_type = os.environ.get('TPU_NAME', os.environ.get('TPU_ACCELERATOR_TYPE', 'tpu'))
-        # tpu_type 例: 'v4-8', 'v5litepod-8', 'v6e-1', 'trillium'
         for ver in ('v6e', 'v5p', 'v5e', 'v5litepod', 'v4', 'v3', 'trillium'):
             if ver in tpu_type.lower():
                 return f'tpu_{ver}'
         return 'tpu'
-    except Exception:
-        pass
-    # GPU 検出
-    try:
-        import torch
-        if torch.cuda.is_available():
-            name = torch.cuda.get_device_name(0).lower()
-            if 'h200' in name:     return 'h200'
-            if 'h100' in name:     return 'h100'
-            if 'a100' in name:     return 'a100'
-            if '3090' in name:     return 'rtx3090'
-            if '4090' in name:     return 'rtx4090'
-            if '1080' in name:     return 'gtx1080ti'
-            return name.replace(' ', '_')[:12]
-    except Exception:
-        pass
+
+    # ── GPU パス (DEVICE_TYPE=GPU, または未設定で CUDA 使用可能) ──────────────
+    # GPU_NAME 環境変数 (entrypoint.sh が export した実際の名前) を最優先
+    gpu_name_env = os.environ.get('GPU_NAME', '').strip().lower()
+    if gpu_name_env and gpu_name_env not in ('cpu', 'cpu (no gpu)', ''):
+        if 'h200'  in gpu_name_env: return 'h200'
+        if 'h100'  in gpu_name_env: return 'h100'
+        if 'a100'  in gpu_name_env: return 'a100'
+        if '4090'  in gpu_name_env: return 'rtx4090'
+        if '3090'  in gpu_name_env: return 'rtx3090'
+        if '1080'  in gpu_name_env: return 'gtx1080ti'
+        if 'unknown' not in gpu_name_env:
+            return gpu_name_env.replace(' ', '_')[:16]
+
+    # torch.cuda でGPU名取得 (DEVICE_TYPE=GPU のときは torch_xla をスキップ)
+    if device_type != 'TPU':
+        try:
+            import torch
+            if torch.cuda.is_available():
+                name = torch.cuda.get_device_name(0).lower()
+                if 'h200'  in name: return 'h200'
+                if 'h100'  in name: return 'h100'
+                if 'a100'  in name: return 'a100'
+                if '4090'  in name: return 'rtx4090'
+                if '3090'  in name: return 'rtx3090'
+                if '1080'  in name: return 'gtx1080ti'
+                return name.replace(' ', '_')[:16]
+        except Exception:
+            pass
+
     return 'h100' if os.environ.get('H100_MODE', '0') == '1' else 'gtx1080ti'
 
 
@@ -179,6 +195,18 @@ def _auto_gpu_config(node_id: str) -> tuple[str, float, float, int]:
             import torch
             if torch.cuda.is_available():
                 total_gb = torch.cuda.get_device_properties(0).total_memory / 1e9
+        except Exception:
+            pass
+
+    if total_gb <= 0:
+        # nvidia-smi で再取得 (torch.cuda が使えない場合のフォールバック)
+        try:
+            import subprocess as _sp
+            _r = _sp.run(['nvidia-smi', '--query-gpu=memory.total',
+                          '--format=csv,noheader,nounits'],
+                         capture_output=True, text=True, timeout=5)
+            if _r.returncode == 0 and _r.stdout.strip():
+                total_gb = round(float(_r.stdout.strip().split('\n')[0]) / 1024, 1)
         except Exception:
             pass
 
