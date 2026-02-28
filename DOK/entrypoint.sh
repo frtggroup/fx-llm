@@ -9,14 +9,25 @@ echo "======================================================"
 echo "  FX AI EA 並列ランダムサーチ (統合イメージ)"
 echo "======================================================"
 
-# ── 1. GPU 確認 ─────────────────────────────────────────────────────────────
-echo "[*] GPU 確認..."
-GPU_NAME=$(nvidia-smi --query-gpu=name --format=csv,noheader 2>/dev/null | head -1 || echo "CPU")
-nvidia-smi --query-gpu=name,memory.total,driver_version \
-           --format=csv,noheader 2>/dev/null \
-  && echo "[OK] GPU 検出: ${GPU_NAME}" \
-  || { GPU_NAME="CPU"; echo "[WARN] nvidia-smi 使用不可 (CPU モードで続行)"; }
-# Python に GPU 名を渡す (run_train.py の GPU_NAME 変数で使用)
+# ── 1. GPU / TPU 確認 ────────────────────────────────────────────────────────
+echo "[*] デバイス確認..."
+
+# NVIDIA GPU チェック
+if nvidia-smi --query-gpu=name,memory.total,driver_version \
+              --format=csv,noheader 2>/dev/null; then
+    GPU_NAME=$(nvidia-smi --query-gpu=name --format=csv,noheader 2>/dev/null | head -1)
+    echo "[OK] GPU 検出: ${GPU_NAME}"
+# TPU チェック (Google Cloud TPU)
+elif python3 -c "import torch_xla.core.xla_model as xm; print(xm.xla_device())" 2>/dev/null; then
+    TPU_TYPE="${TPU_ACCELERATOR_TYPE:-${TPU_NAME:-TPU}}"
+    GPU_NAME="TPU (${TPU_TYPE})"
+    echo "[OK] TPU 検出: ${GPU_NAME}"
+else
+    GPU_NAME="CPU"
+    echo "[WARN] GPU/TPU が検出できません (CPU モードで続行)"
+fi
+
+# Python に デバイス名を渡す (run_train.py の GPU_NAME 変数で使用)
 export GPU_NAME
 
 # ── 2. CUDA MPS デーモン起動 (GPU並列スループット向上) ─────────────────────
