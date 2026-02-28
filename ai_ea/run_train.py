@@ -725,18 +725,26 @@ def _ga_sample_with_important_features(results: list, rng: random.Random) -> tup
     mode_r = rng.random()
     if mode_r < 0.60:
         # モード A: コア重要特徴量 (上位 10〜15) + 重み付き追加
-        core_n   = rng.randint(min(10, len(imp_idx)), min(15, len(imp_idx)))
+        core_lo  = min(10, len(imp_idx))
+        core_hi  = min(15, len(imp_idx))
+        core_n   = rng.randint(core_lo, max(core_lo, core_hi))
         core_idx = imp_idx[:core_n]
-        extra_n  = rng.randint(5, min(20, len(non_imp)))
-        extra    = rng.sample(non_imp, extra_n)
+        if non_imp:
+            extra_lo = min(5, len(non_imp))
+            extra_hi = min(20, len(non_imp))
+            extra_n  = rng.randint(extra_lo, max(extra_lo, extra_hi))
+            extra    = rng.sample(non_imp, extra_n)
+        else:
+            extra = []
         feat_idx = sorted(set(core_idx + extra))
         mode_tag = 'imp_core'
     elif mode_r < 0.85:
         # モード B: 重要特徴量から重み付きサンプリング + 多めランダム
         weights   = [_important_scores.get(FEATURE_COLS[i], 0.001) for i in imp_idx]
-        total_w   = sum(weights)
+        total_w   = sum(weights) or 1.0
         weights   = [w / total_w for w in weights]
-        k_imp     = rng.randint(max(5, len(imp_idx) // 2), len(imp_idx))
+        k_lo      = max(1, min(5, len(imp_idx) // 2))
+        k_imp     = rng.randint(k_lo, max(k_lo, len(imp_idx)))
         # 重みに基づくサンプリング
         chosen_imp = []
         pool_copy  = list(zip(imp_idx, weights))
@@ -747,13 +755,19 @@ def _ga_sample_with_important_features(results: list, rng: random.Random) -> tup
             pick = rng.choices(range(len(pool_copy)), weights=ws)[0]
             chosen_imp.append(pool_copy[pick][0])
             pool_copy.pop(pick)
-        extra_n  = rng.randint(10, min(30, len(non_imp)))
-        extra    = rng.sample(non_imp, extra_n)
+        if non_imp:
+            extra_lo = min(5, len(non_imp))
+            extra_hi = min(30, len(non_imp))
+            extra_n  = rng.randint(extra_lo, max(extra_lo, extra_hi))
+            extra    = rng.sample(non_imp, extra_n)
+        else:
+            extra = []
         feat_idx = sorted(set(chosen_imp + extra))
         mode_tag = 'imp_wide'
     else:
         # モード C: 最重要特徴量のみ (絞り込み・特化)
-        top_n    = rng.randint(5, min(12, len(imp_idx)))
+        top_lo   = min(5, len(imp_idx))
+        top_n    = rng.randint(top_lo, max(top_lo, min(12, len(imp_idx))))
         feat_idx = sorted(imp_idx[:top_n])
         mode_tag = 'imp_exploit'
 
