@@ -91,16 +91,20 @@ export H100_MODE="${H100_MODE:-1}"
 export MAX_PARALLEL="${MAX_PARALLEL:-3}"
 export VRAM_PER_TRIAL="${VRAM_PER_TRIAL:-10}"
 export DATA_PATH="${DATA_PATH:-/opt/artifact/data/USDJPY_M1.csv}"
+export NODE_ID="${NODE_ID:-h100}"
+# GDrive 環境変数は docker-compose から直接渡される (GDRIVE_FOLDER_ID / GDRIVE_CREDENTIALS_BASE64)
 # torch.compile inductor キャッシュを永続ストレージに置く
 # → コンテナ再起動後も同アーキテクチャは再コンパイル不要
 export TORCHINDUCTOR_CACHE_DIR="${ARTIFACT}/torch_inductor_cache"
 mkdir -p "${TORCHINDUCTOR_CACHE_DIR}"
 
 echo "[*] 設定:"
+echo "    NODE_ID      : ${NODE_ID}"
 echo "    H100_MODE    : ${H100_MODE}"
 echo "    MAX_PARALLEL : ${MAX_PARALLEL} 並列"
 echo "    VRAM/試行    : ${VRAM_PER_TRIAL} GB"
 echo "    DATA_PATH    : ${DATA_PATH}"
+echo "    GDRIVE       : ${GDRIVE_FOLDER_ID:-(未設定)}"
 
 # ── 5. ダッシュボードサーバーを先に起動 (CSV待ちで502にならないよう) ──────
 echo "[*] ダッシュボード起動 (port 8080)..."

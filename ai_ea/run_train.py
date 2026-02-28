@@ -41,6 +41,51 @@ S3_BUCKET    = os.environ.get('S3_BUCKET',      'fxea')
 S3_PREFIX    = os.environ.get('S3_PREFIX',      'mix')   # 両ノード共有フォルダ
 S3_ENABLED   = bool(S3_ENDPOINT and S3_ACCESS_KEY and S3_SECRET_KEY)
 
+# ── Google Drive 共有ストレージ (S3 より優先) ─────────────────────────────────
+import gdrive as _gdrive
+GDRIVE_ENABLED = _gdrive.GDRIVE_ENABLED
+
+
+def remote_upload(local_path: Path, rel_key: str) -> bool:
+    """GDrive > S3 の優先順でアップロード"""
+    if GDRIVE_ENABLED:
+        return _gdrive.upload(local_path, rel_key)
+    if S3_ENABLED:
+        return s3_upload(local_path, rel_key)
+    return False
+
+
+def remote_download(rel_key: str, local_path: Path) -> bool:
+    """GDrive > S3 の優先順でダウンロード"""
+    if GDRIVE_ENABLED:
+        return _gdrive.download(rel_key, local_path)
+    if S3_ENABLED:
+        return s3_download(rel_key, local_path)
+    return False
+
+
+def remote_list_node_keys(glob_prefix: str) -> list[str]:
+    """全ノードの同種ファイル一覧 (GDrive > S3)"""
+    if GDRIVE_ENABLED:
+        return _gdrive.list_node_keys(glob_prefix)
+    if S3_ENABLED:
+        return s3_list_node_keys(glob_prefix)
+    return []
+
+
+def remote_list_top100_keys() -> list[str]:
+    """top100_* 以下の全ファイル相対パス一覧 (GDrive > S3)"""
+    if GDRIVE_ENABLED:
+        return _gdrive.list_keys_recursive('top100_')
+    if S3_ENABLED:
+        raw = s3_list_keys('top100_')
+        return [k[len(S3_PREFIX)+1:] for k in raw]
+    return []
+
+
+def REMOTE_ENABLED() -> bool:
+    return GDRIVE_ENABLED or S3_ENABLED
+
 # ── ノードID (GTX / H100 / CPU) ─────────────────────────────────────────────
 # S3 上でノードごとにファイルを分離することで競合を回避する
 def _detect_node_id() -> str:
@@ -1051,16 +1096,17 @@ def save_checkpoint(results: list, best_pf: float) -> None:
             json.dumps(meta, ensure_ascii=False), encoding='utf-8')
         print(f'  [CKPT] ローカル保存完了 node={NODE_ID} ({len(own)}件 / bestPF={best_pf:.4f})')
 
-        if S3_ENABLED:
+        if REMOTE_ENABLED():
+            tag = 'GDrive' if GDRIVE_ENABLED else 'S3'
             # 軽量ファイル (結果JSON / best / meta) は同期でアップロード
             ok = 0
-            if s3_upload(CHECKPOINT_DIR / own_key, own_key): ok += 1
-            if s3_upload(CHECKPOINT_DIR / meta_name, meta_name): ok += 1
+            if remote_upload(CHECKPOINT_DIR / own_key, own_key): ok += 1
+            if remote_upload(CHECKPOINT_DIR / meta_name, meta_name): ok += 1
             for name in [f'best_{NODE_ID}/fx_model_best.onnx',
                          f'best_{NODE_ID}/norm_params_best.json',
                          f'best_{NODE_ID}/best_result.json']:
                 p = CHECKPOINT_DIR / name
-                if p.exists() and s3_upload(p, name): ok += 1
+                if p.exists() and remote_upload(p, name): ok += 1
 
             # top100 (大量ファイル) はバックグラウンドスレッドで差分のみアップロード
             # → メインループをブロックしない
@@ -1071,18 +1117,17 @@ def save_checkpoint(results: list, best_pf: float) -> None:
                 for f in top_dst.rglob('*'):
                     if not f.is_file():
                         continue
-                    s3_rel = f'top100_{NODE_ID}/{f.relative_to(top_dst)}'.replace('\\', '/')
-                    if s3_upload(f, s3_rel):
+                    rel = f'top100_{NODE_ID}/{f.relative_to(top_dst)}'.replace('\\', '/')
+                    if remote_upload(f, rel):
                         top100_ok += 1
                 if top100_ok:
-                    print(f'  [S3]  top100アップロード完了 ({top100_ok}件)')
+                    print(f'  [{tag}]  top100アップロード完了 ({top100_ok}件)')
 
             import threading
             threading.Thread(target=_upload_top100_bg, daemon=True).start()
-            print(f'  [S3]  アップロード完了 node={NODE_ID} ({ok}件 + top100:BG) '
-                  f'→ s3://{S3_BUCKET}/{S3_PREFIX}/')
+            print(f'  [{tag}]  アップロード完了 node={NODE_ID} ({ok}件 + top100:BG)')
         else:
-            print(f'  [CKPT] S3未設定 → ローカルのみ保存 ({CHECKPOINT_DIR})')
+            print(f'  [CKPT] リモートストレージ未設定 → ローカルのみ保存 ({CHECKPOINT_DIR})')
     except Exception as e:
         print(f'  [CKPT] 保存失敗: {e}')
 
@@ -1107,17 +1152,16 @@ def _merge_results_files(result_files: list[Path]) -> list:
 
 
 def fetch_other_nodes_results() -> list:
-    """S3 から他ノードの結果をダウンロードして返す (ノンブロッキング用)"""
-    if not S3_ENABLED:
+    """リモートから他ノードの結果をダウンロードして返す (ノンブロッキング用)"""
+    if not REMOTE_ENABLED():
         return []
-    other_files = s3_list_node_keys('results_')
+    other_files = remote_list_node_keys('results_')
     results_all = []
     for rel_key in other_files:
-        # 自ノードはスキップ (すでにローカルにある)
         if f'results_{NODE_ID}.json' == rel_key:
             continue
         local = CHECKPOINT_DIR / rel_key
-        if s3_download(rel_key, local):
+        if remote_download(rel_key, local):
             try:
                 data = json.loads(local.read_text(encoding='utf-8'))
                 results_all.extend(data)
@@ -1130,32 +1174,32 @@ def restore_checkpoint() -> bool:
     """S3 mix/ から全ノードのチェックポイントをダウンロードしてマージ復元"""
     CHECKPOINT_DIR.mkdir(parents=True, exist_ok=True)
 
-    if S3_ENABLED:
-        print(f'  [S3]  mix チェックポイント確認中 s3://{S3_BUCKET}/{S3_PREFIX}/ ...')
+    if REMOTE_ENABLED():
+        tag = 'GDrive' if GDRIVE_ENABLED else 'S3'
+        print(f'  [{tag}]  チェックポイント確認中 ...')
         # 全ノードの results_*.json をダウンロード
-        result_keys = s3_list_node_keys('results_')
+        result_keys = remote_list_node_keys('results_')
         if not result_keys:
-            print('  [S3]  チェックポイントなし (全ノード)')
+            print(f'  [{tag}]  チェックポイントなし (全ノード)')
         else:
             for rk in result_keys:
-                s3_download(rk, CHECKPOINT_DIR / rk)
-                print(f'  [S3]  取得: {rk}')
+                remote_download(rk, CHECKPOINT_DIR / rk)
+                print(f'  [{tag}]  取得: {rk}')
         # 全ノードの meta_*.json をダウンロード
-        for mk in s3_list_node_keys('meta_'):
-            s3_download(mk, CHECKPOINT_DIR / mk)
+        for mk in remote_list_node_keys('meta_'):
+            remote_download(mk, CHECKPOINT_DIR / mk)
         # このノード + 他ノードの best モデルをダウンロード
-        for bk in s3_list_node_keys('best_'):
-            s3_download(bk, CHECKPOINT_DIR / bk)
+        for bk in remote_list_node_keys('best_'):
+            remote_download(bk, CHECKPOINT_DIR / bk)
         # 全ノードの top100 をダウンロード (ONNX含む全ファイル)
         top100_count = 0
-        for key in s3_list_keys('top100_'):
-            rel = key[len(S3_PREFIX)+1:]   # 例: top100_h100/rank_001/fx_model.onnx
+        for rel in remote_list_top100_keys():   # 例: top100_h100/rank_001/fx_model.onnx
             dest = CHECKPOINT_DIR / rel
             dest.parent.mkdir(parents=True, exist_ok=True)
-            if s3_download(rel, dest):
+            if remote_download(rel, dest):
                 top100_count += 1
         if top100_count:
-            print(f'  [S3]  top100 {top100_count}ファイル取得 (全ノード)')
+            print(f'  [{tag}]  top100 {top100_count}ファイル取得 (全ノード)')
 
     # ── 全ノードの results_*.json をマージ ───────────────────────────────────
     result_files = list(CHECKPOINT_DIR.glob('results_*.json'))
@@ -1335,16 +1379,18 @@ def main():
     mode_str = f'{gpu_name}  並列={MAX_PARALLEL}  VRAM/試行={VRAM_PER_TRIAL}GB' \
                if H100_MODE else f'{gpu_name}  並列={MAX_PARALLEL}'
     print('=' * 60)
-    print(f'FX AI EA v8 - 並列ランダムサーチ [{mode_str}]  S3: mix/{NODE_ID}')
+    storage_tag = 'GDrive' if GDRIVE_ENABLED else ('S3' if S3_ENABLED else 'ローカルのみ')
+    print(f'FX AI EA v8 - 並列ランダムサーチ [{mode_str}]  ストレージ: {storage_tag}/{NODE_ID}')
     print(f'  TOP {TOP_N} 保存  タイムアウト {TRIAL_TIMEOUT//60}分  stop.flag: {STOP_FLAG}')
     print(f'  GPU無使用タイムアウト: {NO_GPU_TIMEOUT//60}分  データ準備猶予: {DATA_PREP_BUDGET//60}分')
     print('=' * 60)
 
-    # ── S3 接続確認 ────────────────────────────────────────────────────────────
-    print(f'  S3_ENABLED : {S3_ENABLED}')
-    print(f'  S3_ENDPOINT: {S3_ENDPOINT or "(未設定)"}')
-    print(f'  S3_BUCKET  : {S3_BUCKET}  PREFIX: {S3_PREFIX}')
-    if S3_ENABLED:
+    # ── ストレージ接続確認 ─────────────────────────────────────────────────────
+    print(f'  GDRIVE_ENABLED: {GDRIVE_ENABLED}')
+    print(f'  S3_ENABLED    : {S3_ENABLED}  (S3_ENDPOINT: {S3_ENDPOINT or "(未設定)"})')
+    if GDRIVE_ENABLED:
+        _gdrive.test_connection()
+    elif S3_ENABLED:
         try:
             cl = _s3_client()
             cl.put_object(Bucket=S3_BUCKET, Key=f'{S3_PREFIX}/.ping', Body=b'ok')
@@ -1353,7 +1399,7 @@ def main():
         except Exception as e:
             print(f'  [S3] 接続テスト 失敗 ❌: {e}')
     else:
-        print('  [S3] 無効 (S3_ENDPOINT/S3_ACCESS_KEY/S3_SECRET_KEY を環境変数で設定してください)')
+        print('  [ストレージ] 未設定 → ローカルのみ (GDRIVE_FOLDER_ID + GDRIVE_CREDENTIALS_BASE64 を設定)')
 
     # ── 起動時にデータキャッシュを事前作成 (全試行が即座に学習開始できる) ──
     _precache_data()
@@ -1388,7 +1434,7 @@ def main():
     def _other_nodes_merge_loop():
         """バックグラウンドで他ノードの新着結果を取り込んでマージ"""
         while not _other_merge_stop.wait(300):   # 5分ごと
-            if not S3_ENABLED:
+            if not REMOTE_ENABLED():
                 continue
             try:
                 other = fetch_other_nodes_results()
