@@ -263,17 +263,6 @@ fi
 # ── 8. 学習ループ起動 ─────────────────────────────────────────────────────────
 rm -f /workspace/stop.flag
 
-# XLA キャッシュを S3 から復元 (TPU のみ / 失敗しても続行)
-_xla_cache_download || true
-
-# XLA キャッシュ定期アップロード (10分ごと、バックグラウンド)
-XLA_SYNC_PID=""
-if [ "$DEVICE_TYPE" = "TPU" ] && [ -n "$S3_ENDPOINT" ]; then
-    (while true; do sleep 600; _xla_cache_upload; done) &
-    XLA_SYNC_PID=$!
-    echo "[*] XLA キャッシュ自動同期 開始 (10分ごと, PID: ${XLA_SYNC_PID})"
-fi
-
 echo ""
 echo "[*] 並列ランダムサーチ開始"
 echo "    ダッシュボード: http://0.0.0.0:${DASHBOARD_PORT}"
@@ -366,6 +355,17 @@ _graceful_stop() {
     echo "[OK] 停止完了"
 }
 trap '_graceful_stop' SIGTERM SIGINT
+
+# XLA キャッシュを S3 から復元 (TPU のみ / 失敗しても続行)
+_xla_cache_download || true
+
+# XLA キャッシュ定期アップロード (10分ごと、バックグラウンド)
+XLA_SYNC_PID=""
+if [ "$DEVICE_TYPE" = "TPU" ] && [ -n "$S3_ENDPOINT" ]; then
+    (while true; do sleep 600; _xla_cache_upload; done) &
+    XLA_SYNC_PID=$!
+    echo "[*] XLA キャッシュ自動同期 開始 (10分ごと, PID: ${XLA_SYNC_PID})"
+fi
 
 # ── 自動再起動ループ ──────────────────────────────────────────────────────────
 # run_train.py がクラッシュしても自動復旧する。stop.flag があれば再起動しない。
