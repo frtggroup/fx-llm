@@ -354,38 +354,61 @@ def api_status():
     if _ws:
         st.update(_ws)
     # TPU チップ情報: trial_progress.json から per-chip 利用率を集計
+    # DEVICE_TYPE / PJRT_DEVICE のどちらかが TPU なら TPU 環境とみなす
+    _is_tpu_env = (os.environ.get('DEVICE_TYPE', '').upper() == 'TPU'
+                   or os.environ.get('PJRT_DEVICE', '').upper() == 'TPU'
+                   or int(os.environ.get('TPU_NUM_DEVICES', '0')) > 1)
+    _n_tpu      = int(os.environ.get('TPU_NUM_DEVICES', '4')) if _is_tpu_env else 0
     _tpu_chip_map: dict[int, dict] = {}   # chip_id -> latest info
     try:
         import glob as _glob, time as _time
         _now = _time.time()
+        # 直近2分以内に更新されたtrial_progress.jsonを全件読む
+        _candidates: list[tuple[float, dict]] = []  # (mtime, data)
         for _pf in _glob.glob(str(TRIALS_DIR / 'trial_*/trial_progress.json')):
             try:
+                _mtime = Path(_pf).stat().st_mtime
+                if _now - _mtime > 600:   # 10分以内 (gru_attn/h1024等の遅いモデルも考慮)
+                    continue
                 _pd = json.loads(Path(_pf).read_text(encoding='utf-8'))
-                _chip = int(_pd.get('tpu_chip', -1))
-                if _chip < 0:
-                    continue
-                _age = _now - Path(_pf).stat().st_mtime
-                # 2分以内に更新されたもののみ (古い試行を除外)
-                if _age > 120:
-                    continue
-                _tpu_chip_map[_chip] = {
-                    'chip':        _chip,
-                    'trial':       _pd.get('trial', 0),
-                    'arch':        _pd.get('arch', '?'),
-                    'hidden':      _pd.get('hidden', 0),
-                    'epoch':       _pd.get('epoch', 0),
-                    'total_epochs':_pd.get('total_epochs', 0),
-                    'ep_sec':      _pd.get('ep_sec', 0.0),
-                    'util_pct':    _pd.get('tpu_util_pct', 0.0),
-                    'phase':       _pd.get('phase', 'unknown'),
-                }
+                _candidates.append((_mtime, _pd))
             except Exception:
                 pass
+
+        # 新しい順にソートして各チップに割り当て
+        _candidates.sort(key=lambda x: x[0], reverse=True)
+        for _mtime, _pd in _candidates:
+            _chip = int(_pd.get('tpu_chip', -1))
+            # tpu_chip未設定(旧train.py)の場合は trial番号からチップを推定
+            if _chip < 0 and _n_tpu > 0:
+                _trial_no = int(_pd.get('trial', 1))
+                _chip = (_trial_no - 1) % _n_tpu
+            if _chip < 0 or _chip in _tpu_chip_map:
+                continue
+            _tpu_chip_map[_chip] = {
+                'chip':        _chip,
+                'trial':       _pd.get('trial', 0),
+                'arch':        _pd.get('arch', '?'),
+                'hidden':      _pd.get('hidden', 0),
+                'epoch':       _pd.get('epoch', 0),
+                'total_epochs':_pd.get('total_epochs', 0),
+                'ep_sec':      float(_pd.get('ep_sec') or 0.0),
+                'util_pct':    float(_pd.get('tpu_util_pct') or 0.0),
+                'phase':       _pd.get('phase', 'running'),
+            }
     except Exception:
         pass
 
-    if _tpu_chip_map:
-        chips_sorted = [_tpu_chip_map[k] for k in sorted(_tpu_chip_map)]
+    if _tpu_chip_map or _is_tpu_env:
+        # TPU環境では必ず全チップ分(0〜n-1)を表示。データなしはidle扱い
+        chips_sorted = []
+        for _ci in range(max(_n_tpu, max(_tpu_chip_map.keys(), default=-1) + 1)):
+            if _ci in _tpu_chip_map:
+                chips_sorted.append(_tpu_chip_map[_ci])
+            else:
+                chips_sorted.append({'chip': _ci, 'arch': '', 'hidden': 0,
+                                     'epoch': 0, 'total_epochs': 0,
+                                     'ep_sec': 0.0, 'util_pct': 0.0, 'phase': 'idle'})
         st['tpu_chips'] = chips_sorted
         utils = [c['util_pct'] for c in chips_sorted if c['util_pct'] > 0]
         st['tpu_duty_cycle'] = round(sum(utils) / len(utils), 1) if utils else 0.0
