@@ -1830,8 +1830,17 @@ def main():
         while len(trainer) < submit_limit:
             if STOP_FLAG.exists():
                 break
-            p, strategy = next_params(results, rng)
-            trainer.launch(trial_no, p, best_pf, start, strategy)
+            try:
+                p, strategy = next_params(results, rng)
+            except Exception as _np_exc:
+                print(f"  [WARN] next_params 失敗: {_np_exc} → ランダムサンプルにフォールバック")
+                p, strategy = sample_params(rng), 'random'
+            try:
+                trainer.launch(trial_no, p, best_pf, start, strategy)
+            except Exception as _launch_exc:
+                print(f"  [WARN] launch 失敗: {_launch_exc} → スキップ")
+                time.sleep(5)
+                break
             trial_no += 1
             if isinstance(trainer, WorkerPool):
                 time.sleep(0.1)   # キュー投入は高速でOK (CUDA初期化済み)

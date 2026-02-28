@@ -1,29 +1,30 @@
 # ─────────────────────────────────────────────────────────────────────────────
 # FX AI EA ランダムサーチ  TPU (Google Cloud TPU v4/v5/Trillium) 対応
-# GPU (CUDA) / TPU (XLA) を自動検出して動作
 #
-# Build:
-#   docker build -f DOK_TPU/Dockerfile -t frtggroup/fx-ea-tpu:latest .
+# ベースイメージ: PyTorch XLA 公式 (torch_xla + libtpu 同梱)
 #
-# Google Cloud TPU VM での起動:
-#   docker run -d -p 8080:8080 \
-#     -e DATA_URL="https://your-storage/USDJPY_H1.csv" \
-#     --privileged \
-#     frtggroup/fx-ea-tpu:latest
+# デプロイ先: Google Cloud TPU VM
+#   gcloud compute tpus tpu-vm create fx-ea-tpu \
+#     --zone=us-central2-b --accelerator-type=v4-8 \
+#     --version=tpu-ubuntu2204-base
+#   gcloud compute tpus tpu-vm ssh fx-ea-tpu --zone=us-central2-b \
+#     --command="docker run -d --privileged --net=host \
+#       -e DATA_URL=<url> \
+#       frtggroup/fx-ea-tpu:latest"
 #
-# デバイス優先順: TPU (XLA) > GPU (CUDA) > CPU
-# NODE_ID / MAX_PARALLEL / VRAM_PER_TRIAL はデバイスから自動計算
+# 環境変数 (すべて自動検出のため通常設定不要):
+#   NODE_ID         : 自動 (tpu_v4 など)
+#   TPU_NUM_DEVICES : TPU チップ数 (デフォルト 4)
+#   DATA_URL        : CSV ダウンロード URL (GDrive になければ指定)
 # ─────────────────────────────────────────────────────────────────────────────
-
-# PyTorch XLA 公式イメージ (PyTorch 2.5 + torch_xla + libtpu 同梱)
 FROM us-central1-docker.pkg.dev/tpu-pytorch/torch-xla-release/torch_xla:r2.5
 
 ENV DEBIAN_FRONTEND=noninteractive \
     PYTHONUNBUFFERED=1 \
-    # TPU BF16 最適化
-    XLA_USE_BF16=1 \
-    # メモリ断片化防止 (CUDA も使う場合)
-    PYTORCH_CUDA_ALLOC_CONF=expandable_segments:True,max_split_size_mb:512 \
+    # XLA フラグ: TPU メモリ断片化防止
+    XLA_PYTHON_CLIENT_PREALLOCATE=false \
+    # PyTorch XLA: プロファイリング無効化 (本番では不要)
+    PT_XLA_DEBUG=0 \
     DATA_PATH=/workspace/data/USDJPY_H1.csv \
     WORKSPACE=/workspace \
     DASHBOARD_PORT=8080 \
@@ -58,7 +59,7 @@ RUN apt-get update && apt-get install -y --no-install-recommends \
         build-essential \
     && apt-get clean && rm -rf /var/lib/apt/lists/*
 
-# ── Python packages (torch_xla はベースイメージに含まれる) ──────────────────
+# ── Python packages ──────────────────────────────────────────────────────────
 COPY DOK_TPU/requirements.txt /tmp/requirements.txt
 RUN pip install --upgrade pip && \
     pip install --no-cache-dir -r /tmp/requirements.txt
@@ -70,10 +71,6 @@ RUN mkdir -p /var/run/sshd /root/.ssh && \
     echo "PasswordAuthentication no"        >> /etc/ssh/sshd_config && \
     echo "PubkeyAuthentication yes"         >> /etc/ssh/sshd_config && \
     echo "AllowTcpForwarding yes"           >> /etc/ssh/sshd_config && \
-    echo "AllowStreamLocalForwarding yes"   >> /etc/ssh/sshd_config && \
-    echo "PrintMotd no"                     >> /etc/ssh/sshd_config && \
-    echo "PrintLastLog no"                  >> /etc/ssh/sshd_config && \
-    echo "PermitTTY yes"                    >> /etc/ssh/sshd_config && \
     echo "PermitUserEnvironment yes"        >> /etc/ssh/sshd_config
 RUN echo 'if [[ $- != *i* ]]; then return; fi' >> /root/.bashrc
 

@@ -11,7 +11,7 @@ on:
 jobs:
   build-and-push:
     runs-on: ubuntu-latest
-    timeout-minutes: 90
+    timeout-minutes: 120
 
     steps:
       - name: Free disk space
@@ -58,10 +58,10 @@ jobs:
           echo "| 項目 | 値 |" >> $GITHUB_STEP_SUMMARY
           echo "|------|---|" >> $GITHUB_STEP_SUMMARY
           echo "| イメージ | \`${{ secrets.DOCKERHUB_USERNAME }}/fx-ea-tpu:latest\` |" >> $GITHUB_STEP_SUMMARY
-          echo "| ベース | \`torch_xla:r2.5\` (PyTorch XLA 公式) |" >> $GITHUB_STEP_SUMMARY
-          echo "| 対応デバイス | TPU v3/v4/v5/Trillium + GPU (CUDA) + CPU |" >> $GITHUB_STEP_SUMMARY
+          echo "| ベース | PyTorch XLA r2.5 (torch_xla 同梱) |" >> $GITHUB_STEP_SUMMARY
+          echo "| 対象 TPU | v4 / v5e / v5p / Trillium |" >> $GITHUB_STEP_SUMMARY
           echo "" >> $GITHUB_STEP_SUMMARY
-          echo "**TPU VM での起動:**" >> $GITHUB_STEP_SUMMARY
-          echo "\`\`\`" >> $GITHUB_STEP_SUMMARY
-          echo "docker run -d -p 8080:8080 --privileged frtggroup/fx-ea-tpu:latest" >> $GITHUB_STEP_SUMMARY
+          echo "**起動コマンド (Google Cloud TPU VM):**" >> $GITHUB_STEP_SUMMARY
+          echo "\`\`\`bash" >> $GITHUB_STEP_SUMMARY
+          echo "docker run -d --privileged --net=host frtggroup/fx-ea-tpu:latest" >> $GITHUB_STEP_SUMMARY
           echo "\`\`\`" >> $GITHUB_STEP_SUMMARY
