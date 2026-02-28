@@ -49,11 +49,20 @@ _folder_cache: dict[str, str] = {}
 _cache_lock = threading.Lock()
 
 
+_HTTP_TIMEOUT = 30  # 全 Drive API コールのソケットタイムアウト (秒)
+
+
 def _build_service():
-    """Google Drive API サービスオブジェクトを生成 (OAuth2 優先 → サービスアカウント)"""
+    """Google Drive API サービスオブジェクトを生成 (OAuth2 優先 → サービスアカウント)
+    socket.setdefaulttimeout でソケットレベルのタイムアウトを設定することで、
+    list/download/upload 含む全 API コールが無限待ちにならないようにする。
+    """
+    import socket
+    socket.setdefaulttimeout(_HTTP_TIMEOUT)   # 根本解決: 全ソケット操作にタイムアウト
+
     from googleapiclient.discovery import build
+
     if _USE_OAUTH:
-        # OAuth2 リフレッシュトークン方式 (個人 My Drive に書き込める)
         from google.oauth2.credentials import Credentials
         from google.auth.transport.requests import Request
         creds = Credentials(
@@ -65,11 +74,11 @@ def _build_service():
         )
         creds.refresh(Request())
     else:
-        # サービスアカウント方式 (Shared Drive のみ書き込み可)
         from google.oauth2 import service_account
         creds_json = base64.b64decode(GDRIVE_CREDS_B64).decode('utf-8')
         info = json.loads(creds_json)
         creds = service_account.Credentials.from_service_account_info(info, scopes=_SCOPES)
+
     return build('drive', 'v3', credentials=creds, cache_discovery=False)
 
 
