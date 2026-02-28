@@ -398,8 +398,25 @@ tr:hover td{background:#1c2128}
       border-radius:6px;padding:2px 8px;vertical-align:middle;color:#79c0ff;font-weight:400;
       margin-left:10px">GPU: ...</span>
   </h1>
-  <span id="nodes-info" style="font-size:.72em;color:#8b949e;margin-right:12px"></span>
   <span class="badge badge-wait" id="phase-badge">待機中</span>
+</div>
+
+<!-- 稼働マシン一覧 -->
+<div class="card" style="margin-bottom:12px" id="nodes-card">
+  <h2>🖥 稼働マシン一覧</h2>
+  <div style="overflow-x:auto">
+    <table id="nodes-table">
+      <thead>
+        <tr>
+          <th>GPU</th><th>ノードID</th><th>完了件数</th>
+          <th>ベストPF</th><th>速度 (件/30分)</th><th>最終更新</th>
+        </tr>
+      </thead>
+      <tbody id="nodes-tbody">
+        <tr><td colspan="6" style="text-align:center;color:#8b949e">待機中</td></tr>
+      </tbody>
+    </table>
+  </div>
 </div>
 
 <div class="toolbar">
@@ -505,17 +522,17 @@ tr:hover td{background:#1c2128}
   </div>
 </div>
 
-<!-- 最近完了 20件 -->
+<!-- 最近完了 50件 (全ノード) -->
 <div class="card" style="margin-bottom:12px">
-  <h2>最近完了した試行 (最新20件)</h2>
+  <h2>最近完了した試行 — 全ノード (最新50件)</h2>
   <div style="overflow-x:auto">
     <table>
       <thead>
         <tr><th>#</th><th>PF</th><th>SR</th><th>MaxDD</th><th>純利益</th>
-            <th>取引</th><th>勝率</th><th>Arch</th><th>時刻</th></tr>
+            <th>取引</th><th>勝率</th><th>Arch</th><th>ノード</th><th>時刻</th></tr>
       </thead>
       <tbody id="recent-tbody">
-        <tr><td colspan="9" style="text-align:center;color:#8b949e">待機中</td></tr>
+        <tr><td colspan="10" style="text-align:center;color:#8b949e">待機中</td></tr>
       </tbody>
     </table>
   </div>
@@ -686,7 +703,9 @@ function updatePFChart(trialResults) {
 
 function updateRecentTable(trialResults) {
   if (!trialResults || !trialResults.length) return;
-  const recent = [...trialResults].filter(r=>r.trial).slice(-20).reverse();
+  // 全ノードの結果を timestamp 降順で最新50件
+  const recent = [...trialResults].filter(r=>r.trial)
+    .sort((a,b)=>(b.timestamp||'').localeCompare(a.timestamp||'')).slice(0,50);
   const tbody  = document.getElementById('recent-tbody');
   tbody.innerHTML = recent.map(r => {
     const pf  = r.pf??0;
@@ -694,6 +713,8 @@ function updateRecentTable(trialResults) {
     const sr  = r.sr??0;
     const srC = sr>=1?'#3fb950':sr>=0.5?'#ffa657':'#8b949e';
     const dd  = r.max_dd??0;
+    const nid = (r.node_id||'').toUpperCase();
+    const nidC = nid ? '#79c0ff' : '#8b949e';
     return `<tr>
       <td style="color:#8b949e">#${r.trial}</td>
       <td style="color:${pfC};font-weight:${pf>=1.2?'700':'400'}">${pf.toFixed(4)}</td>
@@ -703,6 +724,7 @@ function updateRecentTable(trialResults) {
       <td>${r.trades??'-'}</td>
       <td style="color:#3fb950">${((r.win_rate??0)*100).toFixed(1)}%</td>
       <td style="color:#79c0ff">${r.arch??'-'}</td>
+      <td style="color:${nidC};font-size:.75em">${nid||'-'}</td>
       <td style="color:#8b949e;font-size:.7em">${(r.timestamp??'').slice(5,16)}</td>
     </tr>`;
   }).join('');
@@ -835,10 +857,22 @@ async function poll() {
     }
     if (d.nodes_summary) {
       const ns = d.nodes_summary;
-      const parts = Object.entries(ns).map(([nid,info]) =>
-        `<span style="color:#79c0ff">${nid.toUpperCase()}</span>: ${info.count}件 PF=${(info.best_pf||0).toFixed(3)}`
-      );
-      document.getElementById('nodes-info').innerHTML = '🖥 ' + parts.join('&nbsp;│&nbsp;');
+      const rows = Object.entries(ns).map(([nid, info]) => {
+        const pf   = info.best_pf || 0;
+        const pfC  = pf >= 2 ? '#f0883e' : pf >= 1.5 ? '#3fb950' : pf >= 1.2 ? '#ffa657' : '#79c0ff';
+        const rate = info.rate_30min || 0;
+        const rateC = rate >= 20 ? '#3fb950' : rate >= 10 ? '#ffa657' : '#8b949e';
+        return `<tr>
+          <td style="color:#e3b341;font-weight:600">${info.gpu_name || '?'}</td>
+          <td style="color:#79c0ff">${nid.toUpperCase()}</td>
+          <td style="color:#58a6ff">${info.count}</td>
+          <td style="color:${pfC};font-weight:600">${pf.toFixed(4)}</td>
+          <td style="color:${rateC};font-weight:600">${rate.toFixed(1)}</td>
+          <td style="color:#8b949e;font-size:.8em">${info.last_seen || '-'}</td>
+        </tr>`;
+      }).join('');
+      document.getElementById('nodes-tbody').innerHTML = rows ||
+        '<tr><td colspan="6" style="color:#8b949e;text-align:center">データなし</td></tr>';
     }
 
     // 並列試行状態

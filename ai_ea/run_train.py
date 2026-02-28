@@ -953,15 +953,49 @@ def write_progress(running: dict, results: list, best_pf: float, start: float) -
             search_phase = f'🔍 GA モード (残{remain}秒→ランダム切替){imp_tag}'
         else:
             search_phase = f'🎲 ランダム モード (残{remain}秒→GA切替){imp_tag}'
-    # 全ノードの結果集計
-    nodes_summary = {}
+    # 全ノードの結果集計 + スループット計算
+    from datetime import datetime as _dt, timedelta as _td
+    _now_dt  = _dt.now()
+    _cut30   = _now_dt - _td(minutes=30)
+    nodes_summary: dict = {}
     for r in results:
         nid = r.get('node_id', NODE_ID)
+        gpu = r.get('gpu_name') or '?'
+        ts_str = r.get('timestamp', '')
         if nid not in nodes_summary:
-            nodes_summary[nid] = {'count': 0, 'best_pf': 0.0}
-        nodes_summary[nid]['count'] += 1
-        if r.get('pf', 0) > nodes_summary[nid]['best_pf'] and r.get('trades', 0) >= 200:
-            nodes_summary[nid]['best_pf'] = r.get('pf', 0)
+            nodes_summary[nid] = {
+                'count': 0, 'best_pf': 0.0,
+                'gpu_name': gpu,
+                'recent_30min': 0,
+                '_first_ts': None, '_last_ts': None,
+            }
+        ns = nodes_summary[nid]
+        ns['count'] += 1
+        if gpu != '?':
+            ns['gpu_name'] = gpu
+        if r.get('pf', 0) > ns['best_pf'] and r.get('trades', 0) >= 200:
+            ns['best_pf'] = r.get('pf', 0)
+        if ts_str:
+            try:
+                ts = _dt.strptime(ts_str, '%Y-%m-%d %H:%M:%S')
+                if ns['_first_ts'] is None or ts < ns['_first_ts']:
+                    ns['_first_ts'] = ts
+                if ns['_last_ts'] is None or ts > ns['_last_ts']:
+                    ns['_last_ts'] = ts
+                if ts >= _cut30:
+                    ns['recent_30min'] += 1
+            except Exception:
+                pass
+    # rate_30min / last_seen を確定して内部フィールド削除
+    for nid, ns in nodes_summary.items():
+        rate = float(ns['recent_30min'])
+        if rate == 0 and ns['_first_ts'] is not None and ns['_last_ts'] is not None:
+            elapsed_min = max(1.0, (_now_dt - ns['_first_ts']).total_seconds() / 60)
+            if elapsed_min < 30:
+                rate = round(ns['count'] / elapsed_min * 30, 1)
+        ns['rate_30min'] = rate
+        ns['last_seen']  = ns['_last_ts'].strftime('%m/%d %H:%M') if ns['_last_ts'] else '-'
+        del ns['recent_30min'], ns['_first_ts'], ns['_last_ts']
 
     progress = {
         'phase':           'training' if running else 'waiting',
@@ -973,7 +1007,7 @@ def write_progress(running: dict, results: list, best_pf: float, start: float) -
         'best_pf':         best_pf,
         'target_pf':       0,
         'epoch_log':       epoch_log,
-        'trial_results':   results[-200:],
+        'trial_results':   results[-500:],  # 全ノード合算で最新500件
         'start_time':      start,
         'elapsed_sec':     time.time() - start,
         'gpu_pct':         gi['gpu_pct'],
