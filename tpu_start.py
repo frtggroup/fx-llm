@@ -84,16 +84,17 @@ def propagate_ssh_key(zone: str):
 
 
 def ssh(ip: str, remote_cmd: str, timeout=120) -> bool:
-    """OpenSSH でリモートコマンドを実行"""
+    """OpenSSH でリモートコマンドを実行 (バイト送信で CRLF 変換を回避)"""
     import subprocess
+    # text=True にすると Windows で \n→\r\n 変換され bash が失敗するためバイト送信
+    script_bytes = remote_cmd.replace('\r\n', '\n').encode('utf-8')
     result = subprocess.run(
         ["ssh", "-i", SSH_KEY,
          "-o", "StrictHostKeyChecking=no",
          "-o", "UserKnownHostsFile=/dev/null",
          "-o", "ConnectTimeout=15",
          f"{SSH_USER}@{ip}", "bash"],
-        input=remote_cmd,
-        text=True,
+        input=script_bytes,
         timeout=timeout,
     )
     return result.returncode == 0
