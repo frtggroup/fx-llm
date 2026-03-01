@@ -501,6 +501,12 @@ except Exception as e:
 PYEOF
     fi
     echo "[OK] XLA コンパイル＆S3同期 完了 → 学習開始"
+
+    # WARMUP_ONLY=1: コンパイルのみで終了 (複数VM並列warmup時に使用)
+    if [ "${WARMUP_ONLY:-0}" = "1" ]; then
+        echo "[*] WARMUP_ONLY=1: XLAコンパイル完了。コンテナを終了します。"
+        exit 0
+    fi
 fi
 
 # 学習中の新規キャッシュ (train.py が生成) を定期的にS3へバックアップ (10分ごと)
