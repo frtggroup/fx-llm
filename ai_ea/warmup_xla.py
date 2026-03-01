@@ -102,7 +102,7 @@ def _upload_new_cache_files(cache_dir: Path, known_files: set, rank: int) -> set
     戻り値: 更新後の既知ファイルセット"""
     if not cache_dir.exists():
         return known_files
-    current = {f for f in cache_dir.rglob('*') if f.is_file()}
+    current = {f for f in cache_dir.rglob('*') if f.is_file() and not f.name.endswith('.uploading.zip')}
     new_files = current - known_files
     if not new_files:
         return current
@@ -113,7 +113,7 @@ def _upload_new_cache_files(cache_dir: Path, known_files: set, rank: int) -> set
         rel = f.relative_to(cache_dir)
         s3_key = f'{prefix}/{rel}.zip'
         # tmpファイルに書いてからアップロード (BytesIOだと大ファイルでOOM)
-        tmp_path = f.parent / (f.name + '.uploading.zip')
+        tmp_path = f.parent / (f.name + f'.rank{rank}.uploading.zip')
         max_retries = 5
         for attempt in range(max_retries):
             try:
