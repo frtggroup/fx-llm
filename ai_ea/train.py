@@ -104,6 +104,8 @@ def parse_args():
                    help='使用する特徴量数 (0=全70, 2-70で指定)')
     p.add_argument('--feat_set',      type=int,   default=-2,
                    help='feature_sets.py のセット番号 (0-99), -1=ランダム数, -2=未指定')
+    p.add_argument('--feat_indices',  type=str,   default=None,
+                   help='使用する特徴量インデックスのリスト JSON形式 "[1,2,3]" (GAモード用)')
     p.add_argument('--seed',          type=int,   default=42)
     # run_train.py から渡される追加引数
     p.add_argument('--trial',       type=int,   default=1)
@@ -240,6 +242,13 @@ def prepare(args):
     n_feat_arg  = getattr(args, 'n_features', 0)
     feat_frac   = getattr(args, 'feat_frac', 1.0)
     feat_indices_direct = getattr(args, 'feat_indices', None)
+    # run_train.py が str(list) で渡す場合 (例: "[1, 13, 22]") を JSON パース
+    if feat_indices_direct and isinstance(feat_indices_direct, str):
+        import json as _json
+        try:
+            feat_indices_direct = _json.loads(feat_indices_direct)
+        except Exception:
+            feat_indices_direct = None
 
     _tpu_mode = (os.environ.get('PJRT_DEVICE', '').upper() == 'TPU'
                  or os.environ.get('DEVICE_TYPE', '').upper() == 'TPU')

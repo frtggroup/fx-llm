@@ -428,8 +428,8 @@ _graceful_stop() {
 trap '_graceful_stop' SIGTERM SIGINT
 
 # XLA キャッシュを S3 から復元 (TPU のみ / 失敗しても続行)
-# ディスク空き容量が 15GB 未満なら xla_cache 古いファイルを自動削除してスペース確保
-if [ "$DEVICE_TYPE" = "TPU" ]; then
+# XLA_SKIP_DOWNLOAD=1 の場合はスキップ (ディスク節約モード)
+if [ "$DEVICE_TYPE" = "TPU" ] && [ "${XLA_SKIP_DOWNLOAD:-0}" != "1" ]; then
     _XLA_CACHE_DIR="${XLA_CACHE_DIR:-/workspace/xla_cache}"
     _AVAIL_GB=$(df / | tail -1 | awk '{print int($4/1024/1024)}')
     if [ "$_AVAIL_GB" -lt 15 ] && [ -d "$_XLA_CACHE_DIR" ]; then
@@ -440,8 +440,10 @@ if [ "$DEVICE_TYPE" = "TPU" ]; then
         ls -t "$_XLA_CACHE_DIR" | tail -"$_DEL_CNT" | xargs -I{} rm -f "$_XLA_CACHE_DIR/{}" 2>/dev/null || true
         echo "[*] xla_cache 削除後: $(ls $_XLA_CACHE_DIR 2>/dev/null | wc -l)件"
     fi
+    _xla_cache_download || true
+else
+    [ "${XLA_SKIP_DOWNLOAD:-0}" = "1" ] && echo "[*] XLA_SKIP_DOWNLOAD=1: S3キャッシュダウンロードをスキップ"
 fi
-_xla_cache_download || true
 
 # warmup 進捗 JSON を S3 から復元 (TPU のみ / 再起動時にスキップ判定に使用)
 if [ "$DEVICE_TYPE" = "TPU" ] && [ -n "$S3_ENDPOINT" ]; then
