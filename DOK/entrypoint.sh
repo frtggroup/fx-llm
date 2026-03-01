@@ -428,6 +428,19 @@ _graceful_stop() {
 trap '_graceful_stop' SIGTERM SIGINT
 
 # XLA キャッシュを S3 から復元 (TPU のみ / 失敗しても続行)
+# ディスク空き容量が 15GB 未満なら xla_cache 古いファイルを自動削除してスペース確保
+if [ "$DEVICE_TYPE" = "TPU" ]; then
+    _XLA_CACHE_DIR="${XLA_CACHE_DIR:-/workspace/xla_cache}"
+    _AVAIL_GB=$(df / | tail -1 | awk '{print int($4/1024/1024)}')
+    if [ "$_AVAIL_GB" -lt 15 ] && [ -d "$_XLA_CACHE_DIR" ]; then
+        _CACHE_CNT=$(ls "$_XLA_CACHE_DIR" 2>/dev/null | wc -l)
+        _DEL_CNT=$(( _CACHE_CNT / 4 ))
+        [ "$_DEL_CNT" -lt 100 ] && _DEL_CNT=100
+        echo "[*] ディスク空き ${_AVAIL_GB}GB → xla_cache 古い ${_DEL_CNT}件 を削除してスペース確保"
+        ls -t "$_XLA_CACHE_DIR" | tail -"$_DEL_CNT" | xargs -I{} rm -f "$_XLA_CACHE_DIR/{}" 2>/dev/null || true
+        echo "[*] xla_cache 削除後: $(ls $_XLA_CACHE_DIR 2>/dev/null | wc -l)件"
+    fi
+fi
 _xla_cache_download || true
 
 # warmup 進捗 JSON を S3 から復元 (TPU のみ / 再起動時にスキップ判定に使用)
@@ -462,7 +475,7 @@ fi
 # ── XLA 全パターン事前コンパイル (TPU のみ) ─────────────────────────────────
 # warmup_xla.py がパターン1個完了するたびに新規キャッシュファイルをS3へ即時アップロードする。
 # このブロックが完了するまで学習は開始しない。
-if [ "$DEVICE_TYPE" = "TPU" ]; then
+if [ "$DEVICE_TYPE" = "TPU" ] && [ "${WARMUP_SKIP_ALL:-0}" != "1" ]; then
     echo "[*] XLA 事前コンパイル開始 (完了後に学習開始)"
     python3 /workspace/ai_ea/warmup_xla.py 2>&1 | tee -a /workspace/train_run.log
 
