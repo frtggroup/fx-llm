@@ -43,6 +43,60 @@ def _s3_client():
         return None, None, None
 
 
+# ── S3 分散クレーム: 複数VM間で同じパターンを二重コンパイルしない ─────────────
+_CLAIM_TTL = 600  # 秒: この時間内に完了しないクレームはスタールとみなす
+
+
+def _claim_prefix(xla_prefix: str) -> str:
+    """XLAキャッシュprefixからクレームprefixを生成"""
+    base = xla_prefix.rsplit('/xla_cache', 1)[0]
+    return base + '/warmup_claims'
+
+
+def _pattern_key(arch, hidden, layers, seq_len) -> str:
+    return f"{arch}_h{hidden}_L{layers}_seq{seq_len}"
+
+
+def _try_claim(s3, bucket: str, cprefix: str, pkey: str) -> bool:
+    """IfNoneMatch="*" でアトミッククレーム。成功=True、既存クレームあり=False。
+    MinIO/S3 の条件付きPUTを使うため、クレームは排他的に1VMのみが獲得できる。"""
+    try:
+        s3.put_object(
+            Bucket=bucket,
+            Key=f"{cprefix}/{pkey}.json",
+            Body=json.dumps({"ts": time.time()}).encode(),
+            IfNoneMatch="*",
+        )
+        return True
+    except Exception as e:
+        try:
+            code = e.response['Error']['Code']  # type: ignore[attr-defined]
+        except Exception:
+            code = ''
+        if code in ('PreconditionFailed', 'ConditionalRequestConflict'):
+            return False  # 他VMがクレーム済み
+        # 予期しないエラー: クレームなしで続行 (安全側: コンパイルを試みる)
+        return True
+
+
+def _claim_is_stale(s3, bucket: str, cprefix: str, pkey: str) -> bool:
+    """クレームが TTL を超えていれば True (VMクラッシュ時の再クレーム用)"""
+    try:
+        obj = s3.get_object(Bucket=bucket, Key=f"{cprefix}/{pkey}.json")
+        data = json.loads(obj['Body'].read())
+        return time.time() - data.get('ts', 0) > _CLAIM_TTL
+    except Exception:
+        return True  # 取得失敗 = 存在しないか壊れている → スタールとみなす
+
+
+def _release_claim(s3, bucket: str, cprefix: str, pkey: str):
+    """クレームを解放 (コンパイル完了後またはエラー時)"""
+    try:
+        s3.delete_object(Bucket=bucket, Key=f"{cprefix}/{pkey}.json")
+    except Exception:
+        pass
+
+
 def _upload_new_cache_files(cache_dir: Path, known_files: set, rank: int) -> set:
     """キャッシュディレクトリに増えたファイルを即座にS3へアップロードする。
     戻り値: 更新後の既知ファイルセット"""
@@ -154,17 +208,22 @@ def _load_done(rank: int) -> set:
 
 
 def _save_rank(rank: int, world_size: int, all_patterns: list,
-               done_set: set, current=None):
+               done_set: set, current=None, claim_mode: bool = False):
     """ランク別進捗を書き込む (ダッシュボードが集計して読む)"""
-    my_patterns = [p for i, p in enumerate(all_patterns) if i % world_size == rank]
+    if claim_mode:
+        # クレームモード: 全パターンが対象 (複数VMで動的割当)
+        my_total = len(all_patterns)
+    else:
+        # 静的分割モード: このランクの担当パターン数
+        my_total = len([p for i, p in enumerate(all_patterns) if i % world_size == rank])
     data = {
         'rank':               rank,
         'world_size':         world_size,
         'warmup_total':       len(all_patterns),   # 全体の合計 (集計用)
-        'my_total':           len(my_patterns),
+        'my_total':           my_total,
         'warmup_done':        len(done_set),
         'warmup_current':     list(current) if current else None,
-        'warmup_pct':         round(len(done_set) / max(len(my_patterns), 1) * 100, 1),
+        'warmup_pct':         round(len(done_set) / max(my_total, 1) * 100, 1),
         'completed_patterns': [list(p) for p in done_set],
         'updated_at':         time.strftime('%Y-%m-%dT%H:%M:%S'),
     }
@@ -190,22 +249,37 @@ def warmup(rank: int = 0, world_size: int = 1, dry_run: bool = False):
     device = xm.xla_device()
     print(f"[WARMUP rank={rank}] デバイス: {device}", flush=True)
 
-    all_pats  = _all_patterns()
-    # 担当パターン: インターリーブ分割 (負荷均等)
-    my_pats   = [p for i, p in enumerate(all_pats) if i % world_size == rank]
-    done_set  = _load_done(rank)
-    todo      = [p for p in my_pats if p not in done_set]
+    all_pats = _all_patterns()
+    done_set = _load_done(rank)
 
-    print(f"[WARMUP rank={rank}] 担当: {len(my_pats)}  完了済み: {len(done_set)}  残り: {len(todo)}", flush=True)
+    # S3クライアント取得 (クレームモード判定)
+    s3c, bucket, xla_prefix = _s3_client()
+    cprefix = _claim_prefix(xla_prefix) if s3c else None
+    use_claims = s3c is not None
+
+    if use_claims:
+        # ── クレームモード: 複数VM間で動的にパターンを割り当て ────────────────
+        # シャッフルで各VM/チップが異なる順序から試みる → 自然に分散
+        import random
+        todo = [p for p in all_pats if p not in done_set]
+        random.shuffle(todo)
+        print(f"[WARMUP rank={rank}] クレームモード(S3): 全{len(all_pats)}パターンから動的割当  "
+              f"完了済み: {len(done_set)}  未処理候補: {len(todo)}", flush=True)
+    else:
+        # ── ローカルモード: 静的インターリーブ分割 (単一VM) ──────────────────
+        my_pats  = [p for i, p in enumerate(all_pats) if i % world_size == rank]
+        todo     = [p for p in my_pats if p not in done_set]
+        print(f"[WARMUP rank={rank}] ローカルモード: 担当{len(my_pats)}  "
+              f"完了済み: {len(done_set)}  残り: {len(todo)}", flush=True)
 
     if not todo:
         print(f"[WARMUP rank={rank}] 全パターンコンパイル済み → スキップ", flush=True)
-        _save_rank(rank, world_size, all_pats, done_set)
+        _save_rank(rank, world_size, all_pats, done_set, claim_mode=use_claims)
         return
 
     # XLAキャッシュディレクトリ (コンパイル結果の書き込み先)
-    cache_dir   = Path(os.environ.get('XLA_PERSISTENT_CACHE_PATH',
-                       os.environ.get('XLA_CACHE_DIR', '/workspace/xla_cache')))
+    cache_dir = Path(os.environ.get('XLA_PERSISTENT_CACHE_PATH',
+                     os.environ.get('XLA_CACHE_DIR', '/workspace/xla_cache')))
     cache_dir.mkdir(parents=True, exist_ok=True)
     # コンパイル前の既知ファイルを記録 (新規ファイルのみ S3 アップロードするため)
     known_files = {f for f in cache_dir.rglob('*') if f.is_file()}
@@ -215,16 +289,13 @@ def warmup(rank: int = 0, world_size: int = 1, dry_run: bool = False):
     import torch.optim as _optim
 
     # ── S3アップロードは独立スレッドで非同期実行 (TPUコンパイルをブロックしない) ──
-    # 1パターン完了ごとに1ジョブを投入するだけなので4workerで十分
     _s3_executor = concurrent.futures.ThreadPoolExecutor(max_workers=4, thread_name_prefix="s3up")
     _pending_s3: list[concurrent.futures.Future] = []
 
     def _async_upload(snap_known: set) -> set:
-        """バックグラウンドで S3 アップロードし、更新後の既知ファイルセットを返す"""
         return _upload_new_cache_files(cache_dir, snap_known, rank)
 
     def _flush_pending_s3():
-        """完了済みの S3 ジョブを回収し known_files を更新する"""
         nonlocal known_files
         done = [f for f in _pending_s3 if f.done()]
         for f in done:
@@ -235,12 +306,9 @@ def warmup(rank: int = 0, world_size: int = 1, dry_run: bool = False):
             _pending_s3.remove(f)
 
     # ── 全パターンを起動直後にCPU並列でビルド ──────────────────────────────────
-    # 大型モデル (bigru/hidden=1024) は 1つ数百MB → 並列数を抑えてOOMを防ぐ
-    # 4rank同時起動なので 4×4=16 スレッドがビルドを並列実行する
     _N_BUILD_WORKERS = min(4, max(1, len(todo)))
 
     def _build_model_cpu(pat):
-        """CPU上でモデルをビルドして返す (to(device) はしない)"""
         a, h, l, s = pat
         try:
             return build_model(a, N_FEATURES, s, h, l, DROPOUT, N_CLASSES)
@@ -251,38 +319,27 @@ def warmup(rank: int = 0, world_size: int = 1, dry_run: bool = False):
     _build_executor = concurrent.futures.ThreadPoolExecutor(
         max_workers=_N_BUILD_WORKERS, thread_name_prefix="cpu_build"
     )
-    # パターン → Future の辞書。TPUコンパイル中にバックグラウンドで全部終わる。
     _model_cache: dict = {
         pat: _build_executor.submit(_build_model_cpu, pat) for pat in todo
     }
 
-    for idx, (arch, hidden, layers, seq_len) in enumerate(todo):
+    # ── 1パス目: 未クレームパターンをコンパイル ──────────────────────────────
+    skipped_claims: list = []  # 他VMがクレーム中でスキップしたパターン
+
+    def _compile_pattern(arch, hidden, layers, seq_len):
+        """1パターンをTPUコンパイル。成功時 True、失敗時 False を返す。"""
         tag = f"{arch}/h{hidden}/L{layers}/seq{seq_len}"
-        print(f"[WARMUP rank={rank}] ({len(done_set)+1}/{len(my_pats)}) {tag} コンパイル中...", flush=True)
-        _save_rank(rank, world_size, all_pats, done_set, current=(arch, hidden, layers, seq_len))
-
-        if dry_run:
-            done_set.add((arch, hidden, layers, seq_len))
-            continue
-
         t0 = time.time()
         try:
-            # 並列ビルド済みのモデルを取得 (ほぼ待ち時間ゼロ)
             pat_key = (arch, hidden, layers, seq_len)
             fut = _model_cache.pop(pat_key, None)
-            if fut is not None:
-                model = fut.result()  # すでに完了していれば即返る
-            else:
-                model = _build_model_cpu(pat_key)  # 万一キャッシュになければその場でビルド
-
+            model = fut.result() if fut is not None else _build_model_cpu(pat_key)
             if model is None:
                 raise RuntimeError("モデルビルド失敗")
 
             model = model.to(device).train()
-
             x_dummy = torch.randn(BATCH, seq_len, N_FEATURES, device=device, dtype=torch.bfloat16)
             y_dummy = torch.randint(0, N_CLASSES, (BATCH,), device=device)
-
             opt = _optim.Adam(model.parameters(), lr=1e-3)
 
             # 大型モデル(h>=1024)は1ステップのみ: 2ステップだとXLAウォッチドッグ(121秒)を超えてkillされる
@@ -296,25 +353,89 @@ def warmup(rank: int = 0, world_size: int = 1, dry_run: bool = False):
                 xm.optimizer_step(opt)
                 xm.mark_step()
 
-            # eval グラフ (validation ループ用: model.eval + no_grad は別 XLA グラフ)
+            # eval グラフ (validation ループ用)
             model.eval()
             with torch.no_grad():
                 with torch.amp.autocast('xla', enabled=True, dtype=torch.bfloat16):
                     _ = model(x_dummy)
                 xm.mark_step()
 
-            elapsed = time.time() - t0
-            print(f"[WARMUP rank={rank}] ✓ {tag}  {elapsed:.0f}秒", flush=True)
-
+            print(f"[WARMUP rank={rank}] ✓ {tag}  {time.time()-t0:.0f}秒", flush=True)
+            return True
         except Exception as e:
             print(f"[WARMUP rank={rank}] ✗ {tag}  エラー: {e}", flush=True)
+            return False
+
+    for arch, hidden, layers, seq_len in todo:
+        if (arch, hidden, layers, seq_len) in done_set:
+            continue
+
+        pkey = _pattern_key(arch, hidden, layers, seq_len)
+        tag  = f"{arch}/h{hidden}/L{layers}/seq{seq_len}"
+
+        # S3クレームを試みる (クレームモード時のみ)
+        if use_claims:
+            if not _try_claim(s3c, bucket, cprefix, pkey):
+                skipped_claims.append((arch, hidden, layers, seq_len))
+                continue  # 他VMがクレーム中 → スキップ
+
+        print(f"[WARMUP rank={rank}] ({len(done_set)+1}/{len(all_pats)}) {tag} コンパイル中...", flush=True)
+        _save_rank(rank, world_size, all_pats, done_set,
+                   current=(arch, hidden, layers, seq_len), claim_mode=use_claims)
+
+        if dry_run:
+            done_set.add((arch, hidden, layers, seq_len))
+            if use_claims:
+                _release_claim(s3c, bucket, cprefix, pkey)
+            continue
+
+        try:
+            _compile_pattern(arch, hidden, layers, seq_len)
+        finally:
+            # エラーでもクレームは必ず解放 (他VMが再クレームできるように)
+            if use_claims:
+                _release_claim(s3c, bucket, cprefix, pkey)
 
         done_set.add((arch, hidden, layers, seq_len))
-        _save_rank(rank, world_size, all_pats, done_set)
-
-        # ── S3アップロードをバックグラウンドスレッドに投げて即座に次コンパイルへ ──
-        _flush_pending_s3()  # 完了済みのジョブを回収
+        _save_rank(rank, world_size, all_pats, done_set, claim_mode=use_claims)
+        _flush_pending_s3()
         _pending_s3.append(_s3_executor.submit(_async_upload, known_files.copy()))
+
+    # ── 2パス目: スキップしたパターンのスタールクレームを確認して再試行 ─────────
+    if skipped_claims and use_claims:
+        print(f"[WARMUP rank={rank}] 2パス目: {len(skipped_claims)}パターンのスタールクレーム確認...",
+              flush=True)
+        time.sleep(30)  # VMクラッシュ等でスタールになるまで少し待つ
+
+        for arch, hidden, layers, seq_len in skipped_claims:
+            if (arch, hidden, layers, seq_len) in done_set:
+                continue
+
+            pkey = _pattern_key(arch, hidden, layers, seq_len)
+            tag  = f"{arch}/h{hidden}/L{layers}/seq{seq_len}"
+
+            if not _claim_is_stale(s3c, bucket, cprefix, pkey):
+                continue  # まだ活動中 → 本当に他VMが担当中
+
+            # スタールクレームを削除して再クレーム
+            _release_claim(s3c, bucket, cprefix, pkey)
+            if not _try_claim(s3c, bucket, cprefix, pkey):
+                continue  # 別のVMが先に再クレーム
+
+            print(f"[WARMUP rank={rank}] (再クレーム) {tag} コンパイル中...", flush=True)
+            _save_rank(rank, world_size, all_pats, done_set,
+                       current=(arch, hidden, layers, seq_len), claim_mode=True)
+
+            if not dry_run:
+                try:
+                    _compile_pattern(arch, hidden, layers, seq_len)
+                finally:
+                    _release_claim(s3c, bucket, cprefix, pkey)
+
+            done_set.add((arch, hidden, layers, seq_len))
+            _save_rank(rank, world_size, all_pats, done_set, claim_mode=True)
+            _flush_pending_s3()
+            _pending_s3.append(_s3_executor.submit(_async_upload, known_files.copy()))
 
     # 全パターン完了後: 残りのS3アップロードを待機、ビルドexecutorも終了
     _build_executor.shutdown(wait=False)
@@ -326,8 +447,8 @@ def warmup(rank: int = 0, world_size: int = 1, dry_run: bool = False):
             print(f"[WARMUP rank={rank}] S3最終アップロードエラー: {e}", flush=True)
     _s3_executor.shutdown(wait=False)
 
-    _save_rank(rank, world_size, all_pats, done_set)
-    print(f"[WARMUP rank={rank}] 完了! {len(done_set)}/{len(my_pats)} パターンをキャッシュ", flush=True)
+    _save_rank(rank, world_size, all_pats, done_set, claim_mode=use_claims)
+    print(f"[WARMUP rank={rank}] 完了! {len(done_set)}/{len(all_pats)} パターンをキャッシュ", flush=True)
 
 
 def _worker_env(rank: int, n_dev: int) -> dict:
@@ -347,9 +468,12 @@ def _run_rank_until_done(rank: int, n_dev: int, dry_run: bool, max_retries: int 
     """
     1チップのwarmupワーカーを実行。クラッシュ(watchdog timeout等)したら
     進捗JSONから自動再開し、全パターン完了まで繰り返す。
+    クレームモード時は全パターンが対象、ローカルモード時はrank担当分のみ。
     """
     all_pats = _all_patterns()
-    my_pats  = [p for i, p in enumerate(all_pats) if i % n_dev == rank]
+    s3c, _, _ = _s3_client()
+    # クレームモード(S3あり)では全パターンを対象に; ローカルモードは静的分割
+    my_pats = all_pats if s3c else [p for i, p in enumerate(all_pats) if i % n_dev == rank]
     cmd_base = [sys.executable, __file__,
                 '--rank', str(rank),
                 '--world-size', str(n_dev)]
