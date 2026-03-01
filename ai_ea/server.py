@@ -145,7 +145,7 @@ def _read_warmup_status() -> dict:
         total = 0
         done  = 0
         world_size = len(rank_files)
-        current  = None
+        currents = []
         any_active = False
         for f in rank_files:
             try:
@@ -154,10 +154,11 @@ def _read_warmup_status() -> dict:
                     total = w.get('warmup_total', 0)   # 全パターン数 (共通)
                 done += w.get('warmup_done', 0)
                 if w.get('warmup_current'):
-                    current = w['warmup_current']
+                    currents.append(w['warmup_current'])  # 全チップ分を収集
                     any_active = True
             except Exception:
                 pass
+        current = currents if currents else None
         pct = round(done / max(total, 1) * 100, 1)
         return dict(warmup_total=total, warmup_done=done, warmup_pct=pct,
                     warmup_current=current, warmup_phase=any_active or done < total,
@@ -1386,8 +1387,17 @@ async function poll() {
       document.getElementById('warmup-text').textContent =
         `${d.warmup_done??0} / ${d.warmup_total??0} (${pct.toFixed(1)}%)${chipTag}`;
       const cur = d.warmup_current;
-      document.getElementById('warmup-current').textContent =
-        cur ? `コンパイル中: ${cur[0]} h=${cur[1]} L${cur[2]}` : '次のパターンを準備中...';
+      if (cur && Array.isArray(cur) && Array.isArray(cur[0])) {
+        // 複数チップ: [[arch,h,L],[arch,h,L],...]
+        const lines = cur.map((c,i) => `Chip${i}: ${c[0]} h=${c[1]} L${c[2]}`).join('  |  ');
+        document.getElementById('warmup-current').textContent = lines;
+      } else if (cur && Array.isArray(cur)) {
+        // 単一チップ: [arch,h,L]
+        document.getElementById('warmup-current').textContent =
+          `コンパイル中: ${cur[0]} h=${cur[1]} L${cur[2]}`;
+      } else {
+        document.getElementById('warmup-current').textContent = '次のパターンを準備中...';
+      }
     } else if (d.warmup_total && !d.warmup_phase) {
       wCard.style.display = 'block';
       document.getElementById('warmup-bar').style.width = '100%';

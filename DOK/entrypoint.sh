@@ -276,14 +276,15 @@ echo ""
 
 _STOP_REQUESTED=0
 
-# ─── XLA キャッシュ S3 アップロード ─────────────────────────────────────────
+# ─── XLA キャッシュ S3 アップロード (ZIP圧縮) ───────────────────────────────
 _xla_cache_upload() {
     [ "$DEVICE_TYPE" != "TPU" ] && return 0
     [ -z "$S3_ENDPOINT" ] && return 0
-    echo "[*] XLA キャッシュを S3 へ保存中 (並列16スレッド)..."
+    echo "[*] XLA キャッシュを S3 へ保存中 (ZIP圧縮 / 並列50スレッド)..."
     python3 - <<'PYEOF'
-import os, pathlib
+import io, logging, os, pathlib, zipfile
 from concurrent.futures import ThreadPoolExecutor, as_completed
+logging.getLogger('urllib3.connectionpool').setLevel(logging.ERROR)
 try:
     import boto3, urllib3
     urllib3.disable_warnings()
@@ -305,11 +306,24 @@ try:
 
     def upload(f):
         rel = f.relative_to(cache_dir)
-        make_client().upload_file(str(f), bucket, f'{s3_prefix}/{rel}')
+        s3_key = f'{s3_prefix}/{rel}.zip'
+        client = make_client()
+        for attempt in range(5):
+            try:
+                buf = io.BytesIO()
+                with zipfile.ZipFile(buf, 'w', zipfile.ZIP_DEFLATED, compresslevel=1) as zf:
+                    zf.write(str(f), f.name)
+                buf.seek(0)
+                client.upload_fileobj(buf, bucket, s3_key)
+                return f.name
+            except Exception as e:
+                import time
+                if attempt < 4: time.sleep(2 ** attempt)
+                else: raise e
         return f.name
 
     done = 0
-    with ThreadPoolExecutor(max_workers=16) as ex:
+    with ThreadPoolExecutor(max_workers=50) as ex:
         futs = {ex.submit(upload, f): f for f in files}
         for fut in as_completed(futs):
             try: fut.result(); done += 1
@@ -321,14 +335,15 @@ except Exception as e:
 PYEOF
 }
 
-# ─── XLA キャッシュ S3 ダウンロード ─────────────────────────────────────────
+# ─── XLA キャッシュ S3 ダウンロード (ZIP解凍対応) ───────────────────────────
 _xla_cache_download() {
     [ "$DEVICE_TYPE" != "TPU" ] && return 0
     [ -z "$S3_ENDPOINT" ] && return 0
-    echo "[*] XLA キャッシュを S3 から復元中 (並列16スレッド)..."
+    echo "[*] XLA キャッシュを S3 から復元中 (ZIP解凍 / 並列50スレッド)..."
     python3 - <<'PYEOF'
-import os, pathlib
+import io, logging, os, pathlib, zipfile
 from concurrent.futures import ThreadPoolExecutor, as_completed
+logging.getLogger('urllib3.connectionpool').setLevel(logging.ERROR)
 try:
     import boto3, urllib3
     urllib3.disable_warnings()
@@ -344,7 +359,7 @@ try:
             aws_secret_access_key=os.environ.get('S3_SECRET_KEY', ''),
             verify=False)
 
-    # ファイル一覧を取得
+    # ファイル一覧を取得 (.zip / 非zip 両対応)
     s3 = make_client()
     paginator = s3.get_paginator('list_objects_v2')
     tasks = []
@@ -354,24 +369,36 @@ try:
             rel = key[len(s3_prefix):]
             if not rel:
                 continue
-            dst = cache_dir / rel
-            # 既存ファイルはスキップ (サイズ一致チェック)
-            if dst.exists() and dst.stat().st_size == obj['Size']:
+            is_zip = rel.endswith('.zip')
+            # ローカルパス: .zip を除いた相対パス
+            local_rel = rel[:-4] if is_zip else rel
+            dst = cache_dir / local_rel
+            # ローカルファイルが既に存在すればスキップ
+            if dst.exists():
                 continue
-            tasks.append((key, dst, obj['Size']))
+            tasks.append((key, dst, is_zip))
 
     if not tasks:
         print(f'[OK] XLA キャッシュ: 全ファイル既存またはS3未存在 (スキップ)')
     else:
         print(f'[*] XLA キャッシュ: {len(tasks)}件をダウンロード中...', flush=True)
         def download(args):
-            key, dst, _ = args
+            key, dst, is_zip = args
             dst.parent.mkdir(parents=True, exist_ok=True)
-            make_client().download_file(bucket, key, str(dst))
+            if is_zip:
+                buf = io.BytesIO()
+                make_client().download_fileobj(bucket, key, buf)
+                buf.seek(0)
+                with zipfile.ZipFile(buf) as zf:
+                    names = zf.namelist()
+                    if names:
+                        dst.write_bytes(zf.read(names[0]))
+            else:
+                make_client().download_file(bucket, key, str(dst))
             return dst.name
 
         done = 0
-        with ThreadPoolExecutor(max_workers=16) as ex:
+        with ThreadPoolExecutor(max_workers=50) as ex:
             futs = {ex.submit(download, t): t for t in tasks}
             for f in as_completed(futs):
                 try:
@@ -458,8 +485,15 @@ try:
     prefix = os.environ.get('S3_PREFIX','mix') + '/warmup_progress'
     count = 0
     for f in pathlib.Path('/workspace').glob('xla_warmup_rank_*.json'):
-        s3.upload_file(str(f), bucket, f'{prefix}/{f.name}')
-        count += 1
+        for attempt in range(5):
+            try:
+                s3.upload_file(str(f), bucket, f'{prefix}/{f.name}')
+                count += 1
+                break
+            except Exception as e:
+                import time
+                if attempt < 4: time.sleep(2 ** attempt)
+                else: print(f'[WARN] warmup 進捗 S3 保存失敗 {f.name}: {e}')
     if count:
         print(f'[OK] warmup 進捗 S3 保存: {count}件')
 except Exception as e:

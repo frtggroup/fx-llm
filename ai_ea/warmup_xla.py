@@ -1,7 +1,7 @@
 """
 XLA グラフ事前コンパイル (TPU専用)
 
-TPU起動時に全 (arch, hidden, layers) パターンを1フォワード+バックワード実行し
+TPU起動時に全 (arch, hidden, layers, seq_len) パターンを1フォワード+バックワード実行し
 XLA_PERSISTENT_CACHE_PATH にコンパイル済みグラフをキャッシュする。
 2回目以降の試行はキャッシュを再利用するため即座に学習開始できる。
 
@@ -14,8 +14,11 @@ XLA_PERSISTENT_CACHE_PATH にコンパイル済みグラフをキャッシュす
 進捗は /workspace/xla_warmup_rank_{rank}.json に保存され、
 ダッシュボードの /api/status がランクファイルを集計して表示する。
 """
-import argparse, json, os, subprocess, sys, time
+import argparse, io, json, logging, os, subprocess, sys, time, concurrent.futures, zipfile
 from pathlib import Path
+
+# urllib3 の "Connection pool is full" 警告を抑制 (S3並列アップロード時の無害な情報ログ)
+logging.getLogger('urllib3.connectionpool').setLevel(logging.ERROR)
 
 # ── S3 設定 (環境変数から取得) ────────────────────────────────────────────────
 def _s3_client():
@@ -27,12 +30,14 @@ def _s3_client():
         return None, None, None
     try:
         import boto3, urllib3
+        import botocore.config
         urllib3.disable_warnings()
         bucket = os.environ.get('S3_BUCKET', 'fxea')
         prefix = os.environ.get('S3_PREFIX', 'mix') + '/xla_cache'
         s3 = boto3.client('s3', endpoint_url=endpoint,
                           aws_access_key_id=key, aws_secret_access_key=secret,
-                          verify=False)
+                          verify=False,
+                          config=botocore.config.Config(max_pool_connections=50))
         return s3, bucket, prefix
     except Exception:
         return None, None, None
@@ -50,14 +55,40 @@ def _upload_new_cache_files(cache_dir: Path, known_files: set, rank: int) -> set
     s3, bucket, prefix = _s3_client()
     if s3 is None:
         return current
+    def _upload_task(f):
+        rel = f.relative_to(cache_dir)
+        s3_key = f'{prefix}/{rel}.zip'
+        # tmpファイルに書いてからアップロード (BytesIOだと大ファイルでOOM)
+        tmp_path = f.parent / (f.name + '.uploading.zip')
+        max_retries = 5
+        for attempt in range(max_retries):
+            try:
+                with zipfile.ZipFile(str(tmp_path), 'w', zipfile.ZIP_DEFLATED, compresslevel=1) as zf:
+                    zf.write(str(f), f.name)
+                s3.upload_file(str(tmp_path), bucket, s3_key)
+                return True
+            except Exception as e:
+                import time
+                if attempt < max_retries - 1:
+                    sleep_sec = 2 ** attempt
+                    print(f"[WARMUP rank={rank}] S3アップロード失敗 {f.name}: {e} → {sleep_sec}秒後にリトライ ({attempt+1}/{max_retries})", flush=True)
+                    time.sleep(sleep_sec)
+                else:
+                    print(f"[WARMUP rank={rank}] S3アップロード 最終失敗 {f.name}: {e}", flush=True)
+            finally:
+                if tmp_path.exists():
+                    try: tmp_path.unlink()
+                    except Exception: pass
+        return False
+
+    import concurrent.futures
     uploaded = 0
-    for f in new_files:
-        try:
-            rel = f.relative_to(cache_dir)
-            s3.upload_file(str(f), bucket, f'{prefix}/{rel}')
-            uploaded += 1
-        except Exception as e:
-            print(f"[WARMUP rank={rank}] S3アップロード失敗 {f.name}: {e}", flush=True)
+    # max_workers=2: BytesIO廃止でメモリ圧迫は解消済みだが並列数は控えめに (4rank×2=8並列)
+    with concurrent.futures.ThreadPoolExecutor(max_workers=2) as executor:
+        futs = {executor.submit(_upload_task, f): f for f in new_files}
+        for fut in concurrent.futures.as_completed(futs):
+            if fut.result():
+                uploaded += 1
     if uploaded:
         print(f"[WARMUP rank={rank}] S3アップ: {uploaded}件 → {prefix}/", flush=True)
     return current
@@ -86,7 +117,7 @@ _MAX_LAYERS = {
 }
 
 N_FEATURES = 70
-SEQ_LEN    = 60
+SEQ_LENS   = [15, 20, 30, 40, 50, 60]   # run_train.py の _TIER_SEQ['tpu'] と同一
 BATCH      = 1024
 N_CLASSES  = 3
 DROPOUT    = 0.3
@@ -95,13 +126,14 @@ WORKSPACE = Path('/workspace')
 
 
 def _all_patterns():
-    """全 (arch, hidden, layers) 組み合わせを返す"""
+    """全 (arch, hidden, layers, seq_len) 組み合わせを返す"""
     patterns = []
     for arch in ARCHS:
         max_l = _MAX_LAYERS.get(arch, 3)
         for hidden in _HIDDEN_LARGE[arch]:
             for layers in range(1, max_l + 1):
-                patterns.append((arch, hidden, layers))
+                for seq_len in SEQ_LENS:
+                    patterns.append((arch, hidden, layers, seq_len))
     return patterns
 
 
@@ -180,24 +212,77 @@ def warmup(rank: int = 0, world_size: int = 1, dry_run: bool = False):
 
     criterion = torch.nn.CrossEntropyLoss()
 
-    for arch, hidden, layers in todo:
-        tag = f"{arch}/h{hidden}/L{layers}"
+    import torch.optim as _optim
+
+    # ── S3アップロードは独立スレッドで非同期実行 (TPUコンパイルをブロックしない) ──
+    # 1パターン完了ごとに1ジョブを投入するだけなので4workerで十分
+    _s3_executor = concurrent.futures.ThreadPoolExecutor(max_workers=4, thread_name_prefix="s3up")
+    _pending_s3: list[concurrent.futures.Future] = []
+
+    def _async_upload(snap_known: set) -> set:
+        """バックグラウンドで S3 アップロードし、更新後の既知ファイルセットを返す"""
+        return _upload_new_cache_files(cache_dir, snap_known, rank)
+
+    def _flush_pending_s3():
+        """完了済みの S3 ジョブを回収し known_files を更新する"""
+        nonlocal known_files
+        done = [f for f in _pending_s3 if f.done()]
+        for f in done:
+            try:
+                known_files = f.result()
+            except Exception as e:
+                print(f"[WARMUP rank={rank}] S3非同期アップロードエラー: {e}", flush=True)
+            _pending_s3.remove(f)
+
+    # ── 全パターンを起動直後にCPU並列でビルド ──────────────────────────────────
+    # 大型モデル (bigru/hidden=1024) は 1つ数百MB → 並列数を抑えてOOMを防ぐ
+    # 4rank同時起動なので 4×4=16 スレッドがビルドを並列実行する
+    _N_BUILD_WORKERS = min(4, max(1, len(todo)))
+
+    def _build_model_cpu(pat):
+        """CPU上でモデルをビルドして返す (to(device) はしない)"""
+        a, h, l, s = pat
+        try:
+            return build_model(a, N_FEATURES, s, h, l, DROPOUT, N_CLASSES)
+        except Exception:
+            return None
+
+    print(f"[WARMUP rank={rank}] 全{len(todo)}パターンをCPU {_N_BUILD_WORKERS}並列でビルド開始...", flush=True)
+    _build_executor = concurrent.futures.ThreadPoolExecutor(
+        max_workers=_N_BUILD_WORKERS, thread_name_prefix="cpu_build"
+    )
+    # パターン → Future の辞書。TPUコンパイル中にバックグラウンドで全部終わる。
+    _model_cache: dict = {
+        pat: _build_executor.submit(_build_model_cpu, pat) for pat in todo
+    }
+
+    for idx, (arch, hidden, layers, seq_len) in enumerate(todo):
+        tag = f"{arch}/h{hidden}/L{layers}/seq{seq_len}"
         print(f"[WARMUP rank={rank}] ({len(done_set)+1}/{len(my_pats)}) {tag} コンパイル中...", flush=True)
-        _save_rank(rank, world_size, all_pats, done_set, current=(arch, hidden, layers))
+        _save_rank(rank, world_size, all_pats, done_set, current=(arch, hidden, layers, seq_len))
 
         if dry_run:
-            done_set.add((arch, hidden, layers))
+            done_set.add((arch, hidden, layers, seq_len))
             continue
 
         t0 = time.time()
         try:
-            model = build_model(arch, N_FEATURES, SEQ_LEN, hidden, layers, DROPOUT, N_CLASSES)
+            # 並列ビルド済みのモデルを取得 (ほぼ待ち時間ゼロ)
+            pat_key = (arch, hidden, layers, seq_len)
+            fut = _model_cache.pop(pat_key, None)
+            if fut is not None:
+                model = fut.result()  # すでに完了していれば即返る
+            else:
+                model = _build_model_cpu(pat_key)  # 万一キャッシュになければその場でビルド
+
+            if model is None:
+                raise RuntimeError("モデルビルド失敗")
+
             model = model.to(device).train()
 
-            x_dummy = torch.randn(BATCH, SEQ_LEN, N_FEATURES, device=device, dtype=torch.bfloat16)
+            x_dummy = torch.randn(BATCH, seq_len, N_FEATURES, device=device, dtype=torch.bfloat16)
             y_dummy = torch.randint(0, N_CLASSES, (BATCH,), device=device)
 
-            import torch.optim as _optim
             opt = _optim.Adam(model.parameters(), lr=1e-3)
 
             # 大型モデル(h>=1024)は1ステップのみ: 2ステップだとXLAウォッチドッグ(121秒)を超えてkillされる
@@ -211,17 +296,35 @@ def warmup(rank: int = 0, world_size: int = 1, dry_run: bool = False):
                 xm.optimizer_step(opt)
                 xm.mark_step()
 
+            # eval グラフ (validation ループ用: model.eval + no_grad は別 XLA グラフ)
+            model.eval()
+            with torch.no_grad():
+                with torch.amp.autocast('xla', enabled=True, dtype=torch.bfloat16):
+                    _ = model(x_dummy)
+                xm.mark_step()
+
             elapsed = time.time() - t0
             print(f"[WARMUP rank={rank}] ✓ {tag}  {elapsed:.0f}秒", flush=True)
 
         except Exception as e:
             print(f"[WARMUP rank={rank}] ✗ {tag}  エラー: {e}", flush=True)
 
-        done_set.add((arch, hidden, layers))
+        done_set.add((arch, hidden, layers, seq_len))
         _save_rank(rank, world_size, all_pats, done_set)
 
-        # ── コンパイル直後に新規キャッシュファイルをS3へ即時アップロード ──────────
-        known_files = _upload_new_cache_files(cache_dir, known_files, rank)
+        # ── S3アップロードをバックグラウンドスレッドに投げて即座に次コンパイルへ ──
+        _flush_pending_s3()  # 完了済みのジョブを回収
+        _pending_s3.append(_s3_executor.submit(_async_upload, known_files.copy()))
+
+    # 全パターン完了後: 残りのS3アップロードを待機、ビルドexecutorも終了
+    _build_executor.shutdown(wait=False)
+    concurrent.futures.wait(_pending_s3)
+    for f in _pending_s3:
+        try:
+            known_files = f.result()
+        except Exception as e:
+            print(f"[WARMUP rank={rank}] S3最終アップロードエラー: {e}", flush=True)
+    _s3_executor.shutdown(wait=False)
 
     _save_rank(rank, world_size, all_pats, done_set)
     print(f"[WARMUP rank={rank}] 完了! {len(done_set)}/{len(my_pats)} パターンをキャッシュ", flush=True)

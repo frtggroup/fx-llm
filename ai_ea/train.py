@@ -163,9 +163,11 @@ def prepare(args):
             df = add_indicators(df)
             df.replace([np.inf, -np.inf], np.nan, inplace=True)
             df.dropna(inplace=True)
-            test_start = df.index[-1] - timedelta(days=365)
-            dtr = df[df.index < test_start].copy()
-            dte = df[df.index >= test_start].copy()
+            # テスト期間を 2025-01-01 以降に固定 (XLAグラフ形状を完全固定化するため)
+            import pandas as pd
+            TEST_SPLIT_DATE = pd.Timestamp('2025-01-01', tz=df.index.tz)
+            dtr = df[df.index < TEST_SPLIT_DATE].copy()
+            dte = df[df.index >= TEST_SPLIT_DATE].copy()
             try:
                 tmp = cache_path.with_suffix('.tmp')
                 with open(tmp, 'wb') as f:
@@ -213,6 +215,17 @@ def prepare(args):
     # 訓練期間を最近N月に絞る (分布シフト対策)  ※元 df_tr をコピーして使う
     df_tr = df_tr.copy()
     tm = getattr(args, 'train_months', 0)
+    _tpu_mode = (os.environ.get('PJRT_DEVICE', '').upper() == 'TPU'
+                 or os.environ.get('DEVICE_TYPE', '').upper() == 'TPU')
+    if _tpu_mode and tm > 0:
+        print(f"  [TPU] train_months={tm} を無効化 (XLAグラフ形状固定化のため全期間使用)")
+        tm = 0
+    # テスト期間を 2025-01-01 以降に固定 → 学習データの末尾を必ずここで切る (リーク防止)
+    import pandas as pd
+    _TEST_SPLIT = pd.Timestamp('2025-01-01', tz=df_tr.index.tz)
+    df_tr = df_tr[df_tr.index < _TEST_SPLIT].copy()
+    print(f"  [SPLIT] 学習期間: ~ {df_tr.index[-1].date()}  テスト期間: 2025-01-01 以降 (固定)")
+
     if tm > 0:
         train_start = df_tr.index[-1] - timedelta(days=tm * 30)
         df_tr = df_tr[df_tr.index >= train_start].copy()
@@ -228,15 +241,10 @@ def prepare(args):
     feat_frac   = getattr(args, 'feat_frac', 1.0)
     feat_indices_direct = getattr(args, 'feat_indices', None)
 
-    # TPU (XLA) モードでは全特徴量を使用してグラフ形状を固定化
-    # → 同じアーキテクチャ・hiddenサイズなら2回目以降はコンパイル不要になる
     _tpu_mode = (os.environ.get('PJRT_DEVICE', '').upper() == 'TPU'
                  or os.environ.get('DEVICE_TYPE', '').upper() == 'TPU')
-    if _tpu_mode:
-        feat_indices = None
-        print(f"  [TPU] 全{N_FEATURES}特徴量使用 (XLAグラフ形状固定化)")
 
-    elif feat_indices_direct and isinstance(feat_indices_direct, list):
+    if feat_indices_direct and isinstance(feat_indices_direct, list):
         # GAが重要特徴量から直接指定したインデックスリスト
         feat_indices = sorted(int(i) for i in feat_indices_direct if 0 <= int(i) < N_FEATURES)
         print(f"  特徴量直指定: {len(feat_indices)}個 (重要特徴量GAモード)")
@@ -259,10 +267,21 @@ def prepare(args):
         feat_indices = None
         print(f"  特徴量: 全{N_FEATURES}次元")
 
+    # ===== TPU時の特殊処理：形状は固定しつつ、使わない列を0マスキングする =====
+    # build_dataset の中ではサブセット抽出させず、後から 0 に書き換える
+    build_feat_idx = None if _tpu_mode else feat_indices
+    
     X_tr, y_tr, _ = build_dataset(df_tr, seq_len, args.tp, args.sl, args.forward,
-                                   feat_indices=feat_indices)
+                                   feat_indices=build_feat_idx)
     X_te, y_te, _ = build_dataset(df_te, seq_len, args.tp, args.sl, args.forward,
-                                   feat_indices=feat_indices)
+                                   feat_indices=build_feat_idx)
+
+    if _tpu_mode and feat_indices is not None:
+        print(f"  [TPU] {N_FEATURES}次元の入力を維持しつつ、選択外の {N_FEATURES - len(feat_indices)} 個の特徴量を0埋め(マスク)します")
+        mask = np.zeros(N_FEATURES, dtype=np.float32)
+        mask[feat_indices] = 1.0
+        X_tr = X_tr * mask  # Broadcasting across (batch, seq_len, features)
+        X_te = X_te * mask
 
     # 正規化 (訓練データのみで計算)
     n_feat_actual = X_tr.shape[2]          # サブセット後の実際の特徴量数
@@ -295,16 +314,27 @@ class GPULoader:
                  device: torch.device, batch_size: int,
                  weights: np.ndarray = None, shuffle: bool = False,
                  drop_last: bool = False):
-        self.X   = torch.tensor(X, dtype=torch.float32, device=device)
-        self.y   = torch.tensor(y, dtype=torch.long,    device=device)
+        # TPU の場合は動的 Gather が激遅になるため CPU メモリ上に置いておく
+        self.is_tpu = (device.type == 'xla')
+        data_dev = torch.device('cpu') if self.is_tpu else device
+
+        self.X   = torch.tensor(X, dtype=torch.float32, device=data_dev)
+        self.y   = torch.tensor(y, dtype=torch.long,    device=data_dev)
+        
+        # TPU で「ラベル付与の数件のブレ」によるバッチ数変動＝再コンパイル を防ぐため
+        # 余裕を持たせた最小件数（例えば本来13371件なら13000件等）に丸め込むための引数
+        # ここでは「指定された N または len(y)」を実際の件数上限とする
         self.n   = len(y)
+        if hasattr(self, 'target_n') and self.target_n > 0:
+            self.n = min(self.n, self.target_n)
+            
         self.bs  = batch_size
-        self.dev = device
+        self.dev = device  # 本当のターゲットデバイス
         self.shuf = shuffle
         self.drop_last = drop_last
-        # 重み付きサンプリング用 (GPU上で multinomial)
+        # 重み付きサンプリング用 (CPU/GPU上で multinomial)
         if weights is not None:
-            self.w = torch.tensor(weights, dtype=torch.float32, device=device)
+            self.w = torch.tensor(weights[:self.n], dtype=torch.float32, device=data_dev)
         else:
             self.w = None
 
@@ -321,12 +351,17 @@ class GPULoader:
         if self.w is not None:
             idx = torch.multinomial(self.w, n_use, replacement=True)
         elif self.shuf:
-            idx = torch.randperm(self.n, device=self.dev)[:n_use]
+            idx = torch.randperm(self.n, device=self.X.device)[:n_use]
         else:
-            idx = torch.arange(self.n, device=self.dev)[:n_use]
+            idx = torch.arange(self.n, device=self.X.device)[:n_use]
         for start in range(0, n_use, self.bs):
             sl = idx[start:start + self.bs]
-            yield self.X[sl], self.y[sl]
+            # CPU で Gather してから TPU へ転送 (これならグラフが汚れない)
+            xb, yb = self.X[sl], self.y[sl]
+            if self.is_tpu:
+                xb = xb.to(self.dev, non_blocking=True)
+                yb = yb.to(self.dev, non_blocking=True)
+            yield xb, yb
 
 
 def make_loaders(X_tr, y_tr, X_te, y_te, args, device, drop_last: bool = False):
@@ -336,12 +371,28 @@ def make_loaders(X_tr, y_tr, X_te, y_te, args, device, drop_last: bool = False):
     tw     = 1.0 + np.linspace(0, 1, n)          # 新データ重視
     weights = (1.0 / counts)[y_tr] * tw
 
-    tr_dl = GPULoader(X_tr, y_tr, device, args.batch, weights=weights,
-                      drop_last=drop_last)
-    va_dl = GPULoader(X_te, y_te, device, args.batch, shuffle=False,
-                      drop_last=drop_last)
+    # ========= TPU再コンパイル対策（バッチ数＝グラフ形状の完全固定化） =========
+    # ラベル(triple_barrier)の条件でNaN落ちする件数が数件ブレるため、
+    # 常に一定件数（バッチ数の整数倍）に切り落としてXLAのグラフサイズが変わらないようにする。
+    _is_tpu = (device.type == 'xla')
+    tr_dl = GPULoader(X_tr, y_tr, device, args.batch, weights=weights, drop_last=drop_last)
+    va_dl = GPULoader(X_te, y_te, device, args.batch, shuffle=False, drop_last=drop_last)
+    
+    if _is_tpu and drop_last:
+        # 例えば理論値最大 13371 なら、安全に 13000 とするなどの固定（ここでは最低限 -100件の切り捨てを想定）
+        # ※ TPU以外ではそのまま
+        safe_tr_batches = (len(X_tr) - 200) // args.batch
+        safe_te_batches = (len(X_te) - 200) // args.batch
+        safe_tr_batches = max(1, safe_tr_batches)
+        safe_te_batches = max(1, safe_te_batches)
+        tr_dl.target_n = safe_tr_batches * args.batch
+        va_dl.target_n = safe_te_batches * args.batch
+        tr_dl.n = tr_dl.target_n
+        va_dl.n = va_dl.target_n
+
     print(f"  GPU常駐データ: 訓練{len(X_tr):,} テスト{len(X_te):,} "
           f"batch={args.batch} batches/ep={len(tr_dl)}"
+          + (f" [固定化: {tr_dl.n}]" if _is_tpu else "")
           + (" [drop_last=ON]" if drop_last else ""))
     return tr_dl, va_dl
 
@@ -657,9 +708,17 @@ def train(args, X_tr, y_tr, X_te, y_te, mean, std, n_feat=None, _spawn_rank=None
         """torch_xla.debug.metrics から累積XLA実行時間(ns)を取得"""
         try:
             import torch_xla.debug.metrics as _met  # type: ignore
+            # metric_data は [(timestamp_ns, duration_ns), ...] のリスト
+            # 全サンプルの合計が累積実行時間 (data[-1][1] は最後の1回分のみ)
             data = _met.metric_data('ExecuteTime')
             if data:
-                return int(data[-1][1])
+                return sum(int(v) for _, v in data)
+            # fallback: metrics_report() 文字列の Accumulator を解析
+            import re as _re
+            report = _met.metrics_report()
+            m = _re.search(r'Metric: ExecuteTime\b.*?Accumulator:\s*(\d+)', report, _re.DOTALL)
+            if m:
+                return int(m.group(1))
         except Exception:
             pass
         return 0
@@ -673,14 +732,19 @@ def train(args, X_tr, y_tr, X_te, y_te, mean, std, n_feat=None, _spawn_rank=None
                 print(f"  [XLA] グラフコンパイル中... (初回のみ数分かかります)", flush=True)
                 _compile_start = _ep_t0
 
-            step_losses = [
-                _train_step(model, xb, yb,
-                            optimizer, criterion, scheduler, scaler,
-                            use_amp, amp_dtype, use_scaler,
-                            _amp_backend, is_tpu, _spmd_mode)
-                for xb, yb in tr_dl
-            ]
-            t_loss = torch.stack(step_losses).mean().item()
+            t_loss_sum = 0.0
+            t_steps = 0
+            for xb, yb in tr_dl:
+                loss = _train_step(model, xb, yb,
+                                   optimizer, criterion, scheduler, scaler,
+                                   use_amp, amp_dtype, use_scaler,
+                                   _amp_backend, is_tpu, _spmd_mode)
+                if is_tpu:
+                    import torch_xla.core.xla_model as _xm
+                    _xm.mark_step()
+                t_loss_sum += loss.item()
+                t_steps += 1
+            t_loss = t_loss_sum / max(1, t_steps)
 
             if is_tpu and not _xla_compiled and epoch == 1:
                 _xla_compiled = True

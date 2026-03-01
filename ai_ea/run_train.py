@@ -298,11 +298,12 @@ def _s3_client():
         aws_secret_access_key = S3_SECRET_KEY,
         region_name           = os.environ.get('S3_REGION', 'us-east-1'),
         config                = Config(
-            signature_version = 's3v4',
-            s3                = {'addressing_style': 'path'},
-            connect_timeout   = 10,
-            read_timeout      = 60,
-            retries           = {'max_attempts': 2},
+            signature_version    = 's3v4',
+            s3                   = {'addressing_style': 'path'},
+            connect_timeout      = 10,
+            read_timeout         = 60,
+            retries              = {'max_attempts': 2},
+            max_pool_connections = 50,
         ),
         verify = False,   # 自己署名証明書を許可
     )
@@ -319,18 +320,26 @@ def _s3_check_time_skew(e: Exception) -> None:
 
 
 def s3_upload(local_path: Path, s3_key: str) -> bool:
-    """ファイルを S3 にアップロード。失敗しても例外を投げず False を返す"""
+    """ファイルを S3 にアップロード。失敗時のリトライ付き"""
     if _s3_time_skewed:
         return False
-    try:
-        _s3_client().upload_file(str(local_path), S3_BUCKET,
-                                 f'{S3_PREFIX}/{s3_key}')
-        return True
-    except Exception as e:
-        _s3_check_time_skew(e)
-        if not _s3_time_skewed:
-            print(f'  [S3] upload失敗 {s3_key}: {e}')
-        return False
+        
+    client = _s3_client()
+    max_retries = 5
+    for attempt in range(max_retries):
+        try:
+            client.upload_file(str(local_path), S3_BUCKET, f'{S3_PREFIX}/{s3_key}')
+            return True
+        except Exception as e:
+            if attempt < max_retries - 1:
+                sleep_sec = 2 ** attempt
+                print(f'  [S3] upload失敗 {s3_key}: {e} → {sleep_sec}秒後にリトライ ({attempt+1}/{max_retries})')
+                time.sleep(sleep_sec)
+            else:
+                _s3_check_time_skew(e)
+                if not _s3_time_skewed:
+                    print(f'  [S3] upload最終失敗 {s3_key}: {e}')
+    return False
 
 
 def s3_download(s3_key: str, local_path: Path) -> bool:
