@@ -24,12 +24,14 @@ VERSION    = "tpu-ubuntu2204-base"
 IMAGE      = "frtgroup/fx-ea:latest"
 CONTAINER  = "fx-ea-warmup"
 
-# v5litepod-4 が確保しやすいゾーン (VM-i は ZONES[i % len] から順に試す)
+# v5litepod-4 が確認済みのゾーン (VM-i は ZONES[i % len] から順に試す)
 ZONES = [
-    "us-west4-a", "us-west4-b", "us-west4-c",
-    "us-east1-c", "us-east1-d",
+    "us-west4-a", "us-west4-b",
+    "us-east1-c",
     "us-east5-a", "us-east5-b", "us-east5-c",
-    "europe-west4-a", "europe-west4-b", "europe-west4-c",
+    "europe-west4-a", "europe-west4-b",
+    "us-central1-a",
+    "us-east4-b",
 ]
 
 S3_ENDPOINT   = "https://frorit-2022.softether.net:18004"
@@ -120,7 +122,9 @@ def deploy(idx: int, zone: str, dry_run: bool) -> bool:
     # base64デコードでenv fileを作成 → !# のシェルエスケープ問題を完全回避
     ssh_cmd = (
         f"gcloud compute tpus tpu-vm ssh {name} --zone={zone} "
-        f"--strict-host-key-checking=no --command="
+        f"--ssh-flag=\"-o StrictHostKeyChecking=no\" "
+        f"--ssh-flag=\"-o UserKnownHostsFile=/dev/null\" "
+        f"--command="
         f"\"echo {env_b64} | base64 -d > /tmp/fx-ea.env && "
         f'sudo docker stop {CONTAINER} 2>/dev/null || true && '
         f'sudo docker rm   {CONTAINER} 2>/dev/null || true && '
