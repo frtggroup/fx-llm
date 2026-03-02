@@ -570,6 +570,15 @@ def train(args, X_tr, y_tr, X_te, y_te, mean, std, n_feat=None, _spawn_rank=None
         else:
             print(f"  FP16 AMP モード")
     elif is_tpu:
+        # XLA persistent cache を rank ごとに明示初期化 (XLA_PERSISTENT_CACHE_PATH より確実)
+        try:
+            import torch_xla.runtime as xr  # type: ignore
+            _rank = int(os.environ.get('PJRT_LOCAL_PROCESS_RANK', '0'))
+            _cache_base = os.environ.get('XLA_PERSISTENT_CACHE_PATH',
+                                         '/workspace/xla_cache')
+            xr.initialize_cache(_cache_base, readonly=False)
+        except Exception:
+            pass
         if _is_main:
             try:
                 import torch_xla.core.xla_model as xm  # type: ignore
@@ -628,7 +637,7 @@ def train(args, X_tr, y_tr, X_te, y_te, mean, std, n_feat=None, _spawn_rank=None
                                     drop_last=tpu_drop_last)
         model = _build_and_place()
 
-    # H100: torch.compile で GPU カーネル効率を向上 (TPU は XLA が自動最適化するためスキップ)
+    # torch.compile: GPU (H100) は max-autotune、TPU は openxla バックエンドで最適化
     model_for_export = model
     _is_worker = bool(getattr(args, 'out_dir', ''))
     if is_h100 and not _is_worker and not is_tpu:
@@ -646,7 +655,12 @@ def train(args, X_tr, y_tr, X_te, y_te, mean, std, n_feat=None, _spawn_rank=None
         except Exception as e:
             print(f"  torch.compile スキップ: {e}")
     elif is_tpu:
-        print(f"  XLA 自動最適化 (torch.compile スキップ)")
+        # TPU: lazy eval (tracing mode) が既に最適
+        # torch.compile(model, backend='openxla') はforward だけコンパイルし
+        # backward/optimizer との graph break で逆に遅くなる → 使用しない
+        # 正しい使い方は torch_xla.compile(step_fn, full_graph=True) だが
+        # 現状の lazy eval (xm.optimizer_step で全グラフを一括 mark_step) が同等以上
+        print(f"  XLA lazy eval (tracing mode) 使用")
     elif is_h100 and _is_worker:
         print(f"  torch.compile スキップ (並列ワーカーモード: 探索優先)")
 
@@ -656,8 +670,19 @@ def train(args, X_tr, y_tr, X_te, y_te, mean, std, n_feat=None, _spawn_rank=None
 
     criterion = nn.CrossEntropyLoss(label_smoothing=0.1)
     wd        = getattr(args, 'wd', 1e-2)
-    optimizer = torch.optim.AdamW(model.parameters(), lr=args.lr,
-                                  weight_decay=wd)
+    if is_tpu:
+        # TPU: syncfree.AdamW は AMP optimizer_step 内の余分な sync を排除する
+        # torch.optim.AdamW は BF16 AMP 時に追加 sync が入るが syncfree 版は不要
+        try:
+            from torch_xla.amp import syncfree as _sf  # type: ignore
+            optimizer = _sf.AdamW(model.parameters(), lr=args.lr, weight_decay=wd)
+            print(f"  syncfree.AdamW 有効 (TPU AMP sync 削減)")
+        except ImportError:
+            optimizer = torch.optim.AdamW(model.parameters(), lr=args.lr, weight_decay=wd)
+            print(f"  syncfree.AdamW 未対応 → 標準 AdamW 使用")
+    else:
+        optimizer = torch.optim.AdamW(model.parameters(), lr=args.lr,
+                                      weight_decay=wd)
     dtype_str = 'BF16' if amp_dtype == torch.bfloat16 else 'FP16'
     print(f"  AMP({dtype_str})={'ON' if use_amp else 'OFF'}  GradScaler={'ON' if use_scaler else 'OFF (BF16不要)'}")
 
@@ -742,6 +767,9 @@ def train(args, X_tr, y_tr, X_te, y_te, mean, std, n_feat=None, _spawn_rank=None
                 print(f"  [XLA] グラフコンパイル中... (初回のみ数分かかります)", flush=True)
                 _compile_start = _ep_t0
 
+            # TPU: lossをデバイス上で累積し epoch末に1回だけ同期
+            # (xm.optimizer_step内のmark_stepで十分 → per-batch sync×11を排除)
+            t_loss_acc = torch.zeros(1, device=device) if is_tpu else None
             t_loss_sum = 0.0
             t_steps = 0
             for xb, yb in tr_dl:
@@ -750,11 +778,12 @@ def train(args, X_tr, y_tr, X_te, y_te, mean, std, n_feat=None, _spawn_rank=None
                                    use_amp, amp_dtype, use_scaler,
                                    _amp_backend, is_tpu, _spmd_mode)
                 if is_tpu:
-                    import torch_xla.core.xla_model as _xm
-                    _xm.mark_step()
-                t_loss_sum += loss.item()
+                    t_loss_acc = t_loss_acc + loss   # lazy累積、syncなし
+                else:
+                    t_loss_sum += loss.item()
                 t_steps += 1
-            t_loss = t_loss_sum / max(1, t_steps)
+            t_loss = ((t_loss_acc / max(1, t_steps)).item()
+                      if is_tpu else t_loss_sum / max(1, t_steps))
 
             if is_tpu and not _xla_compiled and epoch == 1:
                 _xla_compiled = True

@@ -155,6 +155,10 @@ if [ "$DEVICE_TYPE" = "TPU" ]; then
     # 空文字列をセットしておくと torch_xla の setdefault が上書きしない
     export LIBTPU_INIT_ARGS=""
     echo "[*] LIBTPU_INIT_ARGS をクリア (非対応フラグ防止)"
+    # スカラー値をシンボルとして特別扱いしない → 同一HLOグラフで異なるスカラーを再利用し
+    # 不要な再コンパイルを防ぐ (torch_xla 2.x 推奨設定)
+    export XLA_NO_SPECIAL_SCALARS=1
+    echo "[*] XLA_NO_SPECIAL_SCALARS=1 設定 (不要な再コンパイル防止)"
 fi
 
 # Python に デバイス名を渡す
