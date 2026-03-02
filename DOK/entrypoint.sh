@@ -289,9 +289,8 @@ _STOP_REQUESTED=0
 _xla_cache_upload() {
     [ "$DEVICE_TYPE" != "TPU" ] && return 0
     [ -z "$S3_ENDPOINT" ] && return 0
-    echo "[*] XLA キャッシュを S3 へ保存中 (ZIP圧縮 / 並列10スレッド)..."
     python3 - <<'PYEOF'
-import logging, os, pathlib, tempfile, zipfile
+import logging, os, pathlib, tempfile, time, zipfile
 from concurrent.futures import ThreadPoolExecutor, as_completed
 logging.getLogger('urllib3.connectionpool').setLevel(logging.ERROR)
 try:
@@ -301,17 +300,22 @@ try:
     bucket    = os.environ.get('S3_BUCKET',  'fxea')
     s3_prefix = os.environ.get('S3_PREFIX',  'mix') + '/xla_cache'
 
+    # 前回同期以降に変更されたファイルのみアップロード (全件I/O競合を防止)
+    marker = cache_dir / '.last_s3_sync'
+    last_sync = marker.stat().st_mtime if marker.exists() else 0
+    files = [f for f in cache_dir.rglob('*')
+             if f.is_file() and f.name != '.last_s3_sync'
+             and f.stat().st_mtime > last_sync]
+    if not files:
+        import sys; sys.exit(0)
+    print(f'[*] XLA キャッシュ S3 同期: {len(files)}件 (新規/更新のみ)', flush=True)
+
     def make_client():
         return boto3.client('s3',
             endpoint_url=os.environ.get('S3_ENDPOINT', ''),
             aws_access_key_id=os.environ.get('S3_ACCESS_KEY', ''),
             aws_secret_access_key=os.environ.get('S3_SECRET_KEY', ''),
             verify=False)
-
-    files = [f for f in cache_dir.rglob('*') if f.is_file()]
-    if not files:
-        print('[INFO] XLA キャッシュ: ファイルなし (スキップ)')
-        import sys; sys.exit(0)
 
     def upload(f):
         rel = f.relative_to(cache_dir)
@@ -327,7 +331,6 @@ try:
                 client.upload_file(str(tmp_path), bucket, s3_key)
                 return f.name
             except Exception as e:
-                import time
                 if tmp_path and tmp_path.exists(): tmp_path.unlink(missing_ok=True)
                 if attempt < 2: time.sleep(2 ** attempt)
                 else: raise e
@@ -336,13 +339,13 @@ try:
         return f.name
 
     done = 0
-    with ThreadPoolExecutor(max_workers=10) as ex:
+    with ThreadPoolExecutor(max_workers=4) as ex:
         futs = {ex.submit(upload, f): f for f in files}
         for fut in as_completed(futs):
             try: fut.result(); done += 1
             except Exception as e: print(f'  [WARN] upload failed: {e}')
-            if done % 10 == 0: print(f'  ... {done}/{len(files)}', flush=True)
-    print(f'[OK] XLA キャッシュ S3 保存: {done}/{len(files)}件 → s3://{bucket}/{s3_prefix}/')
+    marker.touch()
+    print(f'[OK] XLA S3 同期: {done}/{len(files)}件完了', flush=True)
 except Exception as e:
     print(f'[WARN] XLA キャッシュ S3 保存失敗: {e}')
 PYEOF
