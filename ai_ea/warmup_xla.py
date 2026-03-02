@@ -147,17 +147,15 @@ def _upload_new_cache_files(cache_dir: Path, known_files: set, rank: int) -> set
         print(f"[WARMUP rank={rank}] S3アップ: {uploaded}件 → {prefix}/", flush=True)
     return current
 
-# ── 全パターン定義 (run_train.py の TPU tier と同一) ──────────────────────────
+# ── 全パターン定義 (run_train.py の _ARCHS_TPU と同一) ─────────────────────────
+# TPU では RNN 系 (bigru/gru_attn/lstm_attn) を除外
+# 理由: XLA は RNN の隠れ状態依存を逐次コンパイルするため 1ep に数百秒かかる
 ARCHS = [
-    'mlp', 'gru_attn', 'bigru', 'lstm_attn',
-    'cnn', 'tcn', 'cnn_gru', 'transformer', 'resnet', 'inception',
+    'mlp', 'cnn', 'tcn', 'cnn_gru', 'transformer', 'resnet', 'inception',
 ]
 
 _HIDDEN_LARGE = {
     'mlp':         [512, 1024, 2048],
-    'gru_attn':    [256, 512, 1024],
-    'bigru':       [256, 512, 1024],
-    'lstm_attn':   [256, 512, 1024],
     'cnn':         [256, 512, 1024],
     'tcn':         [256, 512, 1024],
     'cnn_gru':     [256, 512, 1024],
@@ -167,7 +165,7 @@ _HIDDEN_LARGE = {
 }
 
 _MAX_LAYERS = {
-    'mlp': 2, 'gru_attn': 2,
+    'mlp': 2,  # run_train.py: layers in [1,2] for mlp
 }
 
 N_FEATURES = 70
@@ -284,7 +282,8 @@ def warmup(rank: int = 0, world_size: int = 1, dry_run: bool = False):
     # コンパイル前の既知ファイルを記録 (新規ファイルのみ S3 アップロードするため)
     known_files = {f for f in cache_dir.rglob('*') if f.is_file()}
 
-    criterion = torch.nn.CrossEntropyLoss()
+    # label_smoothing=0.1 は train.py と同一 (HLO グラフを一致させるため必須)
+    criterion = torch.nn.CrossEntropyLoss(label_smoothing=0.1)
 
     import torch.optim as _optim
 
@@ -327,7 +326,14 @@ def warmup(rank: int = 0, world_size: int = 1, dry_run: bool = False):
     skipped_claims: list = []  # 他VMがクレーム中でスキップしたパターン
 
     def _compile_pattern(arch, hidden, layers, seq_len):
-        """1パターンをTPUコンパイル。成功時 True、失敗時 False を返す。"""
+        """1パターンをTPUコンパイル。成功時 True、失敗時 False を返す。
+        train.py の _train_step と HLO グラフを完全一致させる:
+          - 入力 dtype: float32 (train.py GPULoader と同一)
+          - criterion: CrossEntropyLoss(label_smoothing=0.1) (train.py と同一)
+          - optimizer: syncfree.AdamW (train.py TPU ブランチと同一)
+          - grad clipping: device-side (train.py と同一, .item() なし)
+          - zero_grad(set_to_none=True) (train.py と同一)
+        """
         tag = f"{arch}/h{hidden}/L{layers}/seq{seq_len}"
         t0 = time.time()
         try:
@@ -338,26 +344,46 @@ def warmup(rank: int = 0, world_size: int = 1, dry_run: bool = False):
                 raise RuntimeError("モデルビルド失敗")
 
             model = model.to(device).train()
-            x_dummy = torch.randn(BATCH, seq_len, N_FEATURES, device=device, dtype=torch.bfloat16)
+            # dtype=float32: train.py の GPULoader と同一
+            # (autocast が float32→bfloat16 変換を行う → bfloat16入力と HLO が異なる)
+            x_dummy = torch.randn(BATCH, seq_len, N_FEATURES, device=device, dtype=torch.float32)
             y_dummy = torch.randint(0, N_CLASSES, (BATCH,), device=device)
-            opt = _optim.Adam(model.parameters(), lr=1e-3)
+
+            # syncfree.AdamW: train.py TPU ブランチと同一 (optimizer step の HLO が一致)
+            try:
+                from torch_xla.amp import syncfree as _sf  # type: ignore
+                opt = _sf.AdamW(model.parameters(), lr=1e-3)
+            except ImportError:
+                opt = _optim.AdamW(model.parameters(), lr=1e-3)
 
             # 大型モデル(h>=1024)は1ステップのみ: 2ステップだとXLAウォッチドッグ(121秒)を超えてkillされる
             n_steps = 1 if hidden >= 1024 else 2
             for _step in range(n_steps):
-                opt.zero_grad()
+                opt.zero_grad(set_to_none=True)  # train.py と同一
                 with torch.amp.autocast('xla', enabled=True, dtype=torch.bfloat16):
                     logits = model(x_dummy)
                     loss   = criterion(logits, y_dummy)
                 loss.backward()
-                xm.optimizer_step(opt)
-                xm.mark_step()
+                # デバイスサイド gradient clipping: train.py _train_step と HLO を完全一致
+                # (標準 clip_grad_norm_ は内部で .item() → XLA sync → HLO が異なる)
+                _grads = [p.grad.detach() for p in model.parameters()
+                          if p.grad is not None]
+                if _grads:
+                    _g_norms = torch.stack([g.norm(2) for g in _grads])
+                    _total   = _g_norms.norm(2).clamp(min=1e-6)
+                    _coef    = (1.0 / _total).clamp(max=1.0)
+                    for _g in _grads:
+                        _g.mul_(_coef)
+                xm.optimizer_step(opt)  # mark_step() 内包 → ここで XLA グラフを submit
 
             # eval グラフ (validation ループ用)
+            # criterion と argmax も含めて train.py の eval ループに近い HLO を生成
             model.eval()
             with torch.no_grad():
                 with torch.amp.autocast('xla', enabled=True, dtype=torch.bfloat16):
-                    _ = model(x_dummy)
+                    _lo = model(x_dummy)
+                _  = criterion(_lo, y_dummy)      # val loss 計算 (train.py と同一)
+                __ = (_lo.argmax(1) == y_dummy).sum()  # 正解数計算 (train.py と同一)
                 xm.mark_step()
 
             print(f"[WARMUP rank={rank}] ✓ {tag}  {time.time()-t0:.0f}秒", flush=True)
