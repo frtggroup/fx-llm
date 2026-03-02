@@ -53,6 +53,34 @@ def _claim_prefix(xla_prefix: str) -> str:
     return base + '/warmup_claims'
 
 
+def _done_prefix(xla_prefix: str) -> str:
+    """完了済みパターンを永続保存するprefixを生成"""
+    base = xla_prefix.rsplit('/xla_cache', 1)[0]
+    return base + '/warmup_done'
+
+
+def _mark_done_on_s3(s3, bucket: str, dprefix: str, pkey: str):
+    """コンパイル完了をS3に永続記録 (以降どのVMも再コンパイルしない)"""
+    try:
+        s3.put_object(Bucket=bucket, Key=f'{dprefix}/{pkey}', Body=b'1')
+    except Exception:
+        pass
+
+
+def _load_done_from_s3(s3, bucket: str, dprefix: str) -> set:
+    """S3の完了済みパターンキー一覧をsetで返す (起動時の一括取得用)"""
+    done_keys = set()
+    try:
+        paginator = s3.get_paginator('list_objects_v2')
+        for page in paginator.paginate(Bucket=bucket, Prefix=f'{dprefix}/'):
+            for obj in page.get('Contents', []):
+                pkey = obj['Key'].split('/')[-1]
+                done_keys.add(pkey)
+    except Exception:
+        pass
+    return done_keys
+
+
 def _pattern_key(arch, hidden, layers, seq_len) -> str:
     return f"{arch}_h{hidden}_L{layers}_seq{seq_len}"
 
@@ -272,16 +300,22 @@ def warmup(rank: int = 0, world_size: int = 1, dry_run: bool = False):
     # S3クライアント取得 (クレームモード判定)
     s3c, bucket, xla_prefix = _s3_client()
     cprefix = _claim_prefix(xla_prefix) if s3c else None
+    dprefix = _done_prefix(xla_prefix) if s3c else None
     use_claims = s3c is not None
 
     if use_claims:
         # ── クレームモード: 複数VM間で動的にパターンを割り当て ────────────────
-        # シャッフルで各VM/チップが異なる順序から試みる → 自然に分散
+        # 起動時にS3の完了済みパターンを一括取得 → 重複コンパイルを防ぐ
         import random
-        todo = [p for p in all_pats if p not in done_set]
+        print(f"[WARMUP rank={rank}] S3から完了済みパターンを取得中...", flush=True)
+        s3_done_keys = _load_done_from_s3(s3c, bucket, dprefix)
+        print(f"[WARMUP rank={rank}] S3完了済み: {len(s3_done_keys)}パターン", flush=True)
+        # ローカルdone_setとS3 done_keysの両方で除外
+        todo = [p for p in all_pats
+                if p not in done_set and _pattern_key(*p) not in s3_done_keys]
         random.shuffle(todo)
         print(f"[WARMUP rank={rank}] クレームモード(S3): 全{len(all_pats)}パターンから動的割当  "
-              f"完了済み: {len(done_set)}  未処理候補: {len(todo)}", flush=True)
+              f"S3完了済み: {len(s3_done_keys)}  ローカル完了済み: {len(done_set)}  未処理候補: {len(todo)}", flush=True)
     else:
         # ── ローカルモード: 静的インターリーブ分割 (単一VM) ──────────────────
         my_pats  = [p for i, p in enumerate(all_pats) if i % world_size == rank]
@@ -420,6 +454,10 @@ def warmup(rank: int = 0, world_size: int = 1, dry_run: bool = False):
 
         # S3クレームを試みる (クレームモード時のみ)
         if use_claims:
+            # クレーム前に完了済みチェック (他VMが既にS3にdoneマークを付けた場合)
+            if pkey in s3_done_keys:
+                done_set.add((arch, hidden, layers, seq_len))
+                continue
             if not _try_claim(s3c, bucket, cprefix, pkey):
                 skipped_claims.append((arch, hidden, layers, seq_len))
                 continue  # 他VMがクレーム中 → スキップ
@@ -431,14 +469,19 @@ def warmup(rank: int = 0, world_size: int = 1, dry_run: bool = False):
         if dry_run:
             done_set.add((arch, hidden, layers, seq_len))
             if use_claims:
+                _mark_done_on_s3(s3c, bucket, dprefix, pkey)
                 _release_claim(s3c, bucket, cprefix, pkey)
             continue
 
+        ok = False
         try:
-            _compile_pattern(arch, hidden, layers, seq_len)
+            ok = _compile_pattern(arch, hidden, layers, seq_len)
         finally:
-            # エラーでもクレームは必ず解放 (他VMが再クレームできるように)
             if use_claims:
+                if ok:
+                    # 成功: 永続完了マークを付けてからクレーム解放
+                    _mark_done_on_s3(s3c, bucket, dprefix, pkey)
+                    s3_done_keys.add(pkey)  # ローカルキャッシュも更新
                 _release_claim(s3c, bucket, cprefix, pkey)
 
         done_set.add((arch, hidden, layers, seq_len))
@@ -459,6 +502,11 @@ def warmup(rank: int = 0, world_size: int = 1, dry_run: bool = False):
             pkey = _pattern_key(arch, hidden, layers, seq_len)
             tag  = f"{arch}/h{hidden}/L{layers}/seq{seq_len}"
 
+            # 完了済みチェック (2パス目までに他VMが完了した可能性)
+            if pkey in s3_done_keys:
+                done_set.add((arch, hidden, layers, seq_len))
+                continue
+
             if not _claim_is_stale(s3c, bucket, cprefix, pkey):
                 continue  # まだ活動中 → 本当に他VMが担当中
 
@@ -471,11 +519,20 @@ def warmup(rank: int = 0, world_size: int = 1, dry_run: bool = False):
             _save_rank(rank, world_size, all_pats, done_set,
                        current=(arch, hidden, layers, seq_len), claim_mode=True)
 
+            ok = False
             if not dry_run:
                 try:
-                    _compile_pattern(arch, hidden, layers, seq_len)
+                    ok = _compile_pattern(arch, hidden, layers, seq_len)
                 finally:
+                    if ok:
+                        _mark_done_on_s3(s3c, bucket, dprefix, pkey)
+                        s3_done_keys.add(pkey)
                     _release_claim(s3c, bucket, cprefix, pkey)
+            else:
+                ok = True
+                _mark_done_on_s3(s3c, bucket, dprefix, pkey)
+                s3_done_keys.add(pkey)
+                _release_claim(s3c, bucket, cprefix, pkey)
 
             done_set.add((arch, hidden, layers, seq_len))
             _save_rank(rank, world_size, all_pats, done_set, claim_mode=True)
@@ -516,7 +573,8 @@ def _run_rank_until_done(rank: int, n_dev: int, dry_run: bool, max_retries: int 
     クレームモード時は全パターンが対象、ローカルモード時はrank担当分のみ。
     """
     all_pats = _all_patterns()
-    s3c, _, _ = _s3_client()
+    s3c, s3_bucket, s3_xla_prefix = _s3_client()
+    s3_dprefix = _done_prefix(s3_xla_prefix) if s3c else None
     # クレームモード(S3あり)では全パターンを対象に; ローカルモードは静的分割
     my_pats = all_pats if s3c else [p for i, p in enumerate(all_pats) if i % n_dev == rank]
     cmd_base = [sys.executable, __file__,
@@ -528,9 +586,14 @@ def _run_rank_until_done(rank: int, n_dev: int, dry_run: bool, max_retries: int 
     env = _worker_env(rank, n_dev)
 
     for attempt in range(1, max_retries + 1):
-        # 残りパターン数を確認
-        done = _load_done(rank)
-        remaining = len(my_pats) - len(done)
+        # 残りパターン数を確認 (S3の完了済みを優先参照)
+        done_local = _load_done(rank)
+        if s3c and s3_dprefix:
+            s3_done = _load_done_from_s3(s3c, s3_bucket, s3_dprefix)
+            remaining = len([p for p in my_pats
+                             if _pattern_key(*p) not in s3_done and p not in done_local])
+        else:
+            remaining = len(my_pats) - len(done_local)
         if remaining <= 0:
             print(f"[WARMUP] rank={rank} 全パターン完了", flush=True)
             return True
