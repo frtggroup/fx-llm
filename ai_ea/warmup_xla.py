@@ -46,6 +46,10 @@ def _s3_client():
 # ── S3 分散クレーム: 複数VM間で同じパターンを二重コンパイルしない ─────────────
 _CLAIM_TTL = 3600  # 秒: この時間内に完了しないクレームはスタールとみなす
 
+# v5litepod-4 で SIGABRT (libtpu クラッシュ) を引き起こすアーキテクチャ
+# → 実際のコンパイルをスキップし done マーカーのみ置く (学習時に JIT コンパイル)
+_SKIP_COMPILE_ARCHS = {'transformer'}
+
 
 def _claim_prefix(xla_prefix: str) -> str:
     """XLAキャッシュprefixからクレームprefixを生成"""
@@ -462,6 +466,18 @@ def warmup(rank: int = 0, world_size: int = 1, dry_run: bool = False):
                 skipped_claims.append((arch, hidden, layers, seq_len))
                 continue  # 他VMがクレーム中 → スキップ
 
+        # _SKIP_COMPILE_ARCHS: SIGABRT を引き起こすアーキテクチャはスキップ
+        # done マーカーのみ置いて実際のコンパイルを省略 (学習時 JIT コンパイル)
+        if arch in _SKIP_COMPILE_ARCHS:
+            print(f"[WARMUP rank={rank}] ({len(done_set)+1}/{len(all_pats)}) {tag} SKIP(JIT)", flush=True)
+            if use_claims:
+                _mark_done_on_s3(s3c, bucket, dprefix, pkey)
+                s3_done_keys.add(pkey)
+                _release_claim(s3c, bucket, cprefix, pkey)
+            done_set.add((arch, hidden, layers, seq_len))
+            _save_rank(rank, world_size, all_pats, done_set, claim_mode=use_claims)
+            continue
+
         print(f"[WARMUP rank={rank}] ({len(done_set)+1}/{len(all_pats)}) {tag} コンパイル中...", flush=True)
         _save_rank(rank, world_size, all_pats, done_set,
                    current=(arch, hidden, layers, seq_len), claim_mode=use_claims)
@@ -495,6 +511,10 @@ def warmup(rank: int = 0, world_size: int = 1, dry_run: bool = False):
               flush=True)
         time.sleep(30)  # VMクラッシュ等でスタールになるまで少し待つ
 
+        # 2パス開始前に S3 done を最新化 (1パス目の間に他VMが完了した分を反映)
+        s3_done_keys = _load_done_from_s3(s3c, bucket, dprefix)
+        print(f"[WARMUP rank={rank}] 2パス: S3完了済み再取得={len(s3_done_keys)}件", flush=True)
+
         for arch, hidden, layers, seq_len in skipped_claims:
             if (arch, hidden, layers, seq_len) in done_set:
                 continue
@@ -514,6 +534,16 @@ def warmup(rank: int = 0, world_size: int = 1, dry_run: bool = False):
             _release_claim(s3c, bucket, cprefix, pkey)
             if not _try_claim(s3c, bucket, cprefix, pkey):
                 continue  # 別のVMが先に再クレーム
+
+            # _SKIP_COMPILE_ARCHS: 2パス目でも同様にスキップ (SIGABRT 対策)
+            if arch in _SKIP_COMPILE_ARCHS:
+                print(f"[WARMUP rank={rank}] (再クレーム) {tag} SKIP(JIT)", flush=True)
+                _mark_done_on_s3(s3c, bucket, dprefix, pkey)
+                s3_done_keys.add(pkey)
+                _release_claim(s3c, bucket, cprefix, pkey)
+                done_set.add((arch, hidden, layers, seq_len))
+                _save_rank(rank, world_size, all_pats, done_set, claim_mode=True)
+                continue
 
             print(f"[WARMUP rank={rank}] (再クレーム) {tag} コンパイル中...", flush=True)
             _save_rank(rank, world_size, all_pats, done_set,
