@@ -731,9 +731,12 @@ def train(args, X_tr, y_tr, X_te, y_te, mean, std, n_feat=None, _spawn_rank=None
     stop_reason    = ''
     recent_gaps    = []
     prev_v_loss    = float('inf')    # val_loss の前エポック値 (下降判定用)
-    # バリデーション頻度: エポック数に応じて調整 (GPU稼働率向上)
-    # 2000ep → 10ep毎 (200回), 800ep → 4ep毎
-    val_every    = max(1, args.epochs // 200)
+    # バリデーション頻度: TPU はメモリ圧力 + eval XLA グラフ再コンパイルのコストが高い
+    # → 検索速度優先で頻度を大幅削減 (GPU: 800ep→4ep毎, TPU: 800ep→16ep毎)
+    if is_tpu:
+        val_every = max(5, args.epochs // 50)   # 800ep → 16ep毎 (GPU比 4x 削減)
+    else:
+        val_every = max(1, args.epochs // 200)
     # 進捗JSON書き込み頻度 (非同期だが頻度を下げることで辞書更新コストも削減)
     progress_every = max(5, args.epochs // 100)
     print(f"  early_stop: ep{min_epochs}～, patience={patience}, wd={wd}"
