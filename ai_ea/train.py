@@ -980,7 +980,16 @@ def _train_step(model, xb, yb, opt, crit, sched,
         if is_tpu:
             try:
                 import torch_xla.core.xla_model as xm  # type: ignore
-                nn.utils.clip_grad_norm_(model.parameters(), 1.0)
+                # TPU: 標準 clip_grad_norm_ は内部で .item() を呼び XLA sync が発生する
+                # → デバイスサイドの gradient clipping でバッチ毎 sync を完全排除
+                _grads = [p.grad.detach() for p in model.parameters()
+                          if p.grad is not None]
+                if _grads:
+                    _g_norms = torch.stack([g.norm(2) for g in _grads])
+                    _total   = _g_norms.norm(2)        # デバイス上テンソル (sync なし)
+                    _coef    = (1.0 / _total).clamp(max=1.0)  # max_norm=1.0
+                    for _g in _grads:
+                        _g.mul_(_coef)
                 xm.optimizer_step(opt)
             except Exception:
                 nn.utils.clip_grad_norm_(model.parameters(), 1.0)
