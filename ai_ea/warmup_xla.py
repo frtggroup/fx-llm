@@ -115,11 +115,29 @@ def _upload_new_cache_files(cache_dir: Path, known_files: set, rank: int) -> set
         # tmpファイルに書いてからアップロード (BytesIOだと大ファイルでOOM)
         tmp_path = f.parent / (f.name + f'.rank{rank}.uploading.zip')
         max_retries = 5
+        try:
+            from boto3.s3.transfer import TransferConfig as _TC
+        except ImportError:
+            _TC = None
+        # multipart_threshold=256MB: XLA zip は通常 <100MB なので単一PUT で IncompleteBody を回避
+        _tcfg = _TC(multipart_threshold=256*1024*1024, max_concurrency=1) if _TC else None
         for attempt in range(max_retries):
+            # リトライ前に前回の残骸を必ず削除 (ENOENT 対策)
             try:
+                tmp_path.unlink(missing_ok=True)
+            except Exception:
+                pass
+            try:
+                # ディレクトリが存在しない場合に備えて作成 (rglob でサブディレクトリ内ファイルも対象)
+                tmp_path.parent.mkdir(parents=True, exist_ok=True)
                 with zipfile.ZipFile(str(tmp_path), 'w', zipfile.ZIP_DEFLATED, compresslevel=1) as zf:
                     zf.write(str(f), f.name)
-                s3.upload_file(str(tmp_path), bucket, s3_key)
+                if not tmp_path.exists():
+                    raise RuntimeError(f"zip作成後にtmpファイルが消えた: {tmp_path}")
+                if _tcfg:
+                    s3.upload_file(str(tmp_path), bucket, s3_key, Config=_tcfg)
+                else:
+                    s3.upload_file(str(tmp_path), bucket, s3_key)
                 return True
             except Exception as e:
                 import time
@@ -130,9 +148,10 @@ def _upload_new_cache_files(cache_dir: Path, known_files: set, rank: int) -> set
                 else:
                     print(f"[WARMUP rank={rank}] S3アップロード 最終失敗 {f.name}: {e}", flush=True)
             finally:
-                if tmp_path.exists():
-                    try: tmp_path.unlink()
-                    except Exception: pass
+                try:
+                    tmp_path.unlink(missing_ok=True)
+                except Exception:
+                    pass
         return False
 
     import concurrent.futures
