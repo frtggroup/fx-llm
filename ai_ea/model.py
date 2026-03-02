@@ -235,7 +235,16 @@ class TransformerNet(nn.Module):
 
     def forward(self, x):
         x = self.proj(x)
-        x = self.encoder(x)
+        # TPU XLA: scan_layers で複数 TransformerEncoder 層を While ループに畳み込み
+        # → HLO グラフサイズ削減・コンパイル時間短縮 (torch_xla 2.6+)
+        if x.device.type == 'xla' and len(self.encoder.layers) >= 2:
+            try:
+                from torch_xla.experimental.scan_layers import scan_layers  # type: ignore
+                x = scan_layers(self.encoder.layers, x)
+            except Exception:
+                x = self.encoder(x)
+        else:
+            x = self.encoder(x)
         x = x[:, -1, :]    # CLSトークンとして最終ステップを使用
         return self.head(x)
 
