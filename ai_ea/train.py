@@ -701,6 +701,7 @@ def train(args, X_tr, y_tr, X_te, y_te, mean, std, n_feat=None, _spawn_rank=None
 
     v_loss = float('inf')   # 最初のvalidationまでの初期値
     acc    = 0.0
+    _nan_count = 0          # NaN連続カウント (BF16 gradient 爆発検出用)
 
     _xla_compiled = False   # 初回バッチのXLAコンパイル完了フラグ
     import time as _time
@@ -787,6 +788,16 @@ def train(args, X_tr, y_tr, X_te, y_te, mean, std, n_feat=None, _spawn_rank=None
             acc    = correct_sum.item() / max(total_sum, 1)
 
         gap = v_loss - t_loss   # 過学習ギャップ
+
+        # ── NaN/Inf 発散検出: BF16 gradient 爆発で loss=nan になる場合を即終了 ──
+        import math as _math
+        if _math.isnan(t_loss) or _math.isinf(t_loss):
+            _nan_count += 1
+            if _nan_count >= 3:
+                stop_reason = f'NaN/Inf発散 ({_nan_count}ep連続) → 早期終了 ep={epoch}'
+                break
+        else:
+            _nan_count = 0
 
         if _is_main and (epoch % 10 == 0 or epoch <= 5):
             lr_now  = optimizer.param_groups[0]['lr']
