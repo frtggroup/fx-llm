@@ -479,10 +479,16 @@ DATA_PREP_BUDGET  = 600    # 秒: データ準備の最大許容時間 (10分)
 NO_GPU_TIMEOUT    = 900    # 秒: GPU使用なしでこれ以上→強制終了 (15分)
 LAUNCH_INTERVAL   = 1      # 秒: 試行投入間隔 (CUDA初期化の重複を防ぐ)
 
-ARCHS = [
+# TPU では RNN 系 (bigru/gru_attn/lstm_attn) を除外
+# 理由: XLA は RNN の隠れ状態依存を逐次コンパイルするため 1ep に数百秒かかる
+_ARCHS_ALL = [
     'mlp', 'gru_attn', 'bigru', 'lstm_attn',
     'cnn', 'tcn', 'cnn_gru', 'transformer', 'resnet', 'inception',
 ]
+_ARCHS_TPU = [
+    'mlp', 'cnn', 'tcn', 'cnn_gru', 'transformer', 'resnet', 'inception',
+]
+ARCHS = _ARCHS_TPU if TPU_MODE else _ARCHS_ALL
 
 # ── GPU ティア別ハイパーパラメータ探索空間 ──────────────────────────────────
 # micro  : GTX 1080 Ti  (11 GB)
