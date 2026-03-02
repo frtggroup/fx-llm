@@ -695,10 +695,15 @@ def train(args, X_tr, y_tr, X_te, y_te, mean, std, n_feat=None, _spawn_rank=None
     print(f"  AMP({dtype_str})={'ON' if use_amp else 'OFF'}  GradScaler={'ON' if use_scaler else 'OFF (BF16不要)'}")
 
     sched_name = getattr(args, 'scheduler', 'onecycle')
+    # TPU: LR を epoch 単位でのみ変化させる
+    # → 1 epoch 内で LR 一定 = XLA グラフが同一 → 再コンパイル 11回/epoch を 1回/epoch に削減
+    # GPU: バッチ単位で変化させる (従来通り)
+    _sched_steps = 1 if is_tpu else len(tr_dl)
+    _sched_epochs = args.epochs
     if sched_name == 'cosine':
-        # ウォームアップなし → val_loss 安定
         scheduler = torch.optim.lr_scheduler.CosineAnnealingLR(
-            optimizer, T_max=args.epochs * len(tr_dl),
+            optimizer,
+            T_max=_sched_epochs * _sched_steps,
             eta_min=args.lr * 0.01,
         )
     elif sched_name == 'step':
@@ -708,7 +713,7 @@ def train(args, X_tr, y_tr, X_te, y_te, mean, std, n_feat=None, _spawn_rank=None
     else:  # onecycle
         scheduler = torch.optim.lr_scheduler.OneCycleLR(
             optimizer, max_lr=args.lr * 3,
-            steps_per_epoch=len(tr_dl), epochs=args.epochs,
+            steps_per_epoch=_sched_steps, epochs=_sched_epochs,
             pct_start=0.03, anneal_strategy='cos',
         )
     print(f"  scheduler={sched_name}")
@@ -784,12 +789,16 @@ def train(args, X_tr, y_tr, X_te, y_te, mean, std, n_feat=None, _spawn_rank=None
                 loss = _train_step(model, xb, yb,
                                    optimizer, criterion, scheduler, scaler,
                                    use_amp, amp_dtype, use_scaler,
-                                   _amp_backend, is_tpu, _spmd_mode)
+                                   _amp_backend, is_tpu, _spmd_mode,
+                                   do_sched=not is_tpu)  # TPU: per-epoch scheduling
                 if is_tpu:
                     t_loss_acc = t_loss_acc + loss   # lazy累積、syncなし
                 else:
                     t_loss_sum += loss.item()
                 t_steps += 1
+            # TPU: epoch 末に LR を 1 回だけ更新 → 1 epoch 内で LR 一定 = XLA 再コンパイル防止
+            if is_tpu:
+                scheduler.step()
             t_loss = ((t_loss_acc / max(1, t_steps)).item()
                       if is_tpu else t_loss_sum / max(1, t_steps))
 
@@ -808,8 +817,9 @@ def train(args, X_tr, y_tr, X_te, y_te, mean, std, n_feat=None, _spawn_rank=None
             stop_reason = f'{oom_msg} (ep{epoch})'
             break
 
-        # validation は val_every エポックごとに実行 (不要なGPU同期を削減)
-        if epoch % val_every == 0 or epoch <= 5 or epoch == args.epochs:
+        # validation は val_every エポックごとに実行 (不要なTPU sync削減)
+        # TPU: epoch <= 5 は廃止 (ep2-5 の eval graph compile が per-batch LR変化と重なって激遅だった)
+        if epoch % val_every == 0 or epoch == 1 or epoch == args.epochs:
             model.eval()
             v_loss_sum = torch.zeros(1, device=device)
             correct_sum = torch.zeros(1, device=device, dtype=torch.long)
@@ -973,7 +983,8 @@ def train(args, X_tr, y_tr, X_te, y_te, mean, std, n_feat=None, _spawn_rank=None
 def _train_step(model, xb, yb, opt, crit, sched,
                 scaler=None, use_amp=False,
                 amp_dtype=torch.float16, use_scaler=False,
-                amp_backend='cuda', is_tpu=False, spmd_mode=False):
+                amp_backend='cuda', is_tpu=False, spmd_mode=False,
+                do_sched=True):
     opt.zero_grad(set_to_none=True)
     with torch.amp.autocast(amp_backend, enabled=use_amp, dtype=amp_dtype):
         loss = crit(model(xb), yb)
@@ -986,26 +997,24 @@ def _train_step(model, xb, yb, opt, crit, sched,
     else:
         loss.backward()
         if is_tpu:
-            try:
-                import torch_xla.core.xla_model as xm  # type: ignore
-                # TPU: 標準 clip_grad_norm_ は内部で .item() を呼び XLA sync が発生する
-                # → デバイスサイドの gradient clipping でバッチ毎 sync を完全排除
-                _grads = [p.grad.detach() for p in model.parameters()
-                          if p.grad is not None]
-                if _grads:
-                    _g_norms = torch.stack([g.norm(2) for g in _grads])
-                    _total   = _g_norms.norm(2)        # デバイス上テンソル (sync なし)
-                    _coef    = (1.0 / _total).clamp(max=1.0)  # max_norm=1.0
-                    for _g in _grads:
-                        _g.mul_(_coef)
-                xm.optimizer_step(opt)
-            except Exception:
-                nn.utils.clip_grad_norm_(model.parameters(), 1.0)
-                opt.step()
+            import torch_xla.core.xla_model as xm  # type: ignore
+            # TPU: 標準 clip_grad_norm_ は内部で .item() を呼び XLA sync が発生する
+            # → デバイスサイドの gradient clipping でバッチ毎 sync を完全排除
+            # NaN 対策: clamp(min=1e-6) で ゼロ除算/inf を防止
+            _grads = [p.grad.detach() for p in model.parameters()
+                      if p.grad is not None]
+            if _grads:
+                _g_norms = torch.stack([g.norm(2) for g in _grads])
+                _total   = _g_norms.norm(2).clamp(min=1e-6)  # ゼロ除算防止
+                _coef    = (1.0 / _total).clamp(max=1.0)      # max_norm=1.0
+                for _g in _grads:
+                    _g.mul_(_coef)
+            xm.optimizer_step(opt)  # mark_step()内包: lazy eval graph を一括 submit
         else:
             nn.utils.clip_grad_norm_(model.parameters(), 1.0)
             opt.step()
-    sched.step()
+    if do_sched:
+        sched.step()
     return loss.detach()
 
 
