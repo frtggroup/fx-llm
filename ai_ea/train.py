@@ -363,14 +363,22 @@ class GPULoader:
             idx = torch.randperm(self.n, device=self.X.device)[:n_use]
         else:
             idx = torch.arange(self.n, device=self.X.device)[:n_use]
-        for start in range(0, n_use, self.bs):
-            sl = idx[start:start + self.bs]
-            # CPU で Gather してから TPU へ転送 (これならグラフが汚れない)
-            xb, yb = self.X[sl], self.y[sl]
-            if self.is_tpu:
-                xb = xb.to(self.dev, non_blocking=True)
-                yb = yb.to(self.dev, non_blocking=True)
-            yield xb, yb
+        if self.is_tpu:
+            # TPU 最適化: エポック全データを一括 CPU→TPU 転送してから TPU 側でスライス
+            # per-batch 転送 (11回) → 一括転送 (1回) に削減。
+            # XLA の動的 Gather は激遅だが、連続スライスは XLA view で essentially free。
+            X_epoch = self.X[idx]           # CPU gather (np.random と同等)
+            y_epoch = self.y[idx]           # CPU gather
+            X_dev   = X_epoch.to(self.dev)  # 一括 HtoD 転送
+            y_dev   = y_epoch.to(self.dev)
+            del X_epoch, y_epoch            # CPU バッファを即解放
+            for start in range(0, n_use, self.bs):
+                yield X_dev[start:start + self.bs], y_dev[start:start + self.bs]
+        else:
+            for start in range(0, n_use, self.bs):
+                sl = idx[start:start + self.bs]
+                xb, yb = self.X[sl], self.y[sl]
+                yield xb, yb
 
 
 def make_loaders(X_tr, y_tr, X_te, y_te, args, device, drop_last: bool = False):
