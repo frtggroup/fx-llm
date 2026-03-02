@@ -583,7 +583,9 @@ def train(args, X_tr, y_tr, X_te, y_te, mean, std, n_feat=None, _spawn_rank=None
             import torch_xla.runtime as xr  # type: ignore
             _rank = int(os.environ.get('PJRT_LOCAL_PROCESS_RANK', '0'))
             _cache_base = os.environ.get('XLA_PERSISTENT_CACHE_PATH',
-                                         '/workspace/xla_cache')
+                                         '/workspace/local_xla')
+            import pathlib as _pl
+            _pl.Path(_cache_base).mkdir(parents=True, exist_ok=True)
             xr.initialize_cache(_cache_base, readonly=False)
         except Exception:
             pass

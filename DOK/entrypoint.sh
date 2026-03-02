@@ -6,6 +6,9 @@
 # ─────────────────────────────────────────────────────────────────────────────
 set -e
 
+# ── FD上限を上げる (S3並列接続等でulimitエラーを防ぐ)
+ulimit -n 65536 2>/dev/null || true
+
 echo "======================================================"
 echo "  FX AI EA 並列ランダムサーチ (統合イメージ)"
 echo "======================================================"
@@ -145,7 +148,9 @@ esac
 # XLA は初回コンパイル結果をファイルにキャッシュし、2回目以降は再利用する。
 # S3 に永続化することでコンテナ/VM 再作成後もキャッシュが復元される。
 if [ "$DEVICE_TYPE" = "TPU" ]; then
-    export XLA_CACHE_DIR=/workspace/xla_cache
+    # XLAキャッシュはローカルSSD優先 (gcsfuse書き込みI/Oのボトルネックを回避)
+    # 環境変数 XLA_PERSISTENT_CACHE_PATH で上書き可能
+    export XLA_CACHE_DIR="${XLA_PERSISTENT_CACHE_PATH:-/workspace/local_xla}"
     mkdir -p "${XLA_CACHE_DIR}"
     # XLA_FLAGS に書くと torch_xla が GPU 専用フラグを追加してTPUでFatalクラッシュする。
     # 正しいTPU向けキャッシュ設定は XLA_PERSISTENT_CACHE_PATH 環境変数を使う。
@@ -284,15 +289,15 @@ _STOP_REQUESTED=0
 _xla_cache_upload() {
     [ "$DEVICE_TYPE" != "TPU" ] && return 0
     [ -z "$S3_ENDPOINT" ] && return 0
-    echo "[*] XLA キャッシュを S3 へ保存中 (ZIP圧縮 / 並列50スレッド)..."
+    echo "[*] XLA キャッシュを S3 へ保存中 (ZIP圧縮 / 並列10スレッド)..."
     python3 - <<'PYEOF'
-import io, logging, os, pathlib, zipfile
+import logging, os, pathlib, tempfile, zipfile
 from concurrent.futures import ThreadPoolExecutor, as_completed
 logging.getLogger('urllib3.connectionpool').setLevel(logging.ERROR)
 try:
     import boto3, urllib3
     urllib3.disable_warnings()
-    cache_dir = pathlib.Path(os.environ.get('XLA_CACHE_DIR', '/workspace/xla_cache'))
+    cache_dir = pathlib.Path(os.environ.get('XLA_CACHE_DIR', '/workspace/local_xla'))
     bucket    = os.environ.get('S3_BUCKET',  'fxea')
     s3_prefix = os.environ.get('S3_PREFIX',  'mix') + '/xla_cache'
 
@@ -312,22 +317,26 @@ try:
         rel = f.relative_to(cache_dir)
         s3_key = f'{s3_prefix}/{rel}.zip'
         client = make_client()
-        for attempt in range(5):
+        for attempt in range(3):
+            tmp_path = None
             try:
-                buf = io.BytesIO()
-                with zipfile.ZipFile(buf, 'w', zipfile.ZIP_DEFLATED, compresslevel=1) as zf:
+                with tempfile.NamedTemporaryFile(suffix='.zip', delete=False) as tmp:
+                    tmp_path = pathlib.Path(tmp.name)
+                with zipfile.ZipFile(tmp_path, 'w', zipfile.ZIP_DEFLATED, compresslevel=1) as zf:
                     zf.write(str(f), f.name)
-                buf.seek(0)
-                client.upload_fileobj(buf, bucket, s3_key)
+                client.upload_file(str(tmp_path), bucket, s3_key)
                 return f.name
             except Exception as e:
                 import time
-                if attempt < 4: time.sleep(2 ** attempt)
+                if tmp_path and tmp_path.exists(): tmp_path.unlink(missing_ok=True)
+                if attempt < 2: time.sleep(2 ** attempt)
                 else: raise e
+            finally:
+                if tmp_path and tmp_path.exists(): tmp_path.unlink(missing_ok=True)
         return f.name
 
     done = 0
-    with ThreadPoolExecutor(max_workers=50) as ex:
+    with ThreadPoolExecutor(max_workers=10) as ex:
         futs = {ex.submit(upload, f): f for f in files}
         for fut in as_completed(futs):
             try: fut.result(); done += 1
@@ -343,7 +352,7 @@ PYEOF
 _xla_cache_download() {
     [ "$DEVICE_TYPE" != "TPU" ] && return 0
     [ -z "$S3_ENDPOINT" ] && return 0
-    echo "[*] XLA キャッシュを S3 から復元中 (ZIP解凍 / 並列50スレッド)..."
+    echo "[*] XLA キャッシュを S3 から復元中 (ZIP解凍 / 並列10スレッド)..."
     python3 - <<'PYEOF'
 import io, logging, os, pathlib, zipfile
 from concurrent.futures import ThreadPoolExecutor, as_completed
@@ -351,7 +360,7 @@ logging.getLogger('urllib3.connectionpool').setLevel(logging.ERROR)
 try:
     import boto3, urllib3
     urllib3.disable_warnings()
-    cache_dir = pathlib.Path(os.environ.get('XLA_CACHE_DIR', '/workspace/xla_cache'))
+    cache_dir = pathlib.Path(os.environ.get('XLA_CACHE_DIR', '/workspace/local_xla'))
     cache_dir.mkdir(parents=True, exist_ok=True)
     bucket    = os.environ.get('S3_BUCKET',  'fxea')
     s3_prefix = os.environ.get('S3_PREFIX',  'mix') + '/xla_cache/'
@@ -402,7 +411,7 @@ try:
             return dst.name
 
         done = 0
-        with ThreadPoolExecutor(max_workers=50) as ex:
+        with ThreadPoolExecutor(max_workers=10) as ex:
             futs = {ex.submit(download, t): t for t in tasks}
             for f in as_completed(futs):
                 try:
