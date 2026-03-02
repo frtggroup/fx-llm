@@ -434,14 +434,15 @@ def warmup(rank: int = 0, world_size: int = 1, dry_run: bool = False):
                 xm.optimizer_step(opt)  # mark_step() 内包 → ここで XLA グラフを submit
 
             # eval グラフ (validation ループ用)
-            # criterion と argmax も含めて train.py の eval ループに近い HLO を生成
+            # train.py の per-batch mark_step 検証ループと完全一致:
+            #   autocast(model(x)) → criterion(lo,y).detach() → (argmax==y).sum() → mark_step
             model.eval()
             with torch.no_grad():
                 with torch.amp.autocast('xla', enabled=True, dtype=torch.bfloat16):
                     _lo = model(x_dummy)
-                _  = criterion(_lo, y_dummy)      # val loss 計算 (train.py と同一)
-                __ = (_lo.argmax(1) == y_dummy).sum()  # 正解数計算 (train.py と同一)
-                xm.mark_step()
+                _b_loss    = criterion(_lo, y_dummy).detach()  # .detach() で train.py と一致
+                _b_correct = (_lo.argmax(1) == y_dummy).sum()  # 正解数計算
+                xm.mark_step()  # per-batch グラフを submit (train.py val ループと同一構造)
 
             print(f"[WARMUP rank={rank}] ✓ {tag}  {time.time()-t0:.0f}秒", flush=True)
             return True

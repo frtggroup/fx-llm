@@ -697,28 +697,35 @@ def train(args, X_tr, y_tr, X_te, y_te, mean, std, n_feat=None, _spawn_rank=None
     print(f"  AMP({dtype_str})={'ON' if use_amp else 'OFF'}  GradScaler={'ON' if use_scaler else 'OFF (BF16不要)'}")
 
     sched_name = getattr(args, 'scheduler', 'onecycle')
-    # TPU: LR を epoch 単位でのみ変化させる
-    # → 1 epoch 内で LR 一定 = XLA グラフが同一 → 再コンパイル 11回/epoch を 1回/epoch に削減
+    # TPU: LR を固定 (CosineAnnealingLR は毎エポック LR 変化 → XLA 定数として埋め込まれ毎回再コンパイル)
+    # → gradient accumulation (1 mark_step/epoch) と組み合わせて epoch 全体を 1 グラフにまとめ、
+    #   LR 固定によりグラフが全エポック同一 → ep1 コンパイル後は完全キャッシュヒット
     # GPU: バッチ単位で変化させる (従来通り)
     _sched_steps = 1 if is_tpu else len(tr_dl)
     _sched_epochs = args.epochs
-    if sched_name == 'cosine':
+    if is_tpu:
+        # TPU: LR 固定スケジューラ (ConstantLR, factor=1.0 → LR 変化なし)
+        scheduler = torch.optim.lr_scheduler.ConstantLR(optimizer, factor=1.0, total_iters=0)
+        print(f"  scheduler=fixed_lr (TPU XLA再コンパイル防止)")
+    elif sched_name == 'cosine':
         scheduler = torch.optim.lr_scheduler.CosineAnnealingLR(
             optimizer,
             T_max=_sched_epochs * _sched_steps,
             eta_min=args.lr * 0.01,
         )
+        print(f"  scheduler={sched_name}")
     elif sched_name == 'step':
         scheduler = torch.optim.lr_scheduler.StepLR(
             optimizer, step_size=max(1, args.epochs // 5), gamma=0.5,
         )
+        print(f"  scheduler={sched_name}")
     else:  # onecycle
         scheduler = torch.optim.lr_scheduler.OneCycleLR(
             optimizer, max_lr=args.lr * 3,
             steps_per_epoch=_sched_steps, epochs=_sched_epochs,
             pct_start=0.03, anneal_strategy='cos',
         )
-    print(f"  scheduler={sched_name}")
+        print(f"  scheduler={sched_name}")
 
     best_loss      = float('inf')
     best_state     = None
@@ -785,27 +792,43 @@ def train(args, X_tr, y_tr, X_te, y_te, mean, std, n_feat=None, _spawn_rank=None
                 print(f"  [XLA] グラフコンパイル中... (初回のみ数分かかります)", flush=True)
                 _compile_start = _ep_t0
 
-            # TPU: lossをデバイス上で累積し epoch末に1回だけ同期
-            # (xm.optimizer_step内のmark_stepで十分 → per-batch sync×11を排除)
-            t_loss_acc = torch.zeros(1, device=device) if is_tpu else None
+            # TPU: gradient accumulation (1 mark_step/epoch)
+            # → epoch 全体を 1 XLA グラフにまとめ、LR 固定と組み合わせて完全キャッシュヒット
+            # → 従来: 11 mark_step/epoch × 再コンパイル = 11×40-130s = 激遅
+            # → 新: 1 mark_step/epoch × キャッシュヒット = ep1 コンパイル後ほぼ瞬時
             t_loss_sum = 0.0
             t_steps = 0
-            for xb, yb in tr_dl:
-                loss = _train_step(model, xb, yb,
-                                   optimizer, criterion, scheduler, scaler,
-                                   use_amp, amp_dtype, use_scaler,
-                                   _amp_backend, is_tpu, _spmd_mode,
-                                   do_sched=not is_tpu)  # TPU: per-epoch scheduling
-                if is_tpu:
-                    t_loss_acc = t_loss_acc + loss   # lazy累積、syncなし
-                else:
-                    t_loss_sum += loss.item()
-                t_steps += 1
-            # TPU: epoch 末に LR を 1 回だけ更新 → 1 epoch 内で LR 一定 = XLA 再コンパイル防止
             if is_tpu:
-                scheduler.step()
-            t_loss = ((t_loss_acc / max(1, t_steps)).item()
-                      if is_tpu else t_loss_sum / max(1, t_steps))
+                import torch_xla.core.xla_model as xm  # type: ignore
+                _n_batches = len(tr_dl)
+                optimizer.zero_grad(set_to_none=True)
+                t_loss_acc = torch.zeros(1, device=device)  # lazy accumulator
+                for xb, yb in tr_dl:
+                    with torch.amp.autocast(_amp_backend, enabled=use_amp, dtype=amp_dtype):
+                        _loss = criterion(model(xb), yb) / _n_batches  # normalize
+                    _loss.backward()  # lazy gradient accumulation (no mark_step)
+                    t_loss_acc = t_loss_acc + _loss.detach()  # lazy loss accumulation
+                    t_steps += 1
+                # Gradient clipping (device-side, no .item() sync)
+                _grads = [p.grad.detach() for p in model.parameters() if p.grad is not None]
+                if _grads:
+                    _g_norms = torch.stack([g.norm(2) for g in _grads])
+                    _total   = _g_norms.norm(2).clamp(min=1e-6)
+                    _coef    = (1.0 / _total).clamp(max=1.0)
+                    for _g in _grads:
+                        _g.mul_(_coef)
+                xm.optimizer_step(optimizer)  # 1 mark_step/epoch: epoch 全体を一括 submit
+                t_loss = t_loss_acc.item()  # sync (グラフ完了待ち)
+            else:
+                for xb, yb in tr_dl:
+                    loss = _train_step(model, xb, yb,
+                                       optimizer, criterion, scheduler, scaler,
+                                       use_amp, amp_dtype, use_scaler,
+                                       _amp_backend, is_tpu, _spmd_mode,
+                                       do_sched=True)
+                    t_loss_sum += loss.item()
+                    t_steps += 1
+                t_loss = t_loss_sum / max(1, t_steps)
 
             if is_tpu and not _xla_compiled and epoch == 1:
                 _xla_compiled = True
@@ -822,22 +845,41 @@ def train(args, X_tr, y_tr, X_te, y_te, mean, std, n_feat=None, _spawn_rank=None
             stop_reason = f'{oom_msg} (ep{epoch})'
             break
 
-        # validation は val_every エポックごとに実行 (不要なTPU sync削減)
-        # TPU: epoch <= 5 は廃止 (ep2-5 の eval graph compile が per-batch LR変化と重なって激遅だった)
+        # validation は val_every エポックごとに実行
         if epoch % val_every == 0 or epoch == 1 or epoch == args.epochs:
             model.eval()
-            v_loss_sum = torch.zeros(1, device=device)
-            correct_sum = torch.zeros(1, device=device, dtype=torch.long)
-            total_sum   = 0
-            with torch.no_grad():
-                for xb, yb in va_dl:
-                    with torch.amp.autocast(_amp_backend, enabled=use_amp, dtype=amp_dtype):
-                        lo = model(xb)
-                    v_loss_sum  += criterion(lo, yb).detach()
-                    correct_sum += (lo.argmax(1) == yb).sum()
-                    total_sum   += len(yb)
-            v_loss = (v_loss_sum / len(va_dl)).item()   # ここで1回だけ同期
-            acc    = correct_sum.item() / max(total_sum, 1)
+            if is_tpu:
+                # TPU: per-batch mark_step → warmup eval グラフと完全一致 → キャッシュヒット
+                # (従来: 全バッチ合体 1 グラフ → warmup と HLO 不一致 → 毎回再コンパイル 300s)
+                import torch_xla.core.xla_model as xm  # type: ignore
+                _v_loss_cpu = 0.0
+                _correct_cpu = 0
+                _total_sum = 0
+                with torch.no_grad():
+                    for xb, yb in va_dl:
+                        with torch.amp.autocast(_amp_backend, enabled=use_amp, dtype=amp_dtype):
+                            lo = model(xb)
+                        _b_loss    = criterion(lo, yb).detach()
+                        _b_correct = (lo.argmax(1) == yb).sum()
+                        xm.mark_step()  # per-batch submit → warmup eval グラフと一致
+                        _v_loss_cpu  += _b_loss.item()    # sync (グラフ完了後 fast)
+                        _correct_cpu += _b_correct.item()
+                        _total_sum   += yb.shape[0]
+                v_loss = _v_loss_cpu / max(len(va_dl), 1)
+                acc    = _correct_cpu / max(_total_sum, 1)
+            else:
+                v_loss_sum  = torch.zeros(1, device=device)
+                correct_sum = torch.zeros(1, device=device, dtype=torch.long)
+                total_sum   = 0
+                with torch.no_grad():
+                    for xb, yb in va_dl:
+                        with torch.amp.autocast(_amp_backend, enabled=use_amp, dtype=amp_dtype):
+                            lo = model(xb)
+                        v_loss_sum  += criterion(lo, yb).detach()
+                        correct_sum += (lo.argmax(1) == yb).sum()
+                        total_sum   += len(yb)
+                v_loss = (v_loss_sum / len(va_dl)).item()
+                acc    = correct_sum.item() / max(total_sum, 1)
 
         gap = v_loss - t_loss   # 過学習ギャップ
 
