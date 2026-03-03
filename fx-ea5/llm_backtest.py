@@ -127,7 +127,7 @@ def run_backtest(preds: np.ndarray, df_te,
     threshold_idx: None の場合 preds を直接シグナルとして使用
     """
     close = df_te['close'].values
-    atr   = df_te['atr14'].values
+    atr   = df_te['atr_14'].values
     high  = df_te['high'].values
     low   = df_te['low'].values
     n     = len(preds)
