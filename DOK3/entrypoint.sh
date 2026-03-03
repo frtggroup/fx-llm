@@ -286,7 +286,7 @@ dst = Path(os.environ.get('DATA_PATH', '/workspace/data/USDJPY_H1.csv'))
 # 方法1: S3 直接URL (最優先・高速)
 S3_ENDPOINT = os.environ.get('S3_ENDPOINT', 'https://frorit-2022.softether.net:18004')
 S3_BUCKET   = os.environ.get('S3_BUCKET',   'fxea')
-S3_PREFIX',  'mix2')
+S3_PREFIX   = os.environ.get('S3_PREFIX',   'mix2')
 s3_url = f'{S3_ENDPOINT}/{S3_BUCKET}/{S3_PREFIX}/data/USDJPY_H1.csv'
 print(f'[*] S3 から CSV 取得中: {s3_url}')
 try:
