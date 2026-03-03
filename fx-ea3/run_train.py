@@ -653,7 +653,7 @@ _is_tpu_env = (os.environ.get('DEVICE_TYPE', '').upper() == 'TPU'
 EP_STALL_INIT_SEC  = 2700 if _is_tpu_env else 3600  # TPU:45分 / GPU:60分 (Triton AUTOTUNE が初回ep0に最大30分以上かかるため)
 # TPU: gradient accumulation により ep2以降はキャッシュヒットで瞬時 → 短くして良い
 # GPU: ep間はサブ秒なので 2分で十分
-EP_STALL_TRAIN_SEC = 300 if _is_tpu_env else 120   # TPU:5分 / GPU:2分 (cache hit → 超高速)
+EP_STALL_TRAIN_SEC = 300 if _is_tpu_env else 300   # TPU:5分 / GPU:5分 (max-autotune compile が ep間に入ると2分超えるため)
 
 
 def _kill_with_group(pid_or_proc):
@@ -1694,9 +1694,14 @@ class WorkerPool:
                     stall_limit = EP_STALL_INIT_SEC if cur_ep == 0 else EP_STALL_TRAIN_SEC
 
                     if elapsed > 30 and stall > stall_limit:
+                        # STALL: この試行だけスキップ (executor全体再起動はしない)
+                        # executor再起動はCPU爆発→次STALL→無限ループの原因になるため
                         print(f"  [STALL] 試行#{tno} ep={cur_ep} {stall/60:.1f}分進捗なし"
-                              f" → executor再起動でワーカー強制終了")
-                        broken = True   # executor全体再起動でハングワーカーを殺す
+                              f" → この試行のみスキップ (executor継続)")
+                        future.cancel()
+                        done.append((tno, meta))
+                        del self._futures[tno]
+                        del self._meta[tno]
                     elif elapsed > TRIAL_TIMEOUT:
                         future.cancel()
                         print(f"  [TIMEOUT] 試行#{tno} ({elapsed/60:.0f}分超) → スキップ")
