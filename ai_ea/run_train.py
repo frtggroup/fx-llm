@@ -1741,8 +1741,11 @@ class WorkerPool:
 def _worker_init_proxy(train_py_dir: str, cache_pkl_path: str,
                        gpu_mem_fraction: float = 0.0) -> None:
     """spawn ワーカーの初期化 (pickleできる関数でなければならない)"""
-    import sys as _sys
+    import sys as _sys, os as _os
     _sys.path.insert(0, train_py_dir)
+    # WorkerPool ワーカーであることを train.py に伝える
+    # → torch.compile を有効にして inductor キャッシュを生成・再利用する
+    _os.environ['_FX_WORKERPOOL'] = '1'
     # GPU メモリ上限を設定してワーカー間の OOM / segfault を防ぐ
     if gpu_mem_fraction > 0.0:
         try:

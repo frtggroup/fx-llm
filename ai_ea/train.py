@@ -655,7 +655,9 @@ def train(args, X_tr, y_tr, X_te, y_te, mean, std, n_feat=None, _spawn_rank=None
     # torch.compile は optimizer 作成後に step 関数ごとコンパイル (↓ scheduler 作成後に実施)
     # TPU: lazy eval (tracing mode) が既に最適 → torch.compile 不使用
     model_for_export = model
-    _is_worker    = bool(getattr(args, 'out_dir', ''))
+    # WorkerPool ワーカー (_FX_WORKERPOOL=1) は長命プロセスなので torch.compile を有効にする
+    # ParallelTrainer のサブプロセス (1試行で終了) は compile コストが無駄なのでスキップ
+    _is_worker    = bool(getattr(args, 'out_dir', '')) and not os.environ.get('_FX_WORKERPOOL')
     _compiled_step = None   # GPU コンパイル済みステップ関数 (None=フォールバック)
     if is_tpu:
         print(f"  XLA lazy eval (tracing mode) 使用")
