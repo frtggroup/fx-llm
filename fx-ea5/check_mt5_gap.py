@@ -51,7 +51,7 @@ def main():
     open_arr  = df_te['open'].values
     high_arr  = df_te['high'].values
     low_arr   = df_te['low'].values
-    atr_arr   = df_te['atr14'].values
+    atr_arr   = df_te['atr_14'].values
     dates     = df_te.index
 
     # テスト期間の開始インデックス (df全体の中での位置)
