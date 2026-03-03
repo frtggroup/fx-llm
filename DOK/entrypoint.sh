@@ -255,13 +255,23 @@ echo "    DATA_PATH    : ${DATA_PATH}"
 echo "    GDRIVE       : ${GDRIVE_FOLDER_ID:-(未設定)}"
 echo "    DASHBOARD    : port ${DASHBOARD_PORT}"
 
-# ── 6. ダッシュボード起動 ─────────────────────────────────────────────────────
-python /workspace/ai_ea/server.py > /workspace/dashboard.log 2>&1 &
+# ── 6. ダッシュボード起動 (クラッシュ時自動再起動) ──────────────────────────
+_start_dashboard() {
+    while true; do
+        echo "[DASH] server.py 起動 $(date '+%H:%M:%S')" >> /workspace/dashboard.log
+        python /workspace/ai_ea/server.py >> /workspace/dashboard.log 2>&1
+        EXIT_CODE=$?
+        echo "[DASH] server.py 終了 (exit=$EXIT_CODE) → 5秒後に再起動 $(date '+%H:%M:%S')" \
+            >> /workspace/dashboard.log
+        sleep 5
+    done
+}
+_start_dashboard &
 DASH_PID=$!
 sleep 3
-kill -0 "$DASH_PID" 2>/dev/null \
+curl -s --connect-timeout 3 http://127.0.0.1:${DASHBOARD_PORT}/api/status > /dev/null 2>&1 \
   && echo "[OK] ダッシュボード起動 port ${DASHBOARD_PORT} (PID: $DASH_PID)" \
-  || { echo "[WARN] ダッシュボード起動失敗:"; cat /workspace/dashboard.log 2>/dev/null | tail -10 || true; }
+  || { echo "[WARN] ダッシュボード起動失敗:"; cat /workspace/dashboard.log 2>/dev/null | tail -5 || true; }
 
 # ── 7. CSV 自動取得 ───────────────────────────────────────────────────────────
 mkdir -p "$(dirname ${DATA_PATH})"
