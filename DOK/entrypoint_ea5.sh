@@ -782,7 +782,7 @@ fi
 # run_train.py がクラッシュしても自動復旧する。stop.flag があれば再起動しない。
 RESTART_COUNT=0
 while true; do
-    python /workspace/fx-ea5/run_train.py 2>&1 | tee -a /workspace/train_run.log &
+    python /workspace/fx-ea5/run_train.py >> /workspace/train_run.log 2>&1 &
     TRAIN_PID=$!
     wait $TRAIN_PID
     EXIT_CODE=$?
@@ -793,10 +793,14 @@ while true; do
         break
     fi
 
-    # 正常終了も終了
+    # 正常終了 (exit=0) かつ stop.flag なし → 異常とみなして再起動
+    # (tee パイプラインを使わないので exit=0 は本当の正常終了のみ)
     if [ $EXIT_CODE -eq 0 ]; then
-        echo "===== 学習完了 | ダッシュボード: http://0.0.0.0:${DASHBOARD_PORT} ====="
-        break
+        if [ -f /workspace/stop.flag ]; then
+            echo "===== 学習完了 (stop.flag) | ダッシュボード: http://0.0.0.0:${DASHBOARD_PORT} ====="
+            break
+        fi
+        echo "[RESTART] run_train.py が exit=0 で終了 → 再起動..."
     fi
 
     RESTART_COUNT=$((RESTART_COUNT + 1))

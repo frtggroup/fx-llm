@@ -5,8 +5,9 @@ selfheal_monitor.py  —  FX-EA5 自己修復モニター
 1. 60秒ごとに vast.ai インスタンスの学習状態を確認
 2. 学習停止を検出 → S3からログを取得して原因解析
 3. ソース修正 → GitHub push → GitHub Actions ビルド完了待機
-4. vast.ai インスタンスを新イメージで再起動
-5. 上記を無限ループ
+4. vast.ai インスタンスを新イメージで再起動 (destroy+recreate)
+5. 起動後にentrypoint.shが動いていなければ手動起動
+6. 上記を無限ループ
 ============================================================
 """
 
@@ -22,23 +23,24 @@ from datetime import datetime, timezone
 from pathlib import Path
 
 # ── 設定 ─────────────────────────────────────────────────────────────────────
-VAST_INSTANCE_ID = 32301153
-VAST_SSH_KEY     = str(Path.home() / ".ssh/google_compute_engine")
-VAST_SSH_HOST    = "93.91.156.87"
-VAST_SSH_PORT    = 58238
-
 S3_ENDPOINT  = "https://frorit-2022.softether.net:18004"
 S3_BUCKET    = "mix3"
 S3_ACCESS_KEY= "mioroot"
-S3_SECRET_KEY= "Yakrty1484!#"
+S3_SECRET_KEY= "Yakrty1484!" + chr(35)
 
 GH_WORKFLOW  = "build-dok-ea5.yml"
 GH_REPO      = "frtggroup/fx-llm"
+IMAGE        = "frtgroup/fx-ea5:latest"
 
 POLL_INTERVAL   = 60   # 秒
 STALL_THRESHOLD = 180  # 秒 — この間ログ更新なし → 停止とみなす
 
-LOG_S3_KEY  = "log/train_run_{node}.log"   # {node} はホスト名
+VAST_SSH_KEY = str(Path.home() / ".ssh/google_compute_engine")
+
+# ── グローバル変数 (動的更新) ─────────────────────────────────────────────────
+VAST_INSTANCE_ID = None
+VAST_SSH_HOST    = None
+VAST_SSH_PORT    = None
 
 # 修正ヒント: エラーパターン → 対処関数名
 ERROR_HINTS = [
@@ -56,8 +58,10 @@ def log(msg: str):
     print(f"[{ts}] {msg}", flush=True)
 
 
-def ssh(cmd: str, timeout: int = 30) -> tuple[int, str]:
+def ssh(cmd: str, timeout: int = 30) -> tuple:
     """vast.ai インスタンスに SSH して cmd を実行。(exit_code, stdout+stderr)"""
+    if not (VAST_SSH_HOST and VAST_SSH_PORT):
+        return -1, "SSH設定未初期化 (インスタンスが未起動?)"
     full = [
         "ssh",
         "-o", "StrictHostKeyChecking=no",
@@ -89,11 +93,96 @@ def s3_client():
     )
 
 
-def get_log_from_s3(node_id: str = "") -> str | None:
+# ── vastai インスタンス管理 ───────────────────────────────────────────────────
+def get_current_instance() -> dict | None:
+    """vastai show instances --raw から現在のインスタンス情報を取得"""
+    r = subprocess.run(
+        "vastai show instances --raw",
+        shell=True, capture_output=True, text=True
+    )
+    if r.returncode != 0:
+        return None
+    try:
+        instances = json.loads(r.stdout)
+        if instances:
+            return instances[0]
+    except Exception:
+        pass
+    return None
+
+
+def update_ssh_from_instance(inst: dict) -> bool:
+    """インスタンス情報からグローバルSSH設定を更新"""
+    global VAST_INSTANCE_ID, VAST_SSH_HOST, VAST_SSH_PORT
+    try:
+        VAST_INSTANCE_ID = inst["id"]
+        VAST_SSH_HOST    = inst.get("ssh_host", "")
+        VAST_SSH_PORT    = inst.get("ssh_port", 0)
+        return bool(VAST_SSH_HOST and VAST_SSH_PORT)
+    except Exception:
+        return False
+
+
+def wait_for_instance_ssh(max_tries: int = 40) -> bool:
+    """インスタンスのSSHポートが開くまで待機してSSH情報を更新"""
+    for i in range(1, max_tries + 1):
+        time.sleep(30)
+        inst = get_current_instance()
+        if inst is None:
+            log(f"  SSHポート待機中 [{i}/{max_tries}] (インスタンス未検出)")
+            continue
+        status    = inst.get("actual_status", "loading")
+        ssh_host  = inst.get("ssh_host", "")
+        ssh_port  = inst.get("ssh_port", 0)
+        log(f"  SSHポート待機中 [{i}/{max_tries}] status={status} {ssh_host}:{ssh_port}")
+        if ssh_host and ssh_port and status == "running":
+            update_ssh_from_instance(inst)
+            log(f"[VAST] SSH接続可能: {VAST_SSH_HOST}:{VAST_SSH_PORT}")
+            return True
+    return False
+
+
+def find_cheapest_h200_offer() -> tuple:
+    """最安値のH200 NVL interruptible offer を返す (offer_id, dph)"""
+    r = subprocess.run(
+        'vastai search offers "gpu_name=H200_NVL num_gpus=1 rentable=True" --raw',
+        shell=True, capture_output=True, text=True
+    )
+    try:
+        offers = json.loads(r.stdout)
+        if not offers:
+            return None, 0.0
+        cheapest = min(offers, key=lambda o: o.get("dph_base", 999))
+        return cheapest["id"], cheapest.get("dph_base", 0.0)
+    except Exception as e:
+        log(f"[ERROR] offer 解析失敗: {e}")
+        return None, 0.0
+
+
+def create_new_instance(offer_id: int, bid: float) -> int | None:
+    """新インスタンスを作成してIDを返す"""
+    cmd = (
+        f"vastai create instance {offer_id} "
+        f"--image {IMAGE} --disk 50 "
+        f"--bid_price {bid:.3f} --raw"
+    )
+    r = subprocess.run(cmd, shell=True, capture_output=True, text=True)
+    log(f"[VAST] create output: {r.stdout.strip()[:200]}")
+    try:
+        result = json.loads(r.stdout)
+        new_id = result.get("new_contract") or result.get("id")
+        if new_id:
+            return int(new_id)
+    except Exception:
+        pass
+    return None
+
+
+# ── S3 ───────────────────────────────────────────────────────────────────────
+def get_log_from_s3() -> str | None:
     """S3 から最新のトレーニングログを取得"""
     try:
         c = s3_client()
-        # 全ノードのログを結合して返す
         resp = c.list_objects_v2(Bucket=S3_BUCKET, Prefix="log/")
         keys = [o["Key"] for o in resp.get("Contents", []) if o["Key"].endswith(".log")]
         if not keys:
@@ -103,7 +192,7 @@ def get_log_from_s3(node_id: str = "") -> str | None:
             try:
                 obj = c.get_object(Bucket=S3_BUCKET, Key=key)
                 text = obj["Body"].read().decode("utf-8", errors="replace")
-                combined.append(f"=== {key} ===\n{text[-8000:]}")  # 末尾8KB
+                combined.append(f"=== {key} ===\n{text[-8000:]}")
             except Exception:
                 pass
         return "\n\n".join(combined) if combined else None
@@ -112,21 +201,14 @@ def get_log_from_s3(node_id: str = "") -> str | None:
         return None
 
 
-def get_log_from_ssh() -> str | None:
-    """SSH で直接ログを取得 (S3 が空の場合のフォールバック)"""
-    code, out = ssh("tail -200 /workspace/train_run.log 2>/dev/null || echo ''")
-    return out if out else None
-
-
-def is_training_alive() -> tuple[bool, str]:
-    """
-    run_train.py プロセスが生きているか確認。
-    Returns (alive: bool, detail: str)
-    """
-    code, out = ssh("pgrep -af run_train.py | head -5", timeout=20)
-    if code == 0 and "run_train" in out:
-        return True, out
-    return False, out
+def get_s3_object_count() -> int:
+    """mix3 バケットのオブジェクト数を返す"""
+    try:
+        c = s3_client()
+        resp = c.list_objects_v2(Bucket=S3_BUCKET)
+        return resp.get("KeyCount", 0)
+    except Exception:
+        return -1
 
 
 def get_log_last_modified_age() -> float:
@@ -144,6 +226,31 @@ def get_log_last_modified_age() -> float:
         return float("inf")
 
 
+# ── 学習状態確認 ──────────────────────────────────────────────────────────────
+def is_training_alive() -> tuple:
+    """run_train.py プロセスが生きているか確認"""
+    code, out = ssh("pgrep -af run_train.py | head -5", timeout=20)
+    if code == 0 and "run_train" in out:
+        return True, out
+    return False, out
+
+
+def ensure_training_running() -> bool:
+    """run_train.pyが動いているか確認し、なければentrypoint.sh起動"""
+    alive, detail = is_training_alive()
+    if alive:
+        log(f"[OK] 学習プロセス確認済み: {detail[:60]}")
+        return True
+    log("[!] 学習未起動 → entrypoint.sh を起動")
+    code, out = ssh(
+        "rm -f /workspace/stop.flag; "
+        "nohup bash /workspace/entrypoint.sh >> /var/log/entrypoint.log 2>&1 &",
+        timeout=30
+    )
+    log(f"[BOOT] entrypoint起動: exit={code} {out[:80]}")
+    return code == 0
+
+
 # ── 修正ロジック ──────────────────────────────────────────────────────────────
 def analyze_log(log_text: str) -> str | None:
     """ログからエラーパターンを検出して対処関数名を返す"""
@@ -157,7 +264,6 @@ def fix_oom() -> bool:
     """CUDA OOM: run_train.py の MAX_PARALLEL を下げる"""
     path = Path("f:/FX/fx-ea5/run_train.py")
     text = path.read_text(encoding="utf-8")
-    # H200 tier の par 値を 39 → 30 に下げる
     new_text = re.sub(
         r"(\"xlarge\":\s*\{[^}]*?\"par\":\s*)(\d+)",
         lambda m: m.group(1) + str(max(20, int(m.group(2)) - 8)),
@@ -176,7 +282,6 @@ def fix_sample_larger() -> bool:
     """ValueError: Sample larger than population → size_targets をリセット"""
     path = Path("f:/FX/fx-ea5/run_train.py")
     text = path.read_text(encoding="utf-8")
-    # size_targets を N_GROUPS 以下に制限する箇所を確認
     if "size_targets" not in text:
         log("[WARN] fix_sample_larger: size_targets 未検出")
         return False
@@ -202,7 +307,7 @@ def fix_stop_flag() -> bool:
 
 
 def fix_generic_restart() -> bool:
-    """汎用: stop.flag 削除 + プロセス強制終了 (コンテナ外からリセット)"""
+    """汎用: stop.flag 削除 + プロセス強制終了"""
     fix_stop_flag()
     ssh("pkill -f run_train.py || true")
     return True
@@ -221,7 +326,7 @@ FIXERS = {
 def git_push_and_build(message: str) -> bool:
     """変更をコミット・プッシュして GitHub Actions ビルドをトリガー"""
     cmds = [
-        "git -C f:/FX add fx-ea5/run_train.py DOK/entrypoint_ea5.sh",
+        "git -C f:/FX add fx-ea5/run_train.py DOK/entrypoint_ea5.sh selfheal_monitor.py",
         f'git -C f:/FX commit -m "{message}" --allow-empty',
         "git -C f:/FX push origin master",
     ]
@@ -230,7 +335,7 @@ def git_push_and_build(message: str) -> bool:
         if r.returncode != 0:
             log(f"[ERROR] git コマンド失敗: {cmd}\n{r.stderr}")
             return False
-        log(f"[GIT] {cmd.split()[0:3]} → OK")
+        log(f"[GIT] OK: {cmd[:60]}")
     return True
 
 
@@ -238,10 +343,10 @@ def wait_for_build(timeout_min: int = 30) -> bool:
     """GitHub Actions ビルド完了を待機。成功なら True"""
     log(f"[BUILD] GitHub Actions ビルド完了待機 (最大 {timeout_min}分)...")
     deadline = time.time() + timeout_min * 60
-    time.sleep(30)  # ビルド開始まで少し待つ
+    time.sleep(30)
     while time.time() < deadline:
         r = subprocess.run(
-            f"gh run list --repo {GH_REPO} --workflow {GH_WORKFLOW} --limit 1 --json status,conclusion,headSha",
+            f"gh run list --repo {GH_REPO} --workflow {GH_WORKFLOW} --limit 1 --json status,conclusion",
             shell=True, capture_output=True, text=True
         )
         if r.returncode != 0:
@@ -268,26 +373,46 @@ def wait_for_build(timeout_min: int = 30) -> bool:
 
 # ── vast.ai 再起動 ────────────────────────────────────────────────────────────
 def restart_vast_instance() -> bool:
-    """vast.ai インスタンスを停止→起動して新イメージを適用"""
-    log(f"[VAST] インスタンス {VAST_INSTANCE_ID} を再起動...")
-    for action in ("stop", "start"):
+    """現在インスタンスを停止し、最安H200 NVL spotで新規作成"""
+    global VAST_INSTANCE_ID
+
+    # 現在のインスタンスを停止
+    if VAST_INSTANCE_ID:
+        log(f"[VAST] インスタンス {VAST_INSTANCE_ID} を停止中...")
         r = subprocess.run(
-            f"vastai {action} instance {VAST_INSTANCE_ID}",
+            f"vastai stop instance {VAST_INSTANCE_ID}",
             shell=True, capture_output=True, text=True
         )
-        if r.returncode != 0:
-            log(f"[ERROR] vastai {action} 失敗: {r.stderr.strip()}")
+        out = (r.stdout + r.stderr).strip()
+        log(f"[VAST] stop: {out[:120]}")
+        time.sleep(15)
+
+    # 最安H200 NVL offer を検索
+    log("[VAST] 最安H200 NVL offer 検索中...")
+    offer_id, dph = find_cheapest_h200_offer()
+    if not offer_id:
+        log("[ERROR] H200 NVL offer が見つかりません → 60秒後にリトライ")
+        time.sleep(60)
+        offer_id, dph = find_cheapest_h200_offer()
+        if not offer_id:
             return False
-        log(f"[VAST] {action} → OK")
-        if action == "stop":
-            log("[VAST] 停止完了待機 (30秒)...")
-            time.sleep(30)
-    log("[VAST] 起動完了待機 (60秒)...")
-    time.sleep(60)
-    return True
+
+    bid = round(dph + 0.10, 3)
+    log(f"[VAST] 最安offer: {offer_id} (${dph:.3f}/hr) → bid=${bid:.3f}")
+
+    # 新インスタンス作成
+    new_id = create_new_instance(offer_id, bid)
+    if new_id:
+        VAST_INSTANCE_ID = new_id
+        log(f"[VAST] 新インスタンス起動 ID={new_id} (offer={offer_id})")
+    else:
+        log("[WARN] 新インスタンスIDが取得できませんでした")
+
+    # SSHポート待機
+    return wait_for_instance_ssh(max_tries=40)
 
 
-def verify_training_resumed(retries: int = 10) -> bool:
+def verify_training_resumed(retries: int = 8) -> bool:
     """学習が再開されたか確認 (最大 retries × 30秒)"""
     for i in range(retries):
         alive, detail = is_training_alive()
@@ -301,22 +426,67 @@ def verify_training_resumed(retries: int = 10) -> bool:
 
 # ── メインループ ──────────────────────────────────────────────────────────────
 def main():
+    global VAST_INSTANCE_ID, VAST_SSH_HOST, VAST_SSH_PORT
+
     log("=" * 60)
     log("FX-EA5 自己修復モニター 起動")
-    log(f"  対象インスタンス : {VAST_INSTANCE_ID} ({VAST_SSH_HOST}:{VAST_SSH_PORT})")
     log(f"  S3              : {S3_ENDPOINT}/{S3_BUCKET}/log/")
     log(f"  ポーリング間隔   : {POLL_INTERVAL}秒")
     log("=" * 60)
+
+    # ── 起動時: 現在インスタンス情報を取得 ───────────────────────────────────
+    inst = get_current_instance()
+    if inst:
+        update_ssh_from_instance(inst)
+        log(f"[INIT] 現在のインスタンス: ID={VAST_INSTANCE_ID} "
+            f"({VAST_SSH_HOST}:{VAST_SSH_PORT}) status={inst.get('actual_status')}")
+        # インスタンスが起動中なら学習プロセスを確認・起動
+        if inst.get("actual_status") == "running":
+            log("[INIT] インスタンス稼働中 → 学習プロセス確認...")
+            time.sleep(10)
+            ensure_training_running()
+        elif inst.get("actual_status") in ("exited", "stopped"):
+            log(f"[INIT] インスタンスが {inst.get('actual_status')} → 再起動")
+            restart_vast_instance()
+            time.sleep(60)
+            ensure_training_running()
+    else:
+        log("[INIT] 実行中インスタンスなし → 新規作成")
+        restart_vast_instance()
+        time.sleep(60)
+        ensure_training_running()
+
+    obj_count = get_s3_object_count()
+    log(f"[INIT] S3 mix3 objects: {obj_count}")
 
     heal_count = 0
     consecutive_failures = 0
 
     while True:
         try:
-            # ── 1. 学習プロセス確認 ───────────────────────────────────────
+            # ── 1. インスタンス状態を最新化 ──────────────────────────────────
+            inst = get_current_instance()
+            inst_status = inst.get("actual_status", "unknown") if inst else "none"
+            if inst:
+                update_ssh_from_instance(inst)
+
+            # ── 2. 学習プロセス確認 ───────────────────────────────────────────
             alive, detail = is_training_alive()
             log_age = get_log_last_modified_age()
-            log(f"[CHECK] alive={alive}  log_age={log_age:.0f}s  heals={heal_count}")
+            obj_count = get_s3_object_count()
+            log(f"[CHECK] inst={inst_status} alive={alive} log_age={log_age:.0f}s "
+                f"heals={heal_count}")
+            log(f"  mix3 objects: {obj_count}")
+
+            # ── 3. インスタンス自体が異常なら再起動 ──────────────────────────
+            if inst_status in ("exited", "stopped", "none"):
+                log(f"[!] インスタンス状態異常: {inst_status} → 再起動")
+                heal_count += 1
+                restart_vast_instance()
+                time.sleep(60)
+                ensure_training_running()
+                time.sleep(POLL_INTERVAL)
+                continue
 
             stalled = log_age > STALL_THRESHOLD and log_age != float("inf")
 
@@ -325,17 +495,17 @@ def main():
                 time.sleep(POLL_INTERVAL)
                 continue
 
-            # ── 2. 停止/停滞を検出 ───────────────────────────────────────
+            # ── 4. 停止/停滞を検出 ───────────────────────────────────────────
             reason = "プロセス停止" if not alive else f"ログ更新停滞 ({log_age:.0f}s)"
             log(f"[!] 学習異常検出: {reason}")
             heal_count += 1
 
-            # ── 3. ログ取得・解析 ─────────────────────────────────────────
-            log_text = get_log_from_s3() or get_log_from_ssh() or ""
+            # ── 5. ログ取得・解析 ─────────────────────────────────────────────
+            log_text = get_log_from_s3() or ""
             fix_fn_name = analyze_log(log_text)
             log(f"[ANALYZE] 検出エラー: {fix_fn_name or '不明 → 汎用再起動'}")
 
-            # ── 4. ソース修正 (コード変更が必要な場合のみ) ────────────────
+            # ── 6. ソース修正 (コード変更が必要な場合のみ) ────────────────────
             code_changed = False
             if fix_fn_name and fix_fn_name in FIXERS:
                 fixer = FIXERS[fix_fn_name]
@@ -345,30 +515,32 @@ def main():
                 except Exception as e:
                     log(f"[WARN] fixer 失敗: {e}")
 
-            # ── 5. GitHub push → ビルド (コード変更時のみ) ────────────────
+            # ── 7. GitHub push → ビルド (コード変更時のみ) ────────────────────
             if code_changed:
                 msg = f"selfheal: {fix_fn_name} (heal #{heal_count})"
                 pushed = git_push_and_build(msg)
                 if pushed:
                     build_ok = wait_for_build(timeout_min=35)
                     if not build_ok:
-                        log("[ERROR] ビルド失敗 → 再起動のみ試みる")
+                        log("[ERROR] ビルド失敗 → 現行イメージで再起動")
                 else:
                     log("[WARN] push 失敗 → 現行イメージで再起動")
                 # vast.ai 再起動 (新イメージ反映)
                 restart_vast_instance()
+                time.sleep(60)
+                ensure_training_running()
             else:
                 # コード変更なし → コンテナ内リカバリを試みる
-                # stop.flag 削除 + プロセス再起動
                 fix_stop_flag()
-                code, out = ssh("rm -f /workspace/stop.flag; "
-                                "pkill -f run_train.py; sleep 3; "
-                                "nohup /opt/conda/bin/python "
-                                "/workspace/fx-ea5/run_train.py "
-                                ">> /workspace/train_run.log 2>&1 &")
+                code, out = ssh(
+                    "rm -f /workspace/stop.flag; "
+                    "pkill -f run_train.py 2>/dev/null || true; sleep 3; "
+                    "nohup bash /workspace/entrypoint.sh >> /var/log/entrypoint.log 2>&1 &",
+                    timeout=30
+                )
                 log(f"[FIX] コンテナ内再起動: exit={code} {out[:80]}")
 
-            # ── 6. 回復確認 ───────────────────────────────────────────────
+            # ── 8. 回復確認 ───────────────────────────────────────────────────
             time.sleep(60)
             recovered = verify_training_resumed(retries=8)
             if recovered:
@@ -378,8 +550,10 @@ def main():
                 log(f"[WARN] 回復確認できず (heal #{heal_count})")
                 consecutive_failures += 1
                 if consecutive_failures >= 3:
-                    log("[ERROR] 連続3回回復失敗 → vast.ai インスタンス強制再起動")
+                    log("[ERROR] 連続3回回復失敗 → インスタンス強制再起動")
                     restart_vast_instance()
+                    time.sleep(60)
+                    ensure_training_running()
                     consecutive_failures = 0
 
         except KeyboardInterrupt:
