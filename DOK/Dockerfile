@@ -57,6 +57,9 @@ RUN apt-get update && apt-get install -y --no-install-recommends \
         ntpdate \
     && apt-get clean && rm -rf /var/lib/apt/lists/*
 
+# torch.compile (Triton) が libcuda を見つけられるようにする (実行時にマウントされる libcuda.so.1 へのリンク)
+RUN ln -sf /usr/lib/x86_64-linux-gnu/libcuda.so.1 /usr/lib/x86_64-linux-gnu/libcuda.so || true
+
 # ── Python packages ──────────────────────────────────────────────────────────
 COPY DOK/requirements.txt /tmp/requirements.txt
 RUN pip install --upgrade pip && \
