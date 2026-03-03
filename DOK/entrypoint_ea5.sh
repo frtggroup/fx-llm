@@ -285,9 +285,10 @@ dst = Path(os.environ.get('DATA_PATH', '/workspace/data/USDJPY_H1.csv'))
 
 # 方法1: S3 直接URL (最優先・高速)
 S3_ENDPOINT = os.environ.get('S3_ENDPOINT', 'https://frorit-2022.softether.net:18004')
-S3_BUCKET   = os.environ.get('S3_BUCKET',   'fxea')
-S3_PREFIX   = os.environ.get('S3_PREFIX',   'mix3')
-s3_url = f'{S3_ENDPOINT}/{S3_BUCKET}/{S3_PREFIX}/data/USDJPY_H1.csv'
+S3_BUCKET   = os.environ.get('S3_BUCKET',   'mix3')
+S3_PREFIX   = os.environ.get('S3_PREFIX',   '').rstrip('/')
+prefix_sep  = S3_PREFIX + '/' if S3_PREFIX else ''
+s3_url = f'{S3_ENDPOINT}/{S3_BUCKET}/{prefix_sep}data/USDJPY_H1.csv'
 print(f'[*] S3 から CSV 取得中: {s3_url}')
 try:
     ctx = ssl.create_default_context()
@@ -339,8 +340,8 @@ try:
     import boto3, urllib3
     urllib3.disable_warnings()
     cache_dir = pathlib.Path(os.environ.get('XLA_CACHE_DIR', '/workspace/local_xla'))
-    bucket    = os.environ.get('S3_BUCKET',  'fxea')
-    s3_prefix = os.environ.get('S3_PREFIX',  'mix3') + '/xla_cache'
+    bucket    = os.environ.get('S3_BUCKET',  'mix3')
+    s3_prefix = (os.environ.get('S3_PREFIX','').rstrip('/') + '/xla_cache').lstrip('/')
 
     # 前回同期以降に変更されたファイルのみアップロード (全件I/O競合を防止)
     marker = cache_dir / '.last_s3_sync'
@@ -407,8 +408,8 @@ try:
     urllib3.disable_warnings()
     cache_dir = pathlib.Path(os.environ.get('XLA_CACHE_DIR', '/workspace/local_xla'))
     cache_dir.mkdir(parents=True, exist_ok=True)
-    bucket    = os.environ.get('S3_BUCKET',  'fxea')
-    s3_prefix = os.environ.get('S3_PREFIX',  'mix3') + '/xla_cache/'
+    bucket    = os.environ.get('S3_BUCKET',  'mix3')
+    s3_prefix = (os.environ.get('S3_PREFIX','').rstrip('/') + '/xla_cache/').lstrip('/')
 
     def make_client():
         return boto3.client('s3',
@@ -487,8 +488,8 @@ try:
     cache_dir = pathlib.Path(os.environ['TORCHINDUCTOR_CACHE_DIR'])
     if not cache_dir.exists():
         import sys; sys.exit(0)
-    bucket    = os.environ.get('S3_BUCKET', 'fxea')
-    s3_prefix = os.environ.get('S3_PREFIX',  'mix3') + '/torch_inductor_cache'
+    bucket    = os.environ.get('S3_BUCKET', 'mix3')
+    s3_prefix = (os.environ.get('S3_PREFIX','').rstrip('/') + '/torch_inductor_cache').lstrip('/')
 
     marker    = cache_dir / '.last_s3_sync'
     last_sync = marker.stat().st_mtime if marker.exists() else 0
@@ -554,8 +555,8 @@ try:
     urllib3.disable_warnings()
     cache_dir = pathlib.Path(os.environ['TORCHINDUCTOR_CACHE_DIR'])
     cache_dir.mkdir(parents=True, exist_ok=True)
-    bucket    = os.environ.get('S3_BUCKET', 'fxea')
-    s3_prefix = os.environ.get('S3_PREFIX',  'mix3') + '/torch_inductor_cache/'
+    bucket    = os.environ.get('S3_BUCKET', 'mix3')
+    s3_prefix = (os.environ.get('S3_PREFIX','').rstrip('/') + '/torch_inductor_cache/').lstrip('/')
 
     def make_client():
         return boto3.client('s3',
@@ -659,8 +660,8 @@ try:
         aws_access_key_id=os.environ.get('S3_ACCESS_KEY',''),
         aws_secret_access_key=os.environ.get('S3_SECRET_KEY',''),
         verify=False)
-    bucket = os.environ.get('S3_BUCKET','fxea')
-    prefix = os.environ.get('S3_PREFIX',  'mix3') + '/warmup_progress/'
+    bucket = os.environ.get('S3_BUCKET','mix3')
+    prefix = (os.environ.get('S3_PREFIX','').rstrip('/') + '/warmup_progress/').lstrip('/')
     paginator = s3.get_paginator('list_objects_v2')
     count = 0
     for page in paginator.paginate(Bucket=bucket, Prefix=prefix):
@@ -699,8 +700,8 @@ try:
         aws_access_key_id=os.environ.get('S3_ACCESS_KEY',''),
         aws_secret_access_key=os.environ.get('S3_SECRET_KEY',''),
         verify=False)
-    bucket = os.environ.get('S3_BUCKET','fxea')
-    prefix = os.environ.get('S3_PREFIX',  'mix3') + '/warmup_progress'
+    bucket = os.environ.get('S3_BUCKET','mix3')
+    prefix = (os.environ.get('S3_PREFIX','').rstrip('/') + '/warmup_progress').lstrip('/')
     count = 0
     for f in pathlib.Path('/workspace').glob('xla_warmup_rank_*.json'):
         for attempt in range(5):
@@ -746,6 +747,35 @@ if [ "$DEVICE_TYPE" = "GPU" ] && [ -n "$S3_ENDPOINT" ]; then
     (while true; do sleep 3600; _inductor_cache_upload; done) &
     INDUCTOR_SYNC_PID=$!
     echo "[*] 学習中 inductor キャッシュ自動同期 開始 (60分ごと, PID: ${INDUCTOR_SYNC_PID})"
+fi
+
+# ── ログ S3 アップロード (60秒ごと) ─────────────────────────────────────────
+LOG_SHIP_PID=""
+if [ -n "$S3_ENDPOINT" ]; then
+    export _LOG_NODE_ID=$(hostname | tr -d '[:space:]')
+    _LOG_KEY="log/train_run_${_LOG_NODE_ID}.log"
+    (while true; do
+        sleep 60
+        if [ -f /workspace/train_run.log ]; then
+            python3 - <<'PYEOF' 2>/dev/null || true
+import os, boto3, urllib3
+urllib3.disable_warnings()
+ep  = os.environ.get('S3_ENDPOINT','')
+bkt = os.environ.get('S3_BUCKET','mix3')
+ak  = os.environ.get('S3_ACCESS_KEY','')
+sk  = os.environ.get('S3_SECRET_KEY','')
+nid = os.environ.get('_LOG_NODE_ID','node')
+key = f"log/train_run_{nid}.log"
+if ep and ak and sk:
+    c = boto3.client('s3', endpoint_url=ep,
+        aws_access_key_id=ak, aws_secret_access_key=sk,
+        verify=False)
+    c.upload_file('/workspace/train_run.log', bkt, key)
+PYEOF
+        fi
+    done) &
+    LOG_SHIP_PID=$!
+    echo "[*] ログ S3 自動アップロード 開始 (60秒ごと → ${S3_BUCKET:-mix3}/${_LOG_KEY}, PID: ${LOG_SHIP_PID})"
 fi
 
 # ── 自動再起動ループ ──────────────────────────────────────────────────────────

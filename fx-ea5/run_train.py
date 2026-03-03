@@ -96,9 +96,13 @@ CHECKPOINT_EVERY_N  = 5     # 件 (5試行完了ごとに保存)
 S3_ENDPOINT  = os.environ.get('S3_ENDPOINT',   '')   # 例: https://s3.isk01.sakurastorage.jp
 S3_ACCESS_KEY= os.environ.get('S3_ACCESS_KEY',  '')
 S3_SECRET_KEY= os.environ.get('S3_SECRET_KEY',  '')
-S3_BUCKET    = os.environ.get('S3_BUCKET',      'fxea')
-S3_PREFIX    = os.environ.get('S3_PREFIX',      'mix3')  # fx-ea5 専用フォルダ
+S3_BUCKET    = os.environ.get('S3_BUCKET',      'mix3')
+S3_PREFIX    = os.environ.get('S3_PREFIX',      '').rstrip('/')   # mix3バケット直接使用
 S3_ENABLED   = bool(S3_ENDPOINT and S3_ACCESS_KEY and S3_SECRET_KEY)
+
+def _s3_key(key: str) -> str:
+    """S3_PREFIX が空でも正しいキーを返す"""
+    return f'{S3_PREFIX}/{key}' if S3_PREFIX else key
 
 # ── Google Drive: 完全無効 (S3 のみ使用) ─────────────────────────────────────
 import gdrive as _gdrive
@@ -130,7 +134,8 @@ def remote_list_top100_keys() -> list[str]:
     """top100_* 以下の全ファイル相対パス一覧 (S3 のみ)"""
     if S3_ENABLED:
         raw = s3_list_keys('top100_')
-        return [k[len(S3_PREFIX)+1:] for k in raw]
+        strip_len = len(S3_PREFIX) + 1 if S3_PREFIX else 0
+        return [k[strip_len:] for k in raw]
     return []
 
 
@@ -374,7 +379,7 @@ def s3_upload(local_path: Path, s3_key: str) -> bool:
     max_retries = 3   # 5→3 (S3停止時の最大待機: 1+2+4=7秒)
     for attempt in range(max_retries):
         try:
-            client.upload_file(str(local_path), S3_BUCKET, f'{S3_PREFIX}/{s3_key}')
+            client.upload_file(str(local_path), S3_BUCKET, _s3_key(s3_key))
             return True
         except Exception as e:
             if attempt < max_retries - 1:
@@ -394,7 +399,7 @@ def s3_download(s3_key: str, local_path: Path) -> bool:
         return False
     try:
         local_path.parent.mkdir(parents=True, exist_ok=True)
-        _s3_client().download_file(S3_BUCKET, f'{S3_PREFIX}/{s3_key}',
+        _s3_client().download_file(S3_BUCKET, _s3_key(s3_key),
                                    str(local_path))
         return True
     except Exception as e:
@@ -439,7 +444,7 @@ def s3_ensure_public_policy() -> bool:
 
 def s3_public_url(s3_key: str) -> str:
     """期限なし直接URL を返す (バケットポリシーで public-read 設定済みが前提)。"""
-    return f'{S3_ENDPOINT}/{S3_BUCKET}/{S3_PREFIX}/{s3_key}'
+    return f'{S3_ENDPOINT}/{S3_BUCKET}/{_s3_key(s3_key)}'
 
 
 def s3_list_keys(prefix: str = '') -> list:
@@ -447,7 +452,7 @@ def s3_list_keys(prefix: str = '') -> list:
     if _s3_time_skewed:
         return []
     try:
-        full_prefix = f'{S3_PREFIX}/{prefix}' if prefix else S3_PREFIX + '/'
+        full_prefix = _s3_key(prefix) + '/' if prefix else (_s3_key('') + '/').lstrip('/')
         paginator = _s3_client().get_paginator('list_objects_v2')
         keys = []
         for page in paginator.paginate(Bucket=S3_BUCKET, Prefix=full_prefix):
@@ -469,8 +474,9 @@ def s3_node_key(name: str) -> str:
 def s3_list_node_keys(glob_prefix: str) -> list[str]:
     """全ノードの同種ファイル一覧 (例: glob_prefix='results_') → ['results_h100.json', 'results_gtx1080ti.json']"""
     all_keys = s3_list_keys('')
-    prefix_full = f'{S3_PREFIX}/{glob_prefix}'
-    return [k[len(S3_PREFIX)+1:] for k in all_keys if k.startswith(prefix_full)]
+    prefix_full = _s3_key(glob_prefix)
+    strip_len   = len(S3_PREFIX) + 1 if S3_PREFIX else 0
+    return [k[strip_len:] for k in all_keys if k.startswith(prefix_full)]
 
 TOP_N              = 100
 RANDOM_PHASE_LIMIT = 30     # この件数までは純ランダム、以降は 10分交互モード
@@ -2175,8 +2181,8 @@ def main():
     if S3_ENABLED:
         try:
             cl = _s3_client()
-            cl.put_object(Bucket=S3_BUCKET, Key=f'{S3_PREFIX}/.ping', Body=b'ok')
-            cl.delete_object(Bucket=S3_BUCKET, Key=f'{S3_PREFIX}/.ping')
+            cl.put_object(Bucket=S3_BUCKET, Key=_s3_key('.ping'), Body=b'ok')
+            cl.delete_object(Bucket=S3_BUCKET, Key=_s3_key('.ping'))
             print('  [S3] 接続テスト OK ✅')
         except Exception as e:
             print(f'  [S3] 接続テスト 失敗 ❌: {e}')

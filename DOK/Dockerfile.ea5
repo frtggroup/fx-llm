@@ -34,8 +34,8 @@ ENV DEBIAN_FRONTEND=noninteractive \
     S3_ENDPOINT=https://frorit-2022.softether.net:18004 \
     S3_REGION=us-east-1 \
     S3_ACCESS_KEY=mioroot \
-    S3_BUCKET=fxea \
-    S3_PREFIX=mix3
+    S3_BUCKET=mix3 \
+    S3_PREFIX=
 
 ENV S3_SECRET_KEY="Yakrty1484!#"
 
