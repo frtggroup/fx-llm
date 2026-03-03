@@ -730,7 +730,10 @@ def train(args, X_tr, y_tr, X_te, y_te, mean, std, n_feat=None, _spawn_rank=None
     # reduce-overhead: CUDA graph で Python ループオーバーヘッドをゼロ化 (数秒でコンパイル)
     # max-autotune: Triton kernel 最適化 + CUDA graph (長時間学習で元を取る H100 専用)
     if dev_type == 'cuda' and not _is_worker:
-        _step_mode = 'max-autotune' if is_h100 else 'reduce-overhead'
+        _is_workerpool = bool(os.environ.get('_FX_WORKERPOOL'))
+        # WorkerPool ワーカー: reduce-overhead (CUDA graph, Triton検索なし → 数秒でコンパイル)
+        # 非ワーカー (長時間最終学習): max-autotune (Triton最適化, 数分かかるが元を取る)
+        _step_mode = 'reduce-overhead' if _is_workerpool else ('max-autotune' if is_h100 else 'reduce-overhead')
         # dynamo インメモリキャッシュ上限を拡張 (デフォルト8 → 64)
         # 同一プロセスで複数アーキテクチャを試す場合にキャッシュが溢れて再コンパイルされるのを防ぐ
         try:
