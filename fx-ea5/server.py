@@ -140,7 +140,7 @@ def _s3_trial_rank(results: list, trial_no: int) -> int:
     return 0
 
 WORKSPACE      = Path('/workspace')
-AI_EA_DIR      = WORKSPACE / 'fx-ea3'
+AI_EA_DIR      = WORKSPACE / 'fx-ea5'
 PROGRESS_JSON  = AI_EA_DIR / 'progress.json'
 ALL_RESULTS    = AI_EA_DIR / 'all_results.json'
 TOP_DIR        = AI_EA_DIR / 'top100'

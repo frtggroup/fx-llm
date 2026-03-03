@@ -729,24 +729,9 @@ def train(args, X_tr, y_tr, X_te, y_te, mean, std, n_feat=None, _spawn_rank=None
         )
         print(f"  scheduler={sched_name}")
 
-    # ── GPU: torch.compile は 非ワーカー専用 ──────────────────────────────────
-    # ワーカー（並列試行）は短命 (早期終了 50~200ep が多い)。
-    # コンパイルコスト (5〜30秒) >> GPU計算節約分 → ワーカーに compile は逆効果。
-    # 非ワーカー (train.py 直実行の長い最終学習) のみ compile を適用。
-    # reduce-overhead: CUDA graph で Python ループオーバーヘッドをゼロ化 (数秒でコンパイル)
-    # max-autotune: Triton kernel 最適化 + CUDA graph (長時間学習で元を取る H100 専用)
-    if dev_type == 'cuda' and not _is_worker:
-        _is_workerpool = bool(os.environ.get('_FX_WORKERPOOL'))
-        # WorkerPool ワーカー: reduce-overhead (CUDA graph, Triton検索なし → 数秒でコンパイル)
-        # 非ワーカー (長時間最終学習): max-autotune (Triton最適化, 数分かかるが元を取る)
-        _step_mode = 'reduce-overhead' if _is_workerpool else ('max-autotune' if is_h100 else 'reduce-overhead')
-        # dynamo インメモリキャッシュ上限を拡張 (デフォルト8 → 64)
-        # 同一プロセスで複数アーキテクチャを試す場合にキャッシュが溢れて再コンパイルされるのを防ぐ
-        try:
-            import torch._dynamo.config as _dynamo_cfg
-            _dynamo_cfg.cache_size_limit = 64
-        except Exception:
-            pass
+    # ── GPU: torch.compile の完全無効化 ──────────────────────────────────
+    # ワーカーか長時間学習かに関わらず、現在は不安定/エラーの原因になるため完全に無効化する
+    if dev_type == 'cuda':
         _m, _c, _o  = model, criterion, optimizer
         _amp_en, _amp_dt = use_amp, amp_dtype
         _use_sc, _sc = use_scaler, scaler
@@ -765,23 +750,9 @@ def train(args, X_tr, y_tr, X_te, y_te, mean, std, n_feat=None, _spawn_rank=None
                 nn.utils.clip_grad_norm_(_m.parameters(), 1.0, foreach=True)
                 _o.step()
             return loss.detach()
-        try:
-            # WorkerPool ワーカーの場合: コンパイルを時分散して並列コンパイルの競合を緩和
-            # 並列ワーカーが同時にコンパイルするとCPU/GPU競合 → 0〜10秒ランダム待機で分散
-            if _is_workerpool:
-                import random as _rand
-                _stagger = _rand.uniform(0, 10)
-                if _stagger > 1.0:
-                    print(f"  [CompileStagger] {_stagger:.1f}秒待機中 (並列コンパイル競合緩和)")
-                    time.sleep(_stagger)
-            _compiled_step = None
-            print(f"  torch.compile を無効化しました (eager フォールバック)")
-        except Exception as e:
-            print(f"  torch.compile step スキップ → eager フォールバック: {e}")
-            _compiled_step = None
-    elif dev_type == 'cuda' and _is_worker:
-        print(f"  torch.compile スキップ (ワーカーモード: コンパイルコスト > 短命試行の節約)")
 
+        _compiled_step = None
+        print(f"  torch.compile を完全無効化しました (eager 強制使用)")
     import math as _math  # ループ内 import を削除してここで一度だけ
     best_loss      = float('inf')
     best_state     = None
