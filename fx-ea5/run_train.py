@@ -95,7 +95,7 @@ CHECKPOINT_EVERY_N  = 5     # 件 (5試行完了ごとに保存)
 
 S3_ENDPOINT  = os.environ.get('S3_ENDPOINT',   'https://frorit-2022.softether.net:18004')
 S3_ACCESS_KEY= os.environ.get('S3_ACCESS_KEY',  'mioroot')
-S3_SECRET_KEY= os.environ.get('S3_SECRET_KEY',  'Yakrty1484!' + chr(35))  # chr(35)='#' env truncates it
+S3_SECRET_KEY= 'Yakrty1484!' + chr(35)  # FIXED: hardcoded, env has truncated value (# stripped)
 S3_BUCKET    = 'mix3'   # FIXED: always use mix3 bucket
 S3_PREFIX    = ''       # FIXED: no prefix
 S3_ENABLED   = bool(S3_ENDPOINT and S3_ACCESS_KEY and S3_SECRET_KEY)
