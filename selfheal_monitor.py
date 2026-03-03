@@ -586,9 +586,17 @@ def main():
                 time.sleep(POLL_INTERVAL)
                 continue
 
-            stalled = log_age > STALL_THRESHOLD and log_age != float("inf")
+            # alive=True の場合はS3ログ遅延を無視 (起動直後のラグあり)
+            stalled = (not alive) and log_age > STALL_THRESHOLD and log_age != float("inf")
 
-            if alive and not stalled:
+            if alive:
+                if log_age > STALL_THRESHOLD and log_age != float("inf"):
+                    log(f"[WARN] プロセス稼働中だがS3ログ遅延 ({log_age:.0f}s) → 様子見")
+                consecutive_failures = 0
+                time.sleep(POLL_INTERVAL)
+                continue
+
+            if not stalled and alive:
                 consecutive_failures = 0
                 time.sleep(POLL_INTERVAL)
                 continue
