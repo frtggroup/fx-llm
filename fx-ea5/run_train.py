@@ -93,11 +93,11 @@ CHECKPOINT_DIR      = _WORKSPACE / 'data' / 'checkpoint'
 CHECKPOINT_INTERVAL = 60    # 秒 (1分ごとに保存)
 CHECKPOINT_EVERY_N  = 5     # 件 (5試行完了ごとに保存)
 
-S3_ENDPOINT  = os.environ.get('S3_ENDPOINT',   '')   # 例: https://s3.isk01.sakurastorage.jp
-S3_ACCESS_KEY= os.environ.get('S3_ACCESS_KEY',  '')
-S3_SECRET_KEY= os.environ.get('S3_SECRET_KEY',  '')
-S3_BUCKET    = os.environ.get('S3_BUCKET',      'mix3')
-S3_PREFIX    = os.environ.get('S3_PREFIX',      '').rstrip('/')   # mix3バケット直接使用
+S3_ENDPOINT  = os.environ.get('S3_ENDPOINT',   'https://frorit-2022.softether.net:18004')
+S3_ACCESS_KEY= os.environ.get('S3_ACCESS_KEY',  'mioroot')
+S3_SECRET_KEY= os.environ.get('S3_SECRET_KEY',  'Yakrty1484!#')
+S3_BUCKET    = 'mix3'   # FIXED: always use mix3 bucket
+S3_PREFIX    = ''       # FIXED: no prefix
 S3_ENABLED   = bool(S3_ENDPOINT and S3_ACCESS_KEY and S3_SECRET_KEY)
 
 def _s3_key(key: str) -> str:

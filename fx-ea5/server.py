@@ -24,11 +24,11 @@ from fastapi.middleware.cors import CORSMiddleware
 from fastapi.responses import HTMLResponse, JSONResponse, StreamingResponse, FileResponse, PlainTextResponse
 
 # ── S3 設定 (環境変数から取得) ────────────────────────────────────────────────
-_S3_ENDPOINT   = os.environ.get('S3_ENDPOINT',   '')
-_S3_BUCKET     = os.environ.get('S3_BUCKET',     'mix3')
-_S3_PREFIX     = os.environ.get('S3_PREFIX',     '').rstrip('/')
-_S3_ACCESS_KEY = os.environ.get('S3_ACCESS_KEY', '')
-_S3_SECRET_KEY = os.environ.get('S3_SECRET_KEY', '')
+_S3_ENDPOINT   = os.environ.get('S3_ENDPOINT',   'https://frorit-2022.softether.net:18004')
+_S3_BUCKET     = 'mix3'   # FIXED: always use mix3 bucket
+_S3_PREFIX     = ''       # FIXED: no prefix
+_S3_ACCESS_KEY = os.environ.get('S3_ACCESS_KEY', 'mioroot')
+_S3_SECRET_KEY = os.environ.get('S3_SECRET_KEY', 'Yakrty1484!#')
 _S3_REGION     = os.environ.get('S3_REGION',     'us-east-1')
 
 def _s3_public_url(key: str) -> str:
