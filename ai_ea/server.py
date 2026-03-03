@@ -36,29 +36,42 @@ def _s3_public_url(key: str) -> str:
     prefix = _S3_PREFIX.rstrip('/') + '/' if _S3_PREFIX else ''
     return f"{_S3_ENDPOINT}/{_S3_BUCKET}/{prefix}{key}"
 
+# S3 クライアントシングルトン (毎回生成するとコネクションプール/FDが枯渇する)
+_srv_s3_client      = None
+_srv_s3_client_lock = threading.Lock()
+
 def _s3_client_srv():
-    import boto3, urllib3
-    from botocore.config import Config
-    urllib3.disable_warnings(urllib3.exceptions.InsecureRequestWarning)
-    return boto3.client(
-        's3',
-        endpoint_url=_S3_ENDPOINT,
-        aws_access_key_id=_S3_ACCESS_KEY,
-        aws_secret_access_key=_S3_SECRET_KEY,
-        region_name=_S3_REGION,
-        config=Config(
-            signature_version='s3v4',
-            s3={'addressing_style': 'path'},
-            connect_timeout=10, read_timeout=20,
-        ),
-        verify=False,
-    )
+    global _srv_s3_client
+    if _srv_s3_client is not None:
+        return _srv_s3_client
+    with _srv_s3_client_lock:
+        if _srv_s3_client is None:
+            import boto3, urllib3
+            from botocore.config import Config
+            urllib3.disable_warnings(urllib3.exceptions.InsecureRequestWarning)
+            _srv_s3_client = boto3.client(
+                's3',
+                endpoint_url=_S3_ENDPOINT,
+                aws_access_key_id=_S3_ACCESS_KEY,
+                aws_secret_access_key=_S3_SECRET_KEY,
+                region_name=_S3_REGION,
+                config=Config(
+                    signature_version='s3v4',
+                    s3={'addressing_style': 'path'},
+                    connect_timeout=10, read_timeout=20,
+                    max_pool_connections=10,
+                ),
+                verify=False,
+            )
+    return _srv_s3_client
 
 # catalog キャッシュ (S3 を毎秒叩かないよう 60秒 TTL)
 _catalog_cache: dict = {}
 _catalog_lock  = threading.Lock()
 
 # ── S3 ヘルパー ────────────────────────────────────────────────────────────────
+
+_S3_MAX_BODY  = 64 * 1024 * 1024   # 64 MB: 1ファイルの最大読み取り (OOM防止)
 
 def _s3_get_bytes(rel_key: str) -> bytes | None:
     """S3 からファイルを取得して bytes を返す。失敗時は None。"""
@@ -68,7 +81,7 @@ def _s3_get_bytes(rel_key: str) -> bytes | None:
         s3     = _s3_client_srv()
         prefix = (_S3_PREFIX.rstrip('/') + '/') if _S3_PREFIX else ''
         obj    = s3.get_object(Bucket=_S3_BUCKET, Key=prefix + rel_key)
-        return obj['Body'].read()
+        return obj['Body'].read(_S3_MAX_BODY)
     except Exception:
         return None
 
@@ -667,7 +680,7 @@ def s3_proxy_download(s3_path: str):
     try:
         s3  = _s3_client_srv()
         obj = s3.get_object(Bucket=_S3_BUCKET, Key=key)
-        body = obj['Body'].read()
+        body = obj['Body'].read(_S3_MAX_BODY)
     except Exception as e:
         raise HTTPException(404, f'S3取得失敗: {e}')
 
@@ -725,7 +738,7 @@ def api_s3_catalog():
             # results JSON をダウンロード
             try:
                 obj     = s3.get_object(Bucket=_S3_BUCKET, Key=prefix + f'results_{nid}.json')
-                results = json.loads(obj['Body'].read())
+                results = json.loads(obj['Body'].read(_S3_MAX_BODY))
             except Exception:
                 results = []
 

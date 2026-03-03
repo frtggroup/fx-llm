@@ -28,6 +28,42 @@ def _unhandled_exception(exc_type, exc_value, exc_tb):
 
 sys.excepthook = _unhandled_exception
 
+# ── stdout/stderr パイプ保護 (tee が死んでも BrokenPipeError でクラッシュしない) ──
+class _PipeSafeWriter:
+    """BrokenPipeError / OSError を吸収し、ログファイルにフォールバックする wrapper"""
+    def __init__(self, stream, fallback_path):
+        self._stream = stream
+        try:
+            self._fb = open(fallback_path, 'a', buffering=1, encoding='utf-8', errors='replace')
+        except Exception:
+            self._fb = None
+    def write(self, data):
+        try:
+            return self._stream.write(data)
+        except (BrokenPipeError, OSError):
+            try:
+                if self._fb:
+                    return self._fb.write(data)
+            except Exception:
+                pass
+            return 0
+    def flush(self):
+        try:
+            self._stream.flush()
+        except (BrokenPipeError, OSError):
+            pass
+        try:
+            if self._fb:
+                self._fb.flush()
+        except Exception:
+            pass
+    def __getattr__(self, name):
+        return getattr(self._stream, name)
+
+_fallback_log = str(_CRASH_LOG.parent / 'train_stdout_fallback.log')
+sys.stdout = _PipeSafeWriter(sys.stdout, _fallback_log)
+sys.stderr = _PipeSafeWriter(sys.stderr, _fallback_log)
+
 # リモートアップロードの同時実行を1に制限 (並列スレッドによるヒープ破壊防止)
 _remote_upload_sem = threading.Semaphore(1)
 
