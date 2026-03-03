@@ -521,6 +521,7 @@ def main():
 
     heal_count = 0
     consecutive_failures = 0
+    loading_since = None   # loading 開始時刻 (outbid 検出用)
 
     while True:
         try:
@@ -540,10 +541,31 @@ def main():
 
             # ── 3. インスタンス自体が異常なら対処 ────────────────────────────
             if inst_status == "loading":
-                # ロード中は正常 → ただし outbid 検出は wait_for_instance_ssh に任せる
-                log(f"[WAIT] インスタンスloading中 → 待機")
+                if loading_since is None:
+                    loading_since = time.time()
+                loading_elapsed = time.time() - loading_since
+                log(f"[WAIT] インスタンスloading中 ({loading_elapsed:.0f}秒) → 待機")
+
+                # 10分以上 loading → outbid 対処
+                if loading_elapsed > 600:
+                    log(f"[OUTBID] loading {loading_elapsed:.0f}秒超 → bid引き上げ試行")
+                    if VAST_INSTANCE_ID and inst:
+                        recovered = try_raise_bid(VAST_INSTANCE_ID)
+                        if recovered:
+                            loading_since = None
+                            time.sleep(POLL_INTERVAL)
+                            continue
+                    log("[OUTBID] bid引き上げ失敗 → 新インスタンス作成")
+                    heal_count += 1
+                    restart_vast_instance()
+                    loading_since = None
+                    time.sleep(60)
+                    ensure_training_running()
+
                 time.sleep(POLL_INTERVAL)
                 continue
+            else:
+                loading_since = None  # loading 以外になったらリセット
 
             if inst_status in ("exited", "stopped", "none"):
                 log(f"[!] インスタンス状態異常: {inst_status} → 再起動")
