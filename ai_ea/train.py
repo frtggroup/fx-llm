@@ -652,25 +652,12 @@ def train(args, X_tr, y_tr, X_te, y_te, mean, std, n_feat=None, _spawn_rank=None
                                     drop_last=tpu_drop_last)
         model = _build_and_place()
 
-    # torch.compile: 全GPU対象 (H100非ワーカー=max-autotune, それ以外=default)
+    # torch.compile は optimizer 作成後に step 関数ごとコンパイル (↓ scheduler 作成後に実施)
     # TPU: lazy eval (tracing mode) が既に最適 → torch.compile 不使用
     model_for_export = model
-    _is_worker = bool(getattr(args, 'out_dir', ''))
-    if dev_type == 'cuda':
-        compile_mode = 'max-autotune' if (is_h100 and not _is_worker) else 'default'
-        try:
-            compiled_model = torch.compile(model, mode=compile_mode)
-            print(f"  torch.compile({compile_mode}) 有効 → ウォームアップ実行中...")
-            _wup_x, _wup_y = next(iter(tr_dl))
-            with torch.amp.autocast(_amp_backend, enabled=use_amp, dtype=amp_dtype):
-                _ = compiled_model(_wup_x)
-            del _wup_x, _wup_y
-            torch.cuda.synchronize()
-            print(f"  torch.compile ウォームアップ完了")
-            model = compiled_model
-        except Exception as e:
-            print(f"  torch.compile スキップ: {e}")
-    elif is_tpu:
+    _is_worker    = bool(getattr(args, 'out_dir', ''))
+    _compiled_step = None   # GPU コンパイル済みステップ関数 (None=フォールバック)
+    if is_tpu:
         print(f"  XLA lazy eval (tracing mode) 使用")
 
     n_params = sum(p.numel() for p in model.parameters())
@@ -734,6 +721,45 @@ def train(args, X_tr, y_tr, X_te, y_te, mean, std, n_feat=None, _spawn_rank=None
         )
         print(f"  scheduler={sched_name}")
 
+    # ── GPU: step 関数全体を torch.compile → forward+backward+optimizer を1グラフ化 ──
+    # reduce-overhead モード: CUDA graph でPythonオーバーヘッドをゼロ化 (ウォームアップ後)
+    # max-autotune モード: Triton kernel auto-tuning + CUDA graph (H100 非ワーカー)
+    # scheduler.step() は Python 副作用があるため CUDA graph 外 (ループ内で明示呼び出し)
+    if dev_type == 'cuda':
+        _step_mode = 'max-autotune' if (is_h100 and not _is_worker) else 'reduce-overhead'
+        # クロージャで model / criterion / optimizer を束縛
+        _m, _c, _o  = model, criterion, optimizer
+        _amp_en, _amp_dt = use_amp, amp_dtype
+        _use_sc, _sc = use_scaler, scaler
+        def _gpu_step_fn(xb, yb):
+            _o.zero_grad(set_to_none=True)
+            with torch.amp.autocast('cuda', enabled=_amp_en, dtype=_amp_dt):
+                loss = _c(_m(xb), yb)
+            if _use_sc and _sc is not None:
+                _sc.scale(loss).backward()
+                _sc.unscale_(_o)
+                nn.utils.clip_grad_norm_(_m.parameters(), 1.0, foreach=True)
+                _sc.step(_o)
+                _sc.update()
+            else:
+                loss.backward()
+                nn.utils.clip_grad_norm_(_m.parameters(), 1.0, foreach=True)
+                _o.step()
+            return loss.detach()
+        try:
+            _compiled_step = torch.compile(_gpu_step_fn, mode=_step_mode)
+            print(f"  torch.compile({_step_mode}) step 有効 → CUDA graph ウォームアップ中...")
+            _wup_x, _wup_y = next(iter(tr_dl))
+            for _ in range(3):   # CUDA graph capture 用ウォームアップ (3回必要)
+                _compiled_step(_wup_x, _wup_y)
+            torch.cuda.synchronize()
+            del _wup_x, _wup_y
+            print(f"  torch.compile({_step_mode}) ウォームアップ完了 (CUDA graph キャプチャ済)")
+        except Exception as e:
+            print(f"  torch.compile step スキップ → eager フォールバック: {e}")
+            _compiled_step = None
+
+    import math as _math  # ループ内 import を削除してここで一度だけ
     best_loss      = float('inf')
     best_state     = None
     warmup_end     = max(20, int(args.epochs * 0.05))  # 5% warmup
@@ -828,15 +854,24 @@ def train(args, X_tr, y_tr, X_te, y_te, mean, std, n_feat=None, _spawn_rank=None
                 xm.mark_step()  # optimizer.step() lazy ops を即 flush (次エポックへ蓄積防止)
                 t_loss = t_loss_acc.item()  # sync (グラフ完了待ち)
             else:
-                for xb, yb in tr_dl:
-                    loss = _train_step(model, xb, yb,
-                                       optimizer, criterion, scheduler, scaler,
-                                       use_amp, amp_dtype, use_scaler,
-                                       _amp_backend, is_tpu, _spmd_mode,
-                                       do_sched=True)
-                    t_loss_sum += loss.item()
-                    t_steps += 1
-                t_loss = t_loss_sum / max(1, t_steps)
+                if _compiled_step is not None:
+                    # CUDA graph replay: Python ループはデータコピーのみ、GPU同期なし
+                    _t_loss_acc = torch.zeros(1, device=device)
+                    for xb, yb in tr_dl:
+                        _t_loss_acc += _compiled_step(xb, yb)  # GPU 側蓄積、sync なし
+                        scheduler.step()                        # Python-side LR 更新のみ
+                        t_steps += 1
+                    t_loss = (_t_loss_acc / max(1, t_steps)).item()  # エポック 1回 sync
+                else:
+                    for xb, yb in tr_dl:
+                        loss = _train_step(model, xb, yb,
+                                           optimizer, criterion, scheduler, scaler,
+                                           use_amp, amp_dtype, use_scaler,
+                                           _amp_backend, is_tpu, _spmd_mode,
+                                           do_sched=True)
+                        t_loss_sum += loss.item()
+                        t_steps += 1
+                    t_loss = t_loss_sum / max(1, t_steps)
 
             if is_tpu and not _xla_compiled and epoch == 1:
                 _xla_compiled = True
@@ -892,7 +927,6 @@ def train(args, X_tr, y_tr, X_te, y_te, mean, std, n_feat=None, _spawn_rank=None
         gap = v_loss - t_loss   # 過学習ギャップ
 
         # ── NaN/Inf 発散検出: BF16 gradient 爆発で loss=nan になる場合を即終了 ──
-        import math as _math
         if _math.isnan(t_loss) or _math.isinf(t_loss):
             _nan_count += 1
             if _nan_count >= 3:
