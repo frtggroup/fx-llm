@@ -299,7 +299,8 @@ def get_log_last_modified_age() -> float:
 # ── 学習状態確認 ──────────────────────────────────────────────────────────────
 def is_training_alive() -> tuple:
     """run_train.py プロセスが生きているか確認"""
-    code, out = ssh("pgrep -af run_train.py | head -5", timeout=20)
+    # "python.*run_train" に限定して pgrep 自身が引っかかる誤検知を防ぐ
+    code, out = ssh("pgrep -af 'python.*run_train' | head -5", timeout=20)
     if code == 0 and "run_train" in out:
         return True, out
     return False, out
