@@ -1550,11 +1550,40 @@ class WorkerPool:
             self._executor.shutdown(wait=False, cancel_futures=True)
         except Exception:
             pass
-        # ゾンビワーカーを強制終了
+        # ゾンビワーカーを強制終了 (os.killpg は自プロセスも巻き込むため個別 kill を使う)
+        my_pgid = os.getpgid(os.getpid()) if platform.system() != 'Windows' else None
         for pid in old_pids:
             try:
-                _kill_with_group(pid)
-                print(f"  [WorkerPool] ゾンビワーカー PID={pid} グループごと KILL")
+                if platform.system() != 'Windows':
+                    try:
+                        pgid = os.getpgid(pid)
+                    except (ProcessLookupError, OSError):
+                        pgid = None
+                    if pgid and pgid != my_pgid:
+                        # 別プロセスグループなら killpg で安全に kill
+                        try:
+                            os.killpg(pgid, signal.SIGTERM)
+                            time.sleep(1)
+                            os.killpg(pgid, signal.SIGKILL)
+                        except (ProcessLookupError, OSError):
+                            pass
+                    else:
+                        # 同じプロセスグループ (自プロセス含む) → 個別 kill のみ
+                        try:
+                            os.kill(pid, signal.SIGTERM)
+                        except (ProcessLookupError, OSError):
+                            pass
+                        time.sleep(1)
+                        try:
+                            os.kill(pid, signal.SIGKILL)
+                        except (ProcessLookupError, OSError):
+                            pass
+                else:
+                    try:
+                        os.kill(pid, signal.SIGKILL)
+                    except (ProcessLookupError, OSError):
+                        pass
+                print(f"  [WorkerPool] ゾンビワーカー PID={pid} KILL")
             except Exception:
                 pass
         # 壊れた futures / meta を破棄
@@ -2268,7 +2297,7 @@ def main():
                         tmp_path = pathlib.Path(tmp.name)
                     with zipfile.ZipFile(tmp_path, 'w', zipfile.ZIP_DEFLATED, compresslevel=1) as zf:
                         zf.write(str(f), f.name)
-                    client.upload_file(str(tmp_path), S3_BUCKET, f'{S3_PREFIX}/{s3_key}' if S3_PREFIX else s3_key)
+                    client.upload_file(str(tmp_path), S3_BUCKET, s3_key)
                     done += 1
                 except Exception as e:
                     print(f'  [INDUCTOR] upload失敗 {f.name}: {e}')
@@ -2285,7 +2314,7 @@ def main():
             """S3 にあってローカルにないファイルをダウンロード・解凍"""
             cache_dir.mkdir(parents=True, exist_ok=True)
             client = _s3_client()
-            prefix_key = (f'{S3_PREFIX}/{s3_prefix}/' if S3_PREFIX else f'{s3_prefix}/')
+            prefix_key = f'{s3_prefix}/'
             try:
                 paginator = client.get_paginator('list_objects_v2')
                 tasks = []
