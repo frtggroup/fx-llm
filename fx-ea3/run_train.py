@@ -268,7 +268,7 @@ def _auto_gpu_config(node_id: str) -> tuple[str, float, float, int]:
     elif total_gb >=  14: tier = 'small'
     else:                 tier = 'micro'
 
-    vpt_map = {'xlarge': 6.0, 'large': 6.0, 'medium': 5.0, 'small': 5.0, 'micro': 4.0}
+    vpt_map = {'xlarge': 3.0, 'large': 4.0, 'medium': 4.0, 'small': 4.0, 'micro': 3.5}
     vpt = vpt_map[tier]
     par = max(1, int(total_gb * 0.85 / vpt))
 
