@@ -538,7 +538,13 @@ def main():
                 f"heals={heal_count}")
             log(f"  mix3 objects: {obj_count}")
 
-            # ── 3. インスタンス自体が異常なら再起動 ──────────────────────────
+            # ── 3. インスタンス自体が異常なら対処 ────────────────────────────
+            if inst_status == "loading":
+                # ロード中は正常 → ただし outbid 検出は wait_for_instance_ssh に任せる
+                log(f"[WAIT] インスタンスloading中 → 待機")
+                time.sleep(POLL_INTERVAL)
+                continue
+
             if inst_status in ("exited", "stopped", "none"):
                 log(f"[!] インスタンス状態異常: {inst_status} → 再起動")
                 heal_count += 1
