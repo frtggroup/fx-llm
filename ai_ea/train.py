@@ -760,6 +760,14 @@ def train(args, X_tr, y_tr, X_te, y_te, mean, std, n_feat=None, _spawn_rank=None
                 _o.step()
             return loss.detach()
         try:
+            # WorkerPool ワーカーの場合: コンパイルを時分散して並列コンパイルの競合を緩和
+            # 57並列ワーカーが同時にコンパイルするとCPU/GPU競合 → 0〜60秒ランダム待機で分散
+            if _is_workerpool:
+                import random as _rand
+                _stagger = _rand.uniform(0, 60)
+                if _stagger > 1.0:
+                    print(f"  [CompileStagger] {_stagger:.1f}秒待機中 (並列コンパイル競合緩和)")
+                    time.sleep(_stagger)
             _compiled_step = torch.compile(_gpu_step_fn, mode=_step_mode)
             print(f"  torch.compile({_step_mode}) step 有効 → CUDA graph ウォームアップ中...")
             _wup_x, _wup_y = next(iter(tr_dl))
