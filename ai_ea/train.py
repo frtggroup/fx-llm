@@ -566,15 +566,20 @@ def train(args, X_tr, y_tr, X_te, y_te, mean, std, n_feat=None, _spawn_rank=None
         gpu_name = torch.cuda.get_device_name(0)
         cc       = torch.cuda.get_device_capability(0)
         print(f"  GPU: {gpu_name}  CC={cc[0]}.{cc[1]}")
+        torch.set_float32_matmul_precision('high')   # TF32 matmul グローバル有効化 (Ampere+)
         torch.backends.cudnn.benchmark    = True
         torch.backends.cudnn.deterministic = False
         if cc[0] >= 8:
             torch.backends.cuda.matmul.allow_tf32 = True
             torch.backends.cudnn.allow_tf32       = True
+            amp_dtype = torch.bfloat16              # A100+ (CC8+) は BF16 ネイティブ対応
+            torch.backends.cuda.enable_flash_sdp(True)           # Flash Attention 有効化
+            torch.backends.cuda.enable_mem_efficient_sdp(True)   # メモリ効率 SDP 有効化
         if cc[0] >= 9:
             is_h100   = True
-            amp_dtype = torch.bfloat16
-            print(f"  H100 モード: BF16 + TF32 + torch.compile 有効")
+            print(f"  H100 モード: BF16 + TF32 + Flash SDP + torch.compile(max-autotune) 有効")
+        elif cc[0] >= 8:
+            print(f"  A100 モード: BF16 + TF32 + Flash SDP + torch.compile 有効")
         else:
             print(f"  FP16 AMP モード")
     elif is_tpu:
@@ -647,11 +652,12 @@ def train(args, X_tr, y_tr, X_te, y_te, mean, std, n_feat=None, _spawn_rank=None
                                     drop_last=tpu_drop_last)
         model = _build_and_place()
 
-    # torch.compile: GPU (H100) は max-autotune、TPU は openxla バックエンドで最適化
+    # torch.compile: 全GPU対象 (H100非ワーカー=max-autotune, それ以外=default)
+    # TPU: lazy eval (tracing mode) が既に最適 → torch.compile 不使用
     model_for_export = model
     _is_worker = bool(getattr(args, 'out_dir', ''))
-    if is_h100 and not _is_worker and not is_tpu:
-        compile_mode = 'max-autotune'
+    if dev_type == 'cuda':
+        compile_mode = 'max-autotune' if (is_h100 and not _is_worker) else 'default'
         try:
             compiled_model = torch.compile(model, mode=compile_mode)
             print(f"  torch.compile({compile_mode}) 有効 → ウォームアップ実行中...")
@@ -665,14 +671,7 @@ def train(args, X_tr, y_tr, X_te, y_te, mean, std, n_feat=None, _spawn_rank=None
         except Exception as e:
             print(f"  torch.compile スキップ: {e}")
     elif is_tpu:
-        # TPU: lazy eval (tracing mode) が既に最適
-        # torch.compile(model, backend='openxla') はforward だけコンパイルし
-        # backward/optimizer との graph break で逆に遅くなる → 使用しない
-        # 正しい使い方は torch_xla.compile(step_fn, full_graph=True) だが
-        # 現状の lazy eval (xm.optimizer_step で全グラフを一括 mark_step) が同等以上
         print(f"  XLA lazy eval (tracing mode) 使用")
-    elif is_h100 and _is_worker:
-        print(f"  torch.compile スキップ (並列ワーカーモード: 探索優先)")
 
     n_params = sum(p.numel() for p in model.parameters())
     ratio    = len(X_tr) / max(n_params, 1)
@@ -691,8 +690,16 @@ def train(args, X_tr, y_tr, X_te, y_te, mean, std, n_feat=None, _spawn_rank=None
             optimizer = torch.optim.AdamW(model.parameters(), lr=args.lr, weight_decay=wd)
             print(f"  syncfree.AdamW 未対応 → 標準 AdamW 使用")
     else:
-        optimizer = torch.optim.AdamW(model.parameters(), lr=args.lr,
-                                      weight_decay=wd)
+        try:
+            # fused=True: 単一CUDAカーネルで optimizer step → 5-10% 高速化 (PyTorch 2.0+)
+            optimizer = torch.optim.AdamW(model.parameters(), lr=args.lr,
+                                          weight_decay=wd,
+                                          fused=(dev_type == 'cuda'))
+            if dev_type == 'cuda':
+                print(f"  AdamW(fused=True) 有効")
+        except TypeError:
+            optimizer = torch.optim.AdamW(model.parameters(), lr=args.lr,
+                                          weight_decay=wd)
     dtype_str = 'BF16' if amp_dtype == torch.bfloat16 else 'FP16'
     print(f"  AMP({dtype_str})={'ON' if use_amp else 'OFF'}  GradScaler={'ON' if use_scaler else 'OFF (BF16不要)'}")
 
@@ -817,7 +824,8 @@ def train(args, X_tr, y_tr, X_te, y_te, mean, std, n_feat=None, _spawn_rank=None
                     _coef    = (1.0 / _total).clamp(max=1.0)
                     for _g in _grads:
                         _g.mul_(_coef)
-                xm.optimizer_step(optimizer)  # 1 mark_step/epoch: epoch 全体を一括 submit
+                xm.optimizer_step(optimizer)  # mark_step() + lazy optimizer.step() ops submit
+                xm.mark_step()  # optimizer.step() lazy ops を即 flush (次エポックへ蓄積防止)
                 t_loss = t_loss_acc.item()  # sync (グラフ完了待ち)
             else:
                 for xb, yb in tr_dl:
@@ -871,11 +879,11 @@ def train(args, X_tr, y_tr, X_te, y_te, mean, std, n_feat=None, _spawn_rank=None
                 v_loss_sum  = torch.zeros(1, device=device)
                 correct_sum = torch.zeros(1, device=device, dtype=torch.long)
                 total_sum   = 0
-                with torch.no_grad():
+                with torch.inference_mode():
                     for xb, yb in va_dl:
                         with torch.amp.autocast(_amp_backend, enabled=use_amp, dtype=amp_dtype):
                             lo = model(xb)
-                        v_loss_sum  += criterion(lo, yb).detach()
+                        v_loss_sum  += criterion(lo, yb)
                         correct_sum += (lo.argmax(1) == yb).sum()
                         total_sum   += len(yb)
                 v_loss = (v_loss_sum / len(va_dl)).item()
@@ -1038,7 +1046,7 @@ def _train_step(model, xb, yb, opt, crit, sched,
     if use_scaler and scaler is not None:
         scaler.scale(loss).backward()
         scaler.unscale_(opt)
-        nn.utils.clip_grad_norm_(model.parameters(), 1.0)
+        nn.utils.clip_grad_norm_(model.parameters(), 1.0, foreach=True)
         scaler.step(opt)
         scaler.update()
     else:
@@ -1058,7 +1066,7 @@ def _train_step(model, xb, yb, opt, crit, sched,
                     _g.mul_(_coef)
             xm.optimizer_step(opt)  # mark_step()内包: lazy eval graph を一括 submit
         else:
-            nn.utils.clip_grad_norm_(model.parameters(), 1.0)
+            nn.utils.clip_grad_norm_(model.parameters(), 1.0, foreach=True)
             opt.step()
     if do_sched:
         sched.step()
