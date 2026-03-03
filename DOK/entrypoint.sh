@@ -6,8 +6,36 @@
 # ─────────────────────────────────────────────────────────────────────────────
 set -e
 
-# ── FD上限を上げる (S3並列接続等でulimitエラーを防ぐ)
-ulimit -n 65536 2>/dev/null || true
+# ── リソース制限を全項目MAX (FD枯渇・プロセス数・メモリ等の制限解除) ───────────
+# sysctl でカーネルパラメータを最大化
+sysctl -w fs.file-max=1048576          2>/dev/null || true
+sysctl -w fs.nr_open=1048576           2>/dev/null || true
+sysctl -w kernel.pid_max=4194304       2>/dev/null || true
+sysctl -w kernel.threads-max=4194304   2>/dev/null || true
+sysctl -w vm.max_map_count=1048576     2>/dev/null || true
+sysctl -w kernel.msgmax=134217728      2>/dev/null || true
+sysctl -w kernel.msgmnb=134217728      2>/dev/null || true
+sysctl -w net.core.somaxconn=65535     2>/dev/null || true
+sysctl -w net.core.netdev_max_backlog=65535 2>/dev/null || true
+
+# prlimit で全リソースをMAX (root特権コンテナはDockerハード上限を上書き可能)
+_set_limit() { prlimit --"$1"="$2":"$2" --pid $$ 2>/dev/null || true; }
+_set_limit nofile   1048576     # オープンFD数
+_set_limit nproc    4194304     # プロセス/スレッド数
+_set_limit stack    unlimited   # スタックサイズ
+_set_limit memlock  unlimited   # ロック可能メモリ
+_set_limit core     unlimited   # コアダンプサイズ
+_set_limit fsize    unlimited   # 最大ファイルサイズ
+_set_limit data     unlimited   # データセグメント
+_set_limit rss      unlimited   # 常駐メモリ
+_set_limit as       unlimited   # 仮想アドレス空間
+_set_limit locks    unlimited   # ファイルロック数
+_set_limit sigpending 4194304   # 保留シグナル数
+_set_limit msgqueue 134217728   # メッセージキューバイト数
+_set_limit rtprio   99          # リアルタイム優先度
+_set_limit nice     -20         # nice値の下限
+
+echo "[*] FD上限: $(ulimit -n)  プロセス上限: $(ulimit -u)"
 
 echo "======================================================"
 echo "  FX AI EA 並列ランダムサーチ (統合イメージ)"
