@@ -232,7 +232,7 @@ def _auto_gpu_config(node_id: str) -> tuple[str, float, float, int]:
     elif total_gb >=  14: tier = 'small'
     else:                 tier = 'micro'
 
-    vpt_map = {'xlarge': 12.0, 'large': 10.0, 'medium': 8.0, 'small': 7.0, 'micro': 8.0}
+    vpt_map = {'xlarge': 6.0, 'large': 6.0, 'medium': 5.0, 'small': 5.0, 'micro': 4.0}
     vpt = vpt_map[tier]
     par = max(1, int(total_gb * 0.85 / vpt))
 
@@ -471,6 +471,22 @@ def _resolve_float_env(key: str, default: float) -> float:
 
 MAX_PARALLEL   = _resolve_int_env('MAX_PARALLEL',   _PAR_DEFAULT)
 VRAM_PER_TRIAL = _resolve_float_env('VRAM_PER_TRIAL', _VPT_DEFAULT)
+# 動的スケーリング時の並列数上限 (VRAM が余っていてもこれ以上は増やさない)
+_MAX_PAR_CAP = max(MAX_PARALLEL, max(1, int(_GPU_VRAM_GB * 0.85 / max(0.1, VRAM_PER_TRIAL))))
+
+# 適応的 VRAM/試行 EMA (実測値で自動補正)
+_vpt_ema: float = VRAM_PER_TRIAL
+_vpt_ema_lock = threading.Lock()
+
+def _update_vpt_ema(used_gb: float, n_running: int) -> None:
+    """実測 VRAM使用量/試行 を EMA で更新 (1.5倍バッファを保持)"""
+    global _vpt_ema
+    if n_running <= 0:
+        return
+    measured = used_gb / n_running
+    if 0.3 <= measured <= _GPU_VRAM_GB * 0.5:
+        with _vpt_ema_lock:
+            _vpt_ema = 0.85 * _vpt_ema + 0.15 * measured
 
 # ── フリーズ検知: GPU無使用タイムアウト ──────────────────────────────────────
 # データロード・前処理フェーズに DATA_PREP_BUDGET 秒の猶予を与え、
@@ -1093,8 +1109,8 @@ def get_gpu_compute_pids() -> set:
 
 
 def get_max_parallel(n_running: int) -> int:
-    """VRAM/GPU 使用率から動的に最大並列数を返す"""
-    if not H100_MODE or TPU_MODE:
+    """VRAM/GPU 使用率から動的に最大並列数を返す (全 GPU ティア対応)"""
+    if TPU_MODE:
         # TPU: HBM は CUDA VRAM と独立 → MAX_PARALLEL を直接返す
         return MAX_PARALLEL
     gi = _gpu_info()
@@ -1102,19 +1118,24 @@ def get_max_parallel(n_running: int) -> int:
     used_gb  = gi['used_gb']
     mem_pct  = used_gb / total_gb * 100
 
+    # 適応的VPT更新 (実測値でEMAを補正)
+    _update_vpt_ema(used_gb, n_running)
+    with _vpt_ema_lock:
+        eff_vpt = max(0.5, _vpt_ema * 1.5)  # 1.5倍バッファで保守的に
+
     # VRAM使用率が90%超なら新規起動を抑制 (OOM防止)
     if mem_pct > 90 and n_running > 0:
         return n_running  # 現状維持、追加起動しない
     # VRAM使用率が85%超なら保守的に並列数制限
     if mem_pct > 85:
-        return max(1, min(n_running + 1, MAX_PARALLEL))
-    # VRAM 空きから枠を計算
-    vram_slots = max(1, int(gi['free_gb'] / VRAM_PER_TRIAL))
+        return max(1, min(n_running + 1, _MAX_PAR_CAP))
+    # VRAM 空きから枠を計算 (適応的VPTを使用、_MAX_PAR_CAP で上限)
+    vram_slots = max(1, int(gi['free_gb'] / eff_vpt))
     # GPU が高負荷なら維持
     if gi['gpu_pct'] > 92 and n_running > 0:
         return n_running
     # VRAM不足でも最低1並列は保証 (フリーズ防止)
-    return max(1, min(MAX_PARALLEL, vram_slots))
+    return max(1, min(_MAX_PAR_CAP, vram_slots))
 
 
 # ── TOP_N 管理 ────────────────────────────────────────────────────────────────
@@ -1491,6 +1512,38 @@ class WorkerPool:
             initargs=(str(TRAIN_PY.parent), self._cache_path, self._gpu_mem_fraction),
         )
         print(f"  [WorkerPool] executor 再起動完了 ({self._max_workers}ワーカー)")
+
+    def resize(self, new_max: int) -> bool:
+        """アイドル時にワーカー数を変更する。実行中ジョブがあれば False を返す。"""
+        import concurrent.futures as _cf
+        import multiprocessing as _mp
+        new_max = max(1, new_max)
+        if new_max == self._max_workers:
+            return True
+        with self.lock:
+            if self._futures:
+                return False   # 実行中ジョブあり → スキップ
+        old = self._max_workers
+        self._max_workers      = new_max
+        self._gpu_mem_fraction = max(0.1, min(0.95, 0.96 / new_max))
+        print(f"  [WorkerPool] ワーカー数変更: {old} → {new_max} "
+              f"(GPU_MEM={self._gpu_mem_fraction:.2f}/worker)")
+        try:
+            self._executor.shutdown(wait=False, cancel_futures=True)
+        except Exception:
+            pass
+        time.sleep(1)
+        self._executor = _cf.ProcessPoolExecutor(
+            max_workers=new_max,
+            mp_context=_mp.get_context('spawn'),
+            initializer=_worker_init_proxy,
+            initargs=(str(TRAIN_PY.parent), self._cache_path, self._gpu_mem_fraction),
+        )
+        import concurrent.futures as _cf2
+        warmup_futs = [self._executor.submit(_warmup_probe) for _ in range(new_max)]
+        _cf2.wait(warmup_futs, timeout=120)
+        print(f"  [WorkerPool] リサイズ完了 ({new_max}ワーカー)")
+        return True
 
     def launch(self, trial_no: int, params: dict, best_pf: float, start_time: float,
                strategy: str = 'random'):
@@ -2072,7 +2125,7 @@ def main():
     _other_merge_stop = threading.Event()
     def _other_nodes_merge_loop():
         """バックグラウンドで他ノードの新着結果を取り込んでマージ"""
-        while not _other_merge_stop.wait(300):   # 5分ごと
+        while not _other_merge_stop.wait(60):   # 1分ごと
             if not REMOTE_ENABLED():
                 continue
             try:
@@ -2304,9 +2357,12 @@ def main():
         # ── 新規試行を投入 ──────────────────────────────────────────────────
         n_active = trainer.n_active_workers if isinstance(trainer, WorkerPool) else len(trainer)
         max_par = get_max_parallel(n_active)
-        # WorkerPool (ProcessPoolExecutor) の場合はダブルバッファリング:
-        # ワーカー数×2 をキューに保持 → ワーカーが終わった瞬間に次ジョブ開始
-        submit_limit = max_par * 2 if isinstance(trainer, WorkerPool) else max_par
+        # WorkerPool: アイドル時にワーカー数を動的調整 (VRAM余裕があれば増加)
+        if isinstance(trainer, WorkerPool) and len(trainer) == 0 and max_par != trainer._max_workers:
+            trainer.resize(max_par)
+        # WorkerPool (ProcessPoolExecutor) の場合はトリプルバッファリング:
+        # ワーカー数×3 をキューに保持 → GPU が遊ぶ隙を与えない
+        submit_limit = max_par * 3 if isinstance(trainer, WorkerPool) else max_par
         while len(trainer) < submit_limit:
             if STOP_FLAG.exists():
                 break
@@ -2338,8 +2394,8 @@ def main():
             last_checkpoint      = time.time()
             completed_since_ckpt = 0
 
-        # TPU: 1チップ=1試行なので試行間ギャップを最小化するため poll を高頻度に
-        time.sleep(1 if isinstance(trainer, WorkerPool) else (1 if _is_tpu_env else 5))
+        # WorkerPool: 0.5秒ポーリングで試行完了を素早く検知 → GPU遊び時間を短縮
+        time.sleep(0.5 if isinstance(trainer, WorkerPool) else (1 if _is_tpu_env else 5))
         _loop_errors = 0  # 正常ループが回ればエラーカウントリセット
 
       except KeyboardInterrupt:
