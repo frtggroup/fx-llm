@@ -168,12 +168,14 @@ def add_indicators(df: pd.DataFrame) -> pd.DataFrame:
     from feat import add_all_indicators
     df = add_all_indicators(df)
 
-    # 差分展開 (d1 〜 d24)
+    # 差分展開 (d1 〜 d24) — 一括 concat でフラグメント化を回避
     diff1 = df[BASE_FEATURE_COLS].diff(1)
+    diff_frames = []
     for k in range(1, _N_DIFFS + 1):
-        shifted = diff1.shift(k - 1)
-        for col in BASE_FEATURE_COLS:
-            df[f'{col}_d{k}'] = shifted[col].fillna(0).astype(np.float32)
+        shifted = diff1.shift(k - 1).fillna(0).astype(np.float32)
+        shifted.columns = [f'{col}_d{k}' for col in BASE_FEATURE_COLS]
+        diff_frames.append(shifted)
+    df = pd.concat([df] + diff_frames, axis=1)
 
     return df
 

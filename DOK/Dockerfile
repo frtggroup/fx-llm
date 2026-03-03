@@ -100,21 +100,21 @@ COPY DOK/ssh/authorized_keys /root/.ssh/authorized_keys
 RUN chmod 600 /root/.ssh/authorized_keys
 
 # ── Source files ─────────────────────────────────────────────────────────────
-COPY ai_ea/ /workspace/ai_ea/
-RUN rm -f /workspace/ai_ea/all_results.json \
-          /workspace/ai_ea/best_result.json \
-          /workspace/ai_ea/last_result.json \
-          /workspace/ai_ea/progress.json \
-          /workspace/ai_ea/llm_progress.json \
-          /workspace/ai_ea/norm_params.json \
-          /workspace/ai_ea/norm_params_best.json
+COPY fx-ea4/ /workspace/fx-ea4/
+RUN rm -f /workspace/fx-ea4/all_results.json \
+          /workspace/fx-ea4/best_result.json \
+          /workspace/fx-ea4/last_result.json \
+          /workspace/fx-ea4/progress.json \
+          /workspace/fx-ea4/llm_progress.json \
+          /workspace/fx-ea4/norm_params.json \
+          /workspace/fx-ea4/norm_params_best.json
 COPY DOK/entrypoint.sh /workspace/entrypoint.sh
 RUN chmod +x /workspace/entrypoint.sh
 
 RUN mkdir -p /workspace/data \
-             /workspace/ai_ea/trials \
-             /workspace/ai_ea/top100 \
-             /workspace/ai_ea/top_cache
+             /workspace/fx-ea4/trials \
+             /workspace/fx-ea4/top100 \
+             /workspace/fx-ea4/top_cache
 
 WORKDIR /workspace
 

@@ -225,19 +225,19 @@ fi
 ARTIFACT=/opt/artifact
 if [ -d "${ARTIFACT}" ] || [ -b "${ARTIFACT}" ]; then
     echo "[*] Sakura DOK モード: /opt/artifact を使用"
-    mkdir -p "${ARTIFACT}/data" "${ARTIFACT}/ai_ea/trials" \
-             "${ARTIFACT}/ai_ea/top100" "${ARTIFACT}/ai_ea/top_cache"
+    mkdir -p "${ARTIFACT}/data" "${ARTIFACT}/fx-ea4/trials" \
+             "${ARTIFACT}/fx-ea4/top100" "${ARTIFACT}/fx-ea4/top_cache"
     [ ! -L /workspace/data ]             && rm -rf /workspace/data             && ln -sf "${ARTIFACT}/data"              /workspace/data
-    [ ! -L /workspace/ai_ea/trials ]     && rm -rf /workspace/ai_ea/trials     && ln -sf "${ARTIFACT}/ai_ea/trials"      /workspace/ai_ea/trials
-    [ ! -L /workspace/ai_ea/top100 ]     && rm -rf /workspace/ai_ea/top100     && ln -sf "${ARTIFACT}/ai_ea/top100"      /workspace/ai_ea/top100
-    [ ! -L /workspace/ai_ea/top_cache ]  && rm -rf /workspace/ai_ea/top_cache  && ln -sf "${ARTIFACT}/ai_ea/top_cache"   /workspace/ai_ea/top_cache
+    [ ! -L /workspace/fx-ea4/trials ]     && rm -rf /workspace/fx-ea4/trials     && ln -sf "${ARTIFACT}/fx-ea4/trials"      /workspace/fx-ea4/trials
+    [ ! -L /workspace/fx-ea4/top100 ]     && rm -rf /workspace/fx-ea4/top100     && ln -sf "${ARTIFACT}/fx-ea4/top100"      /workspace/fx-ea4/top100
+    [ ! -L /workspace/fx-ea4/top_cache ]  && rm -rf /workspace/fx-ea4/top_cache  && ln -sf "${ARTIFACT}/fx-ea4/top_cache"   /workspace/fx-ea4/top_cache
     export TORCHINDUCTOR_CACHE_DIR="${ARTIFACT}/torch_inductor_cache"
     mkdir -p "${TORCHINDUCTOR_CACHE_DIR}"
     echo "[OK] Sakura DOK ストレージ設定完了"
 else
     echo "[*] クラウド/ローカルモード: /workspace を使用"
-    mkdir -p /workspace/data /workspace/ai_ea/trials \
-             /workspace/ai_ea/top100 /workspace/ai_ea/top_cache
+    mkdir -p /workspace/data /workspace/fx-ea4/trials \
+             /workspace/fx-ea4/top100 /workspace/fx-ea4/top_cache
     # torch.compile inductor キャッシュを /workspace に永続化
     # (デフォルト ~/.cache/torch/inductor/ はコンテナ再起動で消えるため)
     export TORCHINDUCTOR_CACHE_DIR="/workspace/torch_inductor_cache"
@@ -245,7 +245,7 @@ else
 fi
 
 # ── 5. 環境変数 ──────────────────────────────────────────────────────────────
-export PYTHONPATH="/workspace/ai_ea:${PYTHONPATH}"
+export PYTHONPATH="/workspace/fx-ea4:${PYTHONPATH}"
 export DATA_PATH="${DATA_PATH:-/workspace/data/USDJPY_H1.csv}"
 export DASHBOARD_PORT="${DASHBOARD_PORT:-8080}"
 
@@ -259,7 +259,7 @@ echo "    DASHBOARD    : port ${DASHBOARD_PORT}"
 _start_dashboard() {
     while true; do
         echo "[DASH] server.py 起動 $(date '+%H:%M:%S')" >> /workspace/dashboard.log
-        python /workspace/ai_ea/server.py >> /workspace/dashboard.log 2>&1
+        python /workspace/fx-ea4/server.py >> /workspace/dashboard.log 2>&1
         EXIT_CODE=$?
         echo "[DASH] server.py 終了 (exit=$EXIT_CODE) → 5秒後に再起動 $(date '+%H:%M:%S')" \
             >> /workspace/dashboard.log
@@ -278,7 +278,7 @@ mkdir -p "$(dirname ${DATA_PATH})"
 if [ ! -s "${DATA_PATH}" ]; then
     python3 - <<'PYEOF' || true
 import sys, os, urllib.request, ssl
-sys.path.insert(0, '/workspace/ai_ea')
+sys.path.insert(0, '/workspace/fx-ea4')
 from pathlib import Path
 
 dst = Path(os.environ.get('DATA_PATH', '/workspace/data/USDJPY_H1.csv'))
@@ -682,7 +682,7 @@ fi
 # このブロックが完了するまで学習は開始しない。
 if [ "$DEVICE_TYPE" = "TPU" ] && [ "${WARMUP_SKIP_ALL:-0}" != "1" ]; then
     echo "[*] XLA 事前コンパイル開始 (完了後に学習開始)"
-    python3 /workspace/ai_ea/warmup_xla.py 2>&1 | tee -a /workspace/train_run.log
+    python3 /workspace/fx-ea4/warmup_xla.py 2>&1 | tee -a /workspace/train_run.log
 
     # warmup 完了後: 残存キャッシュファイルを同期アップロード (取りこぼし防止)
     echo "[*] XLA キャッシュ S3 最終同期中..."
@@ -752,7 +752,7 @@ fi
 # run_train.py がクラッシュしても自動復旧する。stop.flag があれば再起動しない。
 RESTART_COUNT=0
 while true; do
-    python /workspace/ai_ea/run_train.py 2>&1 | tee -a /workspace/train_run.log &
+    python /workspace/fx-ea4/run_train.py 2>&1 | tee -a /workspace/train_run.log &
     TRAIN_PID=$!
     wait $TRAIN_PID
     EXIT_CODE=$?

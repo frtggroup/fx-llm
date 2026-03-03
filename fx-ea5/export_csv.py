@@ -30,8 +30,11 @@ def main():
     # 有効な行のみ抽出（forward_barsによる末尾の無効データをカット）
     valid_end = len(df) - 20 - 1
     
-    # 700次元の特徴量 + 基本価格データ + 今回ターゲットを指定
-    cols_to_keep = ['open', 'high', 'low', 'close', 'target'] + BASE_FEATURE_COLS
+    # label列を追加（hold/buy/sell）
+    df['label'] = df['target'].map({0: 'hold', 1: 'buy', 2: 'sell'})
+
+    # 230次元の特徴量 + 基本価格データ + ターゲット
+    cols_to_keep = ['open', 'high', 'low', 'close', 'target', 'label'] + BASE_FEATURE_COLS
     df_export = df[cols_to_keep].iloc[:valid_end]
     
     # 訓練用・テスト用の分割 (このプログラム（train.py）と同じ方法: 2025-01-01で分割)
