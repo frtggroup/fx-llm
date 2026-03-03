@@ -442,15 +442,15 @@ def restart_vast_instance() -> bool:
     """現在インスタンスを停止し、最安H200 NVL spotで新規作成"""
     global VAST_INSTANCE_ID
 
-    # 現在のインスタンスを停止
+    # 現在のインスタンスを削除
     if VAST_INSTANCE_ID:
-        log(f"[VAST] インスタンス {VAST_INSTANCE_ID} を停止中...")
+        log(f"[VAST] インスタンス {VAST_INSTANCE_ID} を削除中...")
         r = subprocess.run(
-            f"vastai stop instance {VAST_INSTANCE_ID}",
+            f"vastai destroy instance {VAST_INSTANCE_ID}",
             shell=True, capture_output=True, text=True
         )
         out = (r.stdout + r.stderr).strip()
-        log(f"[VAST] stop: {out[:120]}")
+        log(f"[VAST] destroy: {out[:120]}")
         time.sleep(15)
 
     # 最安H200 NVL offer を検索
