@@ -41,6 +41,18 @@ echo "======================================================"
 echo "  FX AI EA 並列ランダムサーチ (統合イメージ)"
 echo "======================================================"
 
+# ── SSH を最優先で起動 (デバイス検出より前: 初期化中でも接続できるように) ──────
+mkdir -p /var/run/sshd /root/.ssh
+chmod 700 /root/.ssh
+chmod 600 /root/.ssh/authorized_keys 2>/dev/null || true
+ssh-keygen -A 2>/dev/null || true
+/usr/sbin/sshd -D &
+_SSH_PID=$!
+sleep 1
+kill -0 "$_SSH_PID" 2>/dev/null \
+  && echo "[OK] SSH サーバー早期起動 (PID: $_SSH_PID)" \
+  || echo "[WARN] SSH 早期起動失敗 (続行)"
+
 # ── 0a. NTP 時刻同期 (S3 RequestTimeTooSkewed 防止) ──────────────────────────
 # S3 署名検証は±15分以内の時刻一致が必要。コンテナ起動時にクロックを同期する。
 if command -v ntpdate &>/dev/null; then
@@ -67,7 +79,7 @@ fi
 # ── 1. デバイス自動検出 (--gpus / --privileged 不要) ─────────────────────────
 echo "[*] デバイス検出中..."
 
-DEVICE_INFO=$(python3 - <<'PYEOF'
+DEVICE_INFO=$(python3 - <<'PYEOF' || echo "CPU|CPU|0"
 import os, sys, subprocess
 
 # ── 1. nvidia-smi で先に確認 (torch より先に実行 = torch_xla 干渉を回避) ──────
@@ -209,18 +221,6 @@ if [ "$DEVICE_TYPE" = "GPU" ]; then
       || true   # 特権なし環境では失敗するが無視
 fi
 
-# ── 3. SSH サーバー ──────────────────────────────────────────────────────────
-mkdir -p /var/run/sshd /root/.ssh
-chmod 700 /root/.ssh
-chmod 600 /root/.ssh/authorized_keys 2>/dev/null || true
-ssh-keygen -A 2>/dev/null || true
-/usr/sbin/sshd -D &
-SSH_PID=$!
-sleep 1
-kill -0 "$SSH_PID" 2>/dev/null \
-  && echo "[OK] SSH サーバー起動 (PID: $SSH_PID)" \
-  || echo "[WARN] SSH 起動失敗 (続行)"
-
 # ── 4. 永続ストレージ ─────────────────────────────────────────────────────────
 ARTIFACT=/opt/artifact
 if [ -d "${ARTIFACT}" ] || [ -b "${ARTIFACT}" ]; then
@@ -276,7 +276,7 @@ curl -s --connect-timeout 3 http://127.0.0.1:${DASHBOARD_PORT}/api/status > /dev
 # ── 7. CSV 自動取得 ───────────────────────────────────────────────────────────
 mkdir -p "$(dirname ${DATA_PATH})"
 if [ ! -s "${DATA_PATH}" ]; then
-    python3 - <<'PYEOF'
+    python3 - <<'PYEOF' || true
 import sys, os, urllib.request, ssl
 sys.path.insert(0, '/workspace/ai_ea')
 from pathlib import Path
