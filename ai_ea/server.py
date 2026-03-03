@@ -81,7 +81,9 @@ def _s3_get_bytes(rel_key: str) -> bytes | None:
         s3     = _s3_client_srv()
         prefix = (_S3_PREFIX.rstrip('/') + '/') if _S3_PREFIX else ''
         obj    = s3.get_object(Bucket=_S3_BUCKET, Key=prefix + rel_key)
-        return obj['Body'].read(_S3_MAX_BODY)
+        body   = obj['Body'].read(_S3_MAX_BODY)
+        obj['Body'].close()
+        return body
     except Exception:
         return None
 
@@ -681,6 +683,7 @@ def s3_proxy_download(s3_path: str):
         s3  = _s3_client_srv()
         obj = s3.get_object(Bucket=_S3_BUCKET, Key=key)
         body = obj['Body'].read(_S3_MAX_BODY)
+        obj['Body'].close()
     except Exception as e:
         raise HTTPException(404, f'S3取得失敗: {e}')
 
@@ -738,7 +741,9 @@ def api_s3_catalog():
             # results JSON をダウンロード
             try:
                 obj     = s3.get_object(Bucket=_S3_BUCKET, Key=prefix + f'results_{nid}.json')
-                results = json.loads(obj['Body'].read(_S3_MAX_BODY))
+                _body   = obj['Body'].read(_S3_MAX_BODY)
+                obj['Body'].close()
+                results = json.loads(_body)
             except Exception:
                 results = []
 

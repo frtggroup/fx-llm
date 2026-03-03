@@ -1377,6 +1377,7 @@ class ParallelTrainer:
         _popen_extra = {'start_new_session': True} if platform.system() != 'Windows' else {}
 
         # TPU: 各サブプロセスに空きチップを割り当て (使用中チップを避ける)
+        # NOTE: Popen 例外時は log_fh を必ず close (FDリーク防止)
         # PJRT_LOCAL_PROCESS_RANK + TPU_VISIBLE_DEVICES で /dev/vfio/N の競合を防ぐ
         env = os.environ.copy()
         tpu_rank = None
@@ -1393,8 +1394,12 @@ class ParallelTrainer:
             env['TPU_NUM_DEVICES'] = '1'
             env['TPU_VISIBLE_DEVICES'] = str(tpu_rank)
 
-        proc = subprocess.Popen(cmd, stdout=log_fh, stderr=subprocess.STDOUT,
-                                env=env, **_popen_extra)
+        try:
+            proc = subprocess.Popen(cmd, stdout=log_fh, stderr=subprocess.STDOUT,
+                                    env=env, **_popen_extra)
+        except Exception:
+            log_fh.close()
+            raise
 
         with self.lock:
             self.running[trial_no] = {
@@ -1474,6 +1479,10 @@ class ParallelTrainer:
             for info in self.running.values():
                 try:
                     _kill_with_group(info['proc'])
+                except Exception:
+                    pass
+                try:
+                    info['log_fh'].close()
                 except Exception:
                     pass
 
