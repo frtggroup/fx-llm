@@ -62,8 +62,8 @@ FEATURE_SETS.append(_s(STATS_GRP, OTHER_IND))
 categories = [TREND, MACD_GRP, RSI_GRP, STOCH_GRP, BB_GRP, ATR_ETC_GRP, 
               OTHER_IND, DIFF_GRP, ICHI_GRP, STATS_GRP, CANDLE_GRP, BOS_GRP, SESS_GRP]
 
-# サイズ別のバランスセット (5, 10, 20, 30, 50, 100, 200, 300, 500特徴量)
-size_targets = [5, 10, 20, 30, 50, 100, 200, 300, 400, 500, N_GROUPS]
+# サイズ別のバランスセット (5, 10, 20, 30, 50, 100, 150, 200)
+size_targets = [5, 10, 20, 30, 50, 100, 150, 200, N_GROUPS]
 
 while len(FEATURE_SETS) < 100:
     target_size = random.choice(size_targets)
