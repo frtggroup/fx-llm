@@ -219,7 +219,9 @@ _MAX_LAYERS = {
     'mlp': 2,  # run_train.py: layers in [1,2] for mlp
 }
 
-N_FEATURES = 17500  # 700グループ × 25列 (1基底 + 24逐次差分)
+# f:\FX\fx-ea5\features.py に合わせる
+import features as fx
+N_FEATURES = len(fx.BASE_FEATURE_COLS) * 25  # 230グループ × 25列 (1基底 + 24逐次差分) = 5750
 SEQ_LENS   = [15, 20, 30, 40, 50, 60]   # run_train.py の _TIER_SEQ['tpu'] と同一
 BATCH      = 1024
 N_CLASSES  = 3

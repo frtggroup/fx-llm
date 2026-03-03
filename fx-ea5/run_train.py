@@ -738,7 +738,7 @@ def sample_params(rng: random.Random) -> dict:
     wd      = rng.choice([1e-3, 1e-2, 5e-2, 1e-1])
     tm      = rng.choice([0, 0, 0, 12, 18, 12])
     if rng.random() < 0.25:
-        n_feat   = rng.choice([5, 10, 20, 30, 50, 100, 200, 300, 400, 500, 700])
+        n_feat   = rng.choice([5, 10, 20, 30, 50, 100, 150, 200, 230])
         feat_set = -1
     else:
         feat_set = rng.randint(0, len(FEATURE_SETS) - 1)

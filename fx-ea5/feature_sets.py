@@ -8,7 +8,8 @@ import random
 # 再現性のため
 random.seed(42)
 
-N_GROUPS = 700
+import features as fx
+N_GROUPS = len(fx.BASE_FEATURE_COLS)
 
 # 意味的なグループのインデックス範囲 (大まかに分類)
 TREND       = list(range(0, 16))
@@ -24,7 +25,7 @@ STATS_GRP   = list(range(80, 95))
 CANDLE_GRP  = list(range(95, 104))
 BOS_GRP     = list(range(104, 119))
 SESS_GRP    = list(range(119, 127))
-EXTRA_GRP   = list(range(127, 700))
+EXTRA_GRP   = list(range(127, N_GROUPS))
 
 def _s(*groups):
     out = set()
@@ -62,12 +63,12 @@ categories = [TREND, MACD_GRP, RSI_GRP, STOCH_GRP, BB_GRP, ATR_ETC_GRP,
               OTHER_IND, DIFF_GRP, ICHI_GRP, STATS_GRP, CANDLE_GRP, BOS_GRP, SESS_GRP]
 
 # サイズ別のバランスセット (5, 10, 20, 30, 50, 100, 200, 300, 500特徴量)
-size_targets = [5, 10, 20, 30, 50, 100, 200, 300, 400, 500, 600, 700]
+size_targets = [5, 10, 20, 30, 50, 100, 200, 300, 400, 500, N_GROUPS]
 
 while len(FEATURE_SETS) < 100:
     target_size = random.choice(size_targets)
-    if target_size == 700:
-        FEATURE_SETS.append(list(range(700)))
+    if target_size >= N_GROUPS:
+        FEATURE_SETS.append(list(range(N_GROUPS)))
         continue
         
     mode = random.choice(['category_mix', 'pure_random', 'hybrid'])
@@ -83,7 +84,7 @@ while len(FEATURE_SETS) < 100:
         
     elif mode == 'pure_random':
         # 全体からランダムに target_size 個選ぶ
-        FEATURE_SETS.append(sorted(random.sample(range(700), target_size)))
+        FEATURE_SETS.append(sorted(random.sample(range(N_GROUPS), target_size)))
         
     elif mode == 'hybrid':
         # 特定カテゴリ + アルファ
@@ -91,7 +92,7 @@ while len(FEATURE_SETS) < 100:
         base = list(base_cat)
         rem = target_size - len(base)
         if rem > 0:
-            pool = list(set(range(700)) - set(base))
+            pool = list(set(range(N_GROUPS)) - set(base))
             base.extend(random.sample(pool, min(rem, len(pool))))
         base = sorted(base)
         if len(base) > target_size:
@@ -110,7 +111,7 @@ for s in FEATURE_SETS:
 # 万が一重複で100個未満になったら補充
 while len(unique_sets) < 100:
     target_size = random.choice(size_targets)
-    s = sorted(random.sample(range(700), target_size))
+    s = sorted(random.sample(range(N_GROUPS), target_size))
     t = tuple(s)
     if t not in seen:
         seen.add(t)
