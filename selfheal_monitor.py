@@ -211,7 +211,7 @@ def try_raise_bid(instance_id: int) -> bool:
 def find_cheapest_h200_offer() -> tuple:
     """最安値のH200 NVL interruptible offer を返す (offer_id, dph)"""
     r = subprocess.run(
-        'vastai search offers "gpu_name=H200_NVL num_gpus=1 rentable=True" --raw',
+        'vastai search offers "gpu_name=H200_NVL num_gpus=1 rentable=True" --interruptible --order dph_base --raw',
         shell=True, capture_output=True, text=True
     )
     try:
