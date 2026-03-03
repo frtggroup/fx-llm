@@ -2333,70 +2333,166 @@ def main():
         _inductor_sync_thread.start()
         print(f'  [INDUCTOR] S3 定期同期スレッド開始 ({_INDUCTOR_SYNC_INTERVAL}秒ごと, ZIP)')
 
-    # ── [一時] クラッシュ/フリーズ診断ログ (10秒ごとにS3へアップ) ─────────────────
-    # 問題解決後に削除すること
-    _DIAG_INTERVAL  = 10        # 秒
-    _DIAG_MAX_LINES = 360       # 最大保持行数 (360 * 10sec = 1時間分)
+    # ── クラッシュ/フリーズ診断ログ (1秒ごとにS3へアップ) ─────────────────────
+    _DIAG_INTERVAL  = 1          # 秒
+    _DIAG_MAX_LINES = 1200       # 最大保持行数 (1200 * 1sec = 20分分)
     _diag_stop      = threading.Event()
     _diag_lines: list = []
     _diag_lock  = threading.Lock()
 
     def _diag_loop():
-        import collections, io as _io, subprocess as _sp
+        import subprocess as _sp
         _node_id = os.environ.get('NODE_ID', os.uname().nodename if hasattr(os, 'uname') else 'unknown')
         _s3_key  = (f'{S3_PREFIX}/diag/{_node_id}_diag.jsonl').lstrip('/')
+        _upload_counter = 0
+        _prev_stat = None
 
         def _collect():
+            nonlocal _prev_stat
             ts = time.time()
             rec = {'ts': int(ts), 'dt': time.strftime('%H:%M:%S', time.localtime(ts))}
-            # CPU / RAM
+
+            # ── CPU loadavg ──────────────────────────────────────────────
             try:
-                with open('/proc/loadavg') as f:
-                    la = f.read().split()
-                    rec['load1'], rec['load5'] = float(la[0]), float(la[1])
+                la = open('/proc/loadavg').read().split()
+                rec['load1'], rec['load5'], rec['load15'] = float(la[0]), float(la[1]), float(la[2])
+                rec['procs_run'], rec['procs_total'] = la[3].split('/')
             except Exception: pass
+
+            # ── CPU % (差分計算) ─────────────────────────────────────────
             try:
-                with open('/proc/meminfo') as f:
-                    mi = {l.split(':')[0]: int(l.split()[1]) for l in f if ':' in l}
+                s2 = [int(x) for x in open('/proc/stat').readline().split()[1:]]
+                if _prev_stat:
+                    diff = [s2[i] - _prev_stat[i] for i in range(len(s2))]
+                    total = sum(diff)
+                    if total > 0:
+                        rec['cpu_user_pct']   = round(100 * diff[0] / total, 1)
+                        rec['cpu_system_pct'] = round(100 * diff[2] / total, 1)
+                        rec['cpu_iowait_pct'] = round(100 * diff[4] / total, 1) if len(diff) > 4 else 0
+                        rec['cpu_idle_pct']   = round(100 * diff[3] / total, 1)
+                        rec['cpu_pct']        = round(100 * (1 - diff[3] / total), 1)
+                _prev_stat = s2
+            except Exception: pass
+
+            # ── RAM / Swap ───────────────────────────────────────────────
+            try:
+                mi = {}
+                for l in open('/proc/meminfo'):
+                    if ':' in l:
+                        k, v = l.split(':')
+                        mi[k.strip()] = int(v.split()[0])
                 total = mi.get('MemTotal', 0); avail = mi.get('MemAvailable', 0)
-                rec['ram_gb_used'] = round((total - avail) / 1e6, 1)
-                rec['ram_gb_total'] = round(total / 1e6, 1)
-                rec['ram_pct'] = round(100 * (total - avail) / max(total, 1), 1)
+                rec['ram_gb_used']   = round((total - avail) / 1e6, 1)
+                rec['ram_gb_total']  = round(total / 1e6, 1)
+                rec['ram_pct']       = round(100 * (total - avail) / max(total, 1), 1)
+                swap_t = mi.get('SwapTotal', 0); swap_f = mi.get('SwapFree', 0)
+                rec['swap_gb_used']  = round((swap_t - swap_f) / 1e6, 1)
+                rec['swap_gb_total'] = round(swap_t / 1e6, 1)
             except Exception: pass
-            # CPU%
+
+            # ── FD / プロセス数 ──────────────────────────────────────────
             try:
-                s1 = open('/proc/stat').readline().split()[1:]
-                time.sleep(0.1)
-                s2 = open('/proc/stat').readline().split()[1:]
-                idle1, idle2 = int(s1[3]), int(s2[3])
-                total1 = sum(int(x) for x in s1); total2 = sum(int(x) for x in s2)
-                rec['cpu_pct'] = round(100 * (1 - (idle2 - idle1) / max(total2 - total1, 1)), 1)
+                parts = open('/proc/sys/fs/file-nr').read().split()
+                rec['fd_open'], rec['fd_max'] = int(parts[0]), int(parts[2])
             except Exception: pass
-            # FD count
             try:
-                with open('/proc/sys/fs/file-nr') as f:
-                    parts = f.read().split()
-                    rec['fd_open'], rec['fd_max'] = int(parts[0]), int(parts[2])
+                pids = [d for d in os.listdir('/proc') if d.isdigit()]
+                rec['procs'] = len(pids)
             except Exception: pass
-            # プロセス数
+
+            # ── Dstate (IOブロック) プロセス検出 ─────────────────────────
             try:
-                rec['procs'] = len([d for d in os.listdir('/proc') if d.isdigit()])
+                d_procs = []
+                for pid in os.listdir('/proc'):
+                    if not pid.isdigit(): continue
+                    try:
+                        stat = open(f'/proc/{pid}/stat').read().split()
+                        if stat[2] == 'D':  # uninterruptible sleep
+                            cmd = open(f'/proc/{pid}/comm').read().strip()
+                            d_procs.append(f'{pid}:{cmd}')
+                    except Exception: pass
+                if d_procs:
+                    rec['d_state_procs'] = d_procs[:10]
+                    rec['d_state_count'] = len(d_procs)
             except Exception: pass
-            # GPU (nvidia-smi)
+
+            # ── OOM Killer ログ (/proc/kmsg から検出) ────────────────────
+            try:
+                r = _sp.run(['dmesg', '--level=err,crit,emerg', '-T', '--since', '1 minutes ago'],
+                            capture_output=True, text=True, timeout=3)
+                if r.returncode == 0 and r.stdout:
+                    oom_lines = [l for l in r.stdout.strip().split('\n')
+                                 if 'oom' in l.lower() or 'kill' in l.lower() or 'out of memory' in l.lower()]
+                    if oom_lines:
+                        rec['oom_events'] = oom_lines[-3:]
+            except Exception: pass
+
+            # ── GPU (nvidia-smi 詳細) ─────────────────────────────────────
             try:
                 r = _sp.run(
-                    ['nvidia-smi', '--query-gpu=utilization.gpu,memory.used,memory.total,temperature.gpu,power.draw',
+                    ['nvidia-smi', '--query-gpu=utilization.gpu,memory.used,memory.total,'
+                     'temperature.gpu,power.draw,clocks_throttle_reasons.active',
                      '--format=csv,noheader,nounits'],
                     capture_output=True, text=True, timeout=5)
                 if r.returncode == 0:
                     parts = [p.strip() for p in r.stdout.strip().split(',')]
                     if len(parts) >= 5:
-                        rec['gpu_util_pct']    = float(parts[0])
-                        rec['gpu_mem_used_mb'] = float(parts[1])
-                        rec['gpu_mem_total_mb'] = float(parts[2])
-                        rec['gpu_temp_c']      = float(parts[3])
-                        rec['gpu_power_w']     = float(parts[4])
+                        rec['gpu_util_pct']      = float(parts[0])
+                        rec['gpu_mem_used_mb']   = float(parts[1])
+                        rec['gpu_mem_total_mb']  = float(parts[2])
+                        rec['gpu_temp_c']        = float(parts[3])
+                        rec['gpu_power_w']       = float(parts[4])
+                    if len(parts) >= 6:
+                        rec['gpu_throttle']      = parts[5]  # スロットリング理由
             except Exception: pass
+
+            # ── GPU per-process メモリ ────────────────────────────────────
+            try:
+                r = _sp.run(
+                    ['nvidia-smi', '--query-compute-apps=pid,used_memory',
+                     '--format=csv,noheader,nounits'],
+                    capture_output=True, text=True, timeout=5)
+                if r.returncode == 0 and r.stdout.strip():
+                    gpu_procs = {}
+                    for line in r.stdout.strip().split('\n'):
+                        parts = [p.strip() for p in line.split(',')]
+                        if len(parts) == 2:
+                            try:
+                                gpu_procs[parts[0]] = int(parts[1])
+                            except Exception: pass
+                    if gpu_procs:
+                        rec['gpu_proc_mem_mb'] = gpu_procs
+                        rec['gpu_proc_count']  = len(gpu_procs)
+            except Exception: pass
+
+            # ── WorkerPool の active future 数 (共有メモリ経由) ──────────
+            try:
+                # trainer オブジェクトが main スレッドにある場合は参照可能
+                import __main__
+                tr = getattr(__main__, '_trainer_ref', None)
+                if tr is not None and hasattr(tr, '_futures'):
+                    rec['worker_futures'] = len(tr._futures)
+                    rec['worker_meta']    = len(tr._meta)
+            except Exception: pass
+
+            # ── ワーカーPIDの生死確認 ─────────────────────────────────────
+            try:
+                import __main__
+                tr = getattr(__main__, '_trainer_ref', None)
+                if tr is not None and hasattr(tr, '_executor'):
+                    ex = tr._executor
+                    pids_alive = {}
+                    for pid, proc in (ex._processes or {}).items():
+                        try:
+                            os.kill(pid, 0)   # シグナル0 = 存在確認のみ
+                            pids_alive[str(pid)] = 'alive'
+                        except ProcessLookupError:
+                            pids_alive[str(pid)] = 'dead'
+                        except PermissionError:
+                            pids_alive[str(pid)] = 'alive'
+                    rec['worker_pids'] = pids_alive
+            except Exception: pass
+
             return rec
 
         def _upload(lines):
@@ -2418,14 +2514,17 @@ def main():
                     if len(_diag_lines) > _DIAG_MAX_LINES:
                         del _diag_lines[:-_DIAG_MAX_LINES]
                     lines_copy = list(_diag_lines)
-                _upload(lines_copy)
+                # S3アップロードは5秒ごと (1秒ごとだとS3負荷が高い)
+                _upload_counter += 1
+                if _upload_counter % 5 == 0:
+                    _upload(lines_copy)
             except Exception:
                 pass
 
     if S3_ENABLED:
         _diag_thread = threading.Thread(target=_diag_loop, daemon=True, name='DiagLog')
         _diag_thread.start()
-        print(f'  [DIAG] クラッシュ診断ログ開始 ({_DIAG_INTERVAL}秒ごとS3アップ) ※一時機能')
+        print(f'  [DIAG] 診断ログ開始 ({_DIAG_INTERVAL}秒収集/5秒S3アップ, 20分保持)')
 
     # 既存結果を引き継ぐ
     if ALL_RESULTS.exists():
