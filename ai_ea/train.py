@@ -721,13 +721,14 @@ def train(args, X_tr, y_tr, X_te, y_te, mean, std, n_feat=None, _spawn_rank=None
         )
         print(f"  scheduler={sched_name}")
 
-    # ── GPU: step 関数全体を torch.compile → forward+backward+optimizer を1グラフ化 ──
-    # reduce-overhead モード: CUDA graph でPythonオーバーヘッドをゼロ化 (ウォームアップ後)
-    # max-autotune モード: Triton kernel auto-tuning + CUDA graph (H100 非ワーカー)
-    # scheduler.step() は Python 副作用があるため CUDA graph 外 (ループ内で明示呼び出し)
-    if dev_type == 'cuda':
-        _step_mode = 'max-autotune' if (is_h100 and not _is_worker) else 'reduce-overhead'
-        # クロージャで model / criterion / optimizer を束縛
+    # ── GPU: torch.compile は 非ワーカー専用 ──────────────────────────────────
+    # ワーカー（並列試行）は短命 (早期終了 50~200ep が多い)。
+    # コンパイルコスト (5〜30秒) >> GPU計算節約分 → ワーカーに compile は逆効果。
+    # 非ワーカー (train.py 直実行の長い最終学習) のみ compile を適用。
+    # reduce-overhead: CUDA graph で Python ループオーバーヘッドをゼロ化 (数秒でコンパイル)
+    # max-autotune: Triton kernel 最適化 + CUDA graph (長時間学習で元を取る H100 専用)
+    if dev_type == 'cuda' and not _is_worker:
+        _step_mode = 'max-autotune' if is_h100 else 'reduce-overhead'
         _m, _c, _o  = model, criterion, optimizer
         _amp_en, _amp_dt = use_amp, amp_dtype
         _use_sc, _sc = use_scaler, scaler
@@ -758,6 +759,8 @@ def train(args, X_tr, y_tr, X_te, y_te, mean, std, n_feat=None, _spawn_rank=None
         except Exception as e:
             print(f"  torch.compile step スキップ → eager フォールバック: {e}")
             _compiled_step = None
+    elif dev_type == 'cuda' and _is_worker:
+        print(f"  torch.compile スキップ (ワーカーモード: コンパイルコスト > 短命試行の節約)")
 
     import math as _math  # ループ内 import を削除してここで一度だけ
     best_loss      = float('inf')
@@ -854,14 +857,15 @@ def train(args, X_tr, y_tr, X_te, y_te, mean, std, n_feat=None, _spawn_rank=None
                 xm.mark_step()  # optimizer.step() lazy ops を即 flush (次エポックへ蓄積防止)
                 t_loss = t_loss_acc.item()  # sync (グラフ完了待ち)
             else:
+                # GPU loss はデバイス側テンソルに蓄積 → エポック終わりに1回だけ sync
+                # (compiled / eager どちらも同じ方式で per-batch GPU sync を除去)
+                _t_loss_acc = torch.zeros(1, device=device) if dev_type == 'cuda' else None
                 if _compiled_step is not None:
-                    # CUDA graph replay: Python ループはデータコピーのみ、GPU同期なし
-                    _t_loss_acc = torch.zeros(1, device=device)
+                    # 非ワーカー: CUDA graph replay → Python overhead ほぼゼロ
                     for xb, yb in tr_dl:
-                        _t_loss_acc += _compiled_step(xb, yb)  # GPU 側蓄積、sync なし
-                        scheduler.step()                        # Python-side LR 更新のみ
+                        _t_loss_acc += _compiled_step(xb, yb)
+                        scheduler.step()   # Python-side LR 更新
                         t_steps += 1
-                    t_loss = (_t_loss_acc / max(1, t_steps)).item()  # エポック 1回 sync
                 else:
                     for xb, yb in tr_dl:
                         loss = _train_step(model, xb, yb,
@@ -869,8 +873,14 @@ def train(args, X_tr, y_tr, X_te, y_te, mean, std, n_feat=None, _spawn_rank=None
                                            use_amp, amp_dtype, use_scaler,
                                            _amp_backend, is_tpu, _spmd_mode,
                                            do_sched=True)
-                        t_loss_sum += loss.item()
+                        if _t_loss_acc is not None:
+                            _t_loss_acc += loss   # GPU 側蓄積、sync なし
+                        else:
+                            t_loss_sum += loss.item()
                         t_steps += 1
+                if _t_loss_acc is not None:
+                    t_loss = (_t_loss_acc / max(1, t_steps)).item()  # エポック 1回 sync
+                else:
                     t_loss = t_loss_sum / max(1, t_steps)
 
             if is_tpu and not _xla_compiled and epoch == 1:
