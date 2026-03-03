@@ -1406,7 +1406,7 @@ def backtest_torch(model, X_te, df_te, threshold, tp_mult, sl_mult,
                 out = model(xb)
             probs[i:i+bs] = out.float().cpu().numpy()
     close    = df_te['close'].values
-    atr      = df_te['atr14'].values
+    atr      = df_te['atr_14'].values
     high     = df_te['high'].values
     low      = df_te['low'].values
     open_arr = df_te['open'].values
@@ -1424,7 +1424,7 @@ def backtest(onnx_path, X_te, df_te, threshold, tp_mult, sl_mult,
             if mode in ('cuda', 'cuda_iobind') else ['CPUExecutionProvider'])
     sess = ort.InferenceSession(str(onnx_path), providers=pvd)
     close    = df_te['close'].values
-    atr      = df_te['atr14'].values
+    atr      = df_te['atr_14'].values
     high     = df_te['high'].values
     low      = df_te['low'].values
     open_arr = df_te['open'].values
