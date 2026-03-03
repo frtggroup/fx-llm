@@ -112,12 +112,22 @@ def get_current_instance() -> dict | None:
 
 
 def update_ssh_from_instance(inst: dict) -> bool:
-    """インスタンス情報からグローバルSSH設定を更新"""
+    """インスタンス情報からグローバルSSH設定を更新
+    ssh_host が null の場合は public_ipaddr + ports["22/tcp"] を使う"""
     global VAST_INSTANCE_ID, VAST_SSH_HOST, VAST_SSH_PORT
     try:
         VAST_INSTANCE_ID = inst["id"]
-        VAST_SSH_HOST    = inst.get("ssh_host", "")
-        VAST_SSH_PORT    = inst.get("ssh_port", 0)
+        ssh_host = inst.get("ssh_host") or ""
+        ssh_port = inst.get("ssh_port") or 0
+        # ssh_host が null → public_ipaddr + ports["22/tcp"][0]["HostPort"] を試みる
+        if not ssh_host:
+            ssh_host = inst.get("public_ipaddr", "")
+            ports = inst.get("ports", {})
+            tcp22 = ports.get("22/tcp", [])
+            if tcp22:
+                ssh_port = int(tcp22[0].get("HostPort", 0))
+        VAST_SSH_HOST = ssh_host
+        VAST_SSH_PORT = ssh_port
         return bool(VAST_SSH_HOST and VAST_SSH_PORT)
     except Exception:
         return False
