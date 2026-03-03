@@ -97,7 +97,7 @@ S3_ENDPOINT  = os.environ.get('S3_ENDPOINT',   '')   # 例: https://s3.isk01.sak
 S3_ACCESS_KEY= os.environ.get('S3_ACCESS_KEY',  '')
 S3_SECRET_KEY= os.environ.get('S3_SECRET_KEY',  '')
 S3_BUCKET    = os.environ.get('S3_BUCKET',      'fxea')
-S3_PREFIX    = os.environ.get('S3_PREFIX',      'mix2')  # fx-ea3 専用フォルダ
+S3_PREFIX    = os.environ.get('S3_PREFIX',      'mix3')  # fx-ea5 専用フォルダ
 S3_ENABLED   = bool(S3_ENDPOINT and S3_ACCESS_KEY and S3_SECRET_KEY)
 
 # ── Google Drive: 完全無効 (S3 のみ使用) ─────────────────────────────────────

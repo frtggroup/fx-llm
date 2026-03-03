@@ -26,7 +26,7 @@ from fastapi.responses import HTMLResponse, JSONResponse, StreamingResponse, Fil
 # ── S3 設定 (環境変数から取得) ────────────────────────────────────────────────
 _S3_ENDPOINT   = os.environ.get('S3_ENDPOINT',   '')
 _S3_BUCKET     = os.environ.get('S3_BUCKET',     '')
-_S3_PREFIX     = os.environ.get('S3_PREFIX',     'mix')
+_S3_PREFIX     = os.environ.get('S3_PREFIX',     'mix3')
 _S3_ACCESS_KEY = os.environ.get('S3_ACCESS_KEY', '')
 _S3_SECRET_KEY = os.environ.get('S3_SECRET_KEY', '')
 _S3_REGION     = os.environ.get('S3_REGION',     'us-east-1')

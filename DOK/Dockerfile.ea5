@@ -35,7 +35,7 @@ ENV DEBIAN_FRONTEND=noninteractive \
     S3_REGION=us-east-1 \
     S3_ACCESS_KEY=mioroot \
     S3_BUCKET=fxea \
-    S3_PREFIX=mix
+    S3_PREFIX=mix3
 
 ENV S3_SECRET_KEY="Yakrty1484!#"
 

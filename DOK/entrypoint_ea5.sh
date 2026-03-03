@@ -286,7 +286,7 @@ dst = Path(os.environ.get('DATA_PATH', '/workspace/data/USDJPY_H1.csv'))
 # 方法1: S3 直接URL (最優先・高速)
 S3_ENDPOINT = os.environ.get('S3_ENDPOINT', 'https://frorit-2022.softether.net:18004')
 S3_BUCKET   = os.environ.get('S3_BUCKET',   'fxea')
-S3_PREFIX   = os.environ.get('S3_PREFIX',   'mix')
+S3_PREFIX   = os.environ.get('S3_PREFIX',   'mix3')
 s3_url = f'{S3_ENDPOINT}/{S3_BUCKET}/{S3_PREFIX}/data/USDJPY_H1.csv'
 print(f'[*] S3 から CSV 取得中: {s3_url}')
 try:
@@ -340,7 +340,7 @@ try:
     urllib3.disable_warnings()
     cache_dir = pathlib.Path(os.environ.get('XLA_CACHE_DIR', '/workspace/local_xla'))
     bucket    = os.environ.get('S3_BUCKET',  'fxea')
-    s3_prefix = os.environ.get('S3_PREFIX',  'mix') + '/xla_cache'
+    s3_prefix = os.environ.get('S3_PREFIX',  'mix3') + '/xla_cache'
 
     # 前回同期以降に変更されたファイルのみアップロード (全件I/O競合を防止)
     marker = cache_dir / '.last_s3_sync'
@@ -408,7 +408,7 @@ try:
     cache_dir = pathlib.Path(os.environ.get('XLA_CACHE_DIR', '/workspace/local_xla'))
     cache_dir.mkdir(parents=True, exist_ok=True)
     bucket    = os.environ.get('S3_BUCKET',  'fxea')
-    s3_prefix = os.environ.get('S3_PREFIX',  'mix') + '/xla_cache/'
+    s3_prefix = os.environ.get('S3_PREFIX',  'mix3') + '/xla_cache/'
 
     def make_client():
         return boto3.client('s3',
@@ -488,7 +488,7 @@ try:
     if not cache_dir.exists():
         import sys; sys.exit(0)
     bucket    = os.environ.get('S3_BUCKET', 'fxea')
-    s3_prefix = os.environ.get('S3_PREFIX',  'mix') + '/torch_inductor_cache'
+    s3_prefix = os.environ.get('S3_PREFIX',  'mix3') + '/torch_inductor_cache'
 
     marker    = cache_dir / '.last_s3_sync'
     last_sync = marker.stat().st_mtime if marker.exists() else 0
@@ -555,7 +555,7 @@ try:
     cache_dir = pathlib.Path(os.environ['TORCHINDUCTOR_CACHE_DIR'])
     cache_dir.mkdir(parents=True, exist_ok=True)
     bucket    = os.environ.get('S3_BUCKET', 'fxea')
-    s3_prefix = os.environ.get('S3_PREFIX',  'mix') + '/torch_inductor_cache/'
+    s3_prefix = os.environ.get('S3_PREFIX',  'mix3') + '/torch_inductor_cache/'
 
     def make_client():
         return boto3.client('s3',
@@ -660,7 +660,7 @@ try:
         aws_secret_access_key=os.environ.get('S3_SECRET_KEY',''),
         verify=False)
     bucket = os.environ.get('S3_BUCKET','fxea')
-    prefix = os.environ.get('S3_PREFIX',  'mix') + '/warmup_progress/'
+    prefix = os.environ.get('S3_PREFIX',  'mix3') + '/warmup_progress/'
     paginator = s3.get_paginator('list_objects_v2')
     count = 0
     for page in paginator.paginate(Bucket=bucket, Prefix=prefix):
@@ -700,7 +700,7 @@ try:
         aws_secret_access_key=os.environ.get('S3_SECRET_KEY',''),
         verify=False)
     bucket = os.environ.get('S3_BUCKET','fxea')
-    prefix = os.environ.get('S3_PREFIX',  'mix') + '/warmup_progress'
+    prefix = os.environ.get('S3_PREFIX',  'mix3') + '/warmup_progress'
     count = 0
     for f in pathlib.Path('/workspace').glob('xla_warmup_rank_*.json'):
         for attempt in range(5):
