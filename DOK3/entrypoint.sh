@@ -743,9 +743,9 @@ fi
 # GPU: inductor キャッシュを学習中に定期バックアップ (10分ごと)
 INDUCTOR_SYNC_PID=""
 if [ "$DEVICE_TYPE" = "GPU" ] && [ -n "$S3_ENDPOINT" ]; then
-    (while true; do sleep 600; _inductor_cache_upload; done) &
+    (while true; do sleep 3600; _inductor_cache_upload; done) &
     INDUCTOR_SYNC_PID=$!
-    echo "[*] 学習中 inductor キャッシュ自動同期 開始 (10分ごと, PID: ${INDUCTOR_SYNC_PID})"
+    echo "[*] 学習中 inductor キャッシュ自動同期 開始 (60分ごと, PID: ${INDUCTOR_SYNC_PID})"
 fi
 
 # ── 自動再起動ループ ──────────────────────────────────────────────────────────

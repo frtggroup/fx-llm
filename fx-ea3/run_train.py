@@ -2263,7 +2263,7 @@ def main():
     _sync_thread.start()
 
     # ── inductor キャッシュ定期同期スレッド (GPU のみ) ──────────────────────
-    _INDUCTOR_SYNC_INTERVAL = 300   # 5分ごと
+    _INDUCTOR_SYNC_INTERVAL = 3600  # 60分ごと (10/5分毎だとS3スレッド爆発でCPU飽和)
     _inductor_sync_stop = threading.Event()
 
     def _inductor_cache_sync_loop():
