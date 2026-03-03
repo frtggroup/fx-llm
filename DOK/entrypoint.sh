@@ -210,6 +210,10 @@ else
     echo "[*] クラウド/ローカルモード: /workspace を使用"
     mkdir -p /workspace/data /workspace/ai_ea/trials \
              /workspace/ai_ea/top100 /workspace/ai_ea/top_cache
+    # torch.compile inductor キャッシュを /workspace に永続化
+    # (デフォルト ~/.cache/torch/inductor/ はコンテナ再起動で消えるため)
+    export TORCHINDUCTOR_CACHE_DIR="/workspace/torch_inductor_cache"
+    mkdir -p "${TORCHINDUCTOR_CACHE_DIR}"
 fi
 
 # ── 5. 環境変数 ──────────────────────────────────────────────────────────────

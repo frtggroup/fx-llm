@@ -729,6 +729,13 @@ def train(args, X_tr, y_tr, X_te, y_te, mean, std, n_feat=None, _spawn_rank=None
     # max-autotune: Triton kernel 最適化 + CUDA graph (長時間学習で元を取る H100 専用)
     if dev_type == 'cuda' and not _is_worker:
         _step_mode = 'max-autotune' if is_h100 else 'reduce-overhead'
+        # dynamo インメモリキャッシュ上限を拡張 (デフォルト8 → 64)
+        # 同一プロセスで複数アーキテクチャを試す場合にキャッシュが溢れて再コンパイルされるのを防ぐ
+        try:
+            import torch._dynamo.config as _dynamo_cfg
+            _dynamo_cfg.cache_size_limit = 64
+        except Exception:
+            pass
         _m, _c, _o  = model, criterion, optimizer
         _amp_en, _amp_dt = use_amp, amp_dtype
         _use_sc, _sc = use_scaler, scaler
