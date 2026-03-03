@@ -82,21 +82,16 @@ BASE_FEATURE_COLS.extend([
     "is_tokyo", "is_london", "is_ny", "is_overlap"
 ])
 
-# 追加の遅延/差分特徴などで水増し (約500以上にする)
+# 追加の遅延/差分特徴
 for p in range(5, 51, 5):
     BASE_FEATURE_COLS.extend([f"ret1_{p}", f"ret5_{p}", f"vol_{p}"])
-    
+
 for p in range(5, 120, 5):
-    # さらにボラティリティやモメンタムの差分で強引に700近辺まで持っていく
     BASE_FEATURE_COLS.extend([f"momentum_{p}", f"volatility_{p}", f"price_diff_{p}"])
 
-# 数をきっちり700個に切り詰める/水増しする
-while len(BASE_FEATURE_COLS) < 700:
-    BASE_FEATURE_COLS.append(f"extra_random_feat_{len(BASE_FEATURE_COLS)}")
-    
-BASE_FEATURE_COLS = BASE_FEATURE_COLS[:700]
+# ※ extra_random_feat は削除 — 実在する特徴量のみ使用
 
-N_GROUPS = len(BASE_FEATURE_COLS)
+N_GROUPS = len(BASE_FEATURE_COLS)  # 230
 
 # 拡張特徴量リスト 
 _N_DIFFS = 24
