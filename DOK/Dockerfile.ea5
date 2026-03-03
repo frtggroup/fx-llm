@@ -114,9 +114,7 @@ RUN rm -f /workspace/fx-ea5/all_results.json \
           /workspace/fx-ea5/norm_params.json \
           /workspace/fx-ea5/norm_params_best.json
 COPY DOK/entrypoint_ea5.sh /workspace/entrypoint.sh
-# Windows CRLF → Unix LF 変換 (exec format error 対策)
-RUN sed -i 's/\r//' /workspace/entrypoint.sh && \
-    chmod +x /workspace/entrypoint.sh
+RUN chmod +x /workspace/entrypoint.sh
 
 RUN mkdir -p /workspace/data \
              /workspace/fx-ea5/trials \
