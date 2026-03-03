@@ -1748,6 +1748,21 @@ def _worker_init_proxy(train_py_dir: str, cache_pkl_path: str,
     """spawn ワーカーの初期化 (pickleできる関数でなければならない)"""
     import sys as _sys, os as _os
     _sys.path.insert(0, train_py_dir)
+
+    # ── 重要: spawn は親の環境変数を引き継がない ──────────────────────────
+    # DEVICE_TYPE が未設定だと train.py の _detect_device() が XLA に落ちる
+    # (torch_xla がインストール済みのイメージではXLAを優先するため)
+    # 親プロセスの DEVICE_TYPE を引き継ぐか、なければ GPU をデフォルトにする
+    _parent_device = os.environ.get('DEVICE_TYPE', 'GPU').upper()
+    _os.environ.setdefault('DEVICE_TYPE', _parent_device)
+    if _parent_device == 'GPU':
+        # GPU モードでは PJRT_DEVICE=CUDA + CUDA_VISIBLE_DEVICES を確実にセット
+        _os.environ['PJRT_DEVICE'] = 'CUDA'
+        _os.environ.setdefault('CUDA_VISIBLE_DEVICES', '0')
+    elif _parent_device == 'TPU':
+        _os.environ.setdefault('PJRT_DEVICE', 'TPU')
+    # ─────────────────────────────────────────────────────────────────────
+
     # WorkerPool ワーカーであることを train.py に伝える
     # → torch.compile を有効にして inductor キャッシュを生成・再利用する
     _os.environ['_FX_WORKERPOOL'] = '1'
