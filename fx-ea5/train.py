@@ -1,0 +1,1850 @@
+"""
+CUDA GPU 学習スクリプト v3
+- 70次元特徴量 × H1データ
+- 10種アーキテクチャ対応
+- 時間重み付け・過学習早期終了
+
+使用方法:
+    py -3.12 train.py [オプション]
+"""
+import os, sys, json, argparse, time, threading
+from pathlib import Path
+from datetime import timedelta
+
+# ── 非同期ファイル書き込みエグゼキューター ─────────────────────────────────────
+# GPU訓練ループをブロックしないよう、ファイルI/OはバックグラウンドスレッドでOK
+_last_write_thread: threading.Thread | None = None
+
+def _async_write(path: Path, text: str) -> None:
+    """ノンブロッキング: バックグラウンドで tmp→rename アトミック書き込み"""
+    global _last_write_thread
+    def _do():
+        try:
+            tmp = path.with_suffix('.tmp')
+            tmp.write_text(text, encoding='utf-8')
+            tmp.replace(path)
+        except Exception:
+            pass
+    # 前のスレッドが生きていてもスキップせず新スレッドで上書き
+    _last_write_thread = threading.Thread(target=_do, daemon=True)
+    _last_write_thread.start()
+
+import numpy as np
+import torch
+import torch.nn as nn
+from torch.utils.data import DataLoader, TensorDataset, WeightedRandomSampler  # noqa (DataLoader は backtest で使用)
+
+sys.path.insert(0, str(Path(__file__).parent))
+from features import (load_data, add_indicators, build_dataset,
+                       FEATURE_COLS, N_FEATURES, N_GROUPS, FEATURE_GROUPS, expand_groups)
+from feature_sets import FEATURE_SETS
+import random as _random
+from model    import build_model, FXPredictorWithNorm, export_onnx, verify_onnx, ARCH_MAP
+from dashboard import update_dashboard
+
+_DEFAULT_DATA = str(Path(__file__).parent.parent / 'USDJPY_M1_202301020700_202602262003.csv')
+DATA_PATH = Path(os.environ.get('DATA_PATH', _DEFAULT_DATA))
+OUT_DIR   = Path(__file__).parent
+ONNX_PATH = OUT_DIR / 'fx_model.onnx'
+NORM_PATH = OUT_DIR / 'norm_params.json'
+SPREAD    = 0.005  # ラウンドトリップ 1.0pips = 0.010円
+                  # エントリー時・エグジット時の2回引くため 0.01/2 = 0.005 に設定
+
+# ── バックテスト 資金設定 ──────────────────────────────────────────────────
+BT_CAPITAL  = float(os.environ.get('BT_CAPITAL',  '150000'))  # スタート資金 (円)
+BT_LEVERAGE = float(os.environ.get('BT_LEVERAGE', '1000'))    # レバレッジ倍率
+BT_RISK_PCT = float(os.environ.get('BT_RISK_PCT', '1.0'))     # リスク率 (%)
+
+
+def _calc_lot(equity_yen: float, risk_pct: float = BT_RISK_PCT) -> float:
+    """MQL5 LotSize() 相当: 口座残高の risk_pct % を使うロット数を返す
+    JPY口座: magnification=10000
+    例) 150,000円 × 1% → MathCeil(150000*1/10000)/100 - 0.01 = 0.14 lot
+    """
+    import math
+    magnification = 10000  # JPY口座
+    lot = math.ceil(equity_yen * risk_pct / magnification) / 100.0
+    lot = lot - 0.01
+    if lot < 0.01:
+        lot = 0.01
+    if lot > 1.0:
+        lot = math.ceil(lot)
+    if lot > 20.0:
+        lot = 20.0
+    return lot
+
+_dash: dict = {}
+
+
+def parse_args():
+    p = argparse.ArgumentParser()
+    p.add_argument('--epochs',    type=int,   default=500)
+    p.add_argument('--hidden',    type=int,   default=24)
+    p.add_argument('--layers',    type=int,   default=1)
+    p.add_argument('--dropout',   type=float, default=0.5)
+    p.add_argument('--lr',        type=float, default=5e-4)
+    p.add_argument('--batch',     type=int,   default=128)
+    p.add_argument('--tp',        type=float, default=1.5)
+    p.add_argument('--sl',        type=float, default=1.0)
+    p.add_argument('--forward',   type=int,   default=20)
+    p.add_argument('--threshold', type=float, default=0.40)
+    p.add_argument('--timeframe', type=str,   default='H1')
+    p.add_argument('--seq_len',   type=int,   default=20,  help='シーケンス長')
+    p.add_argument('--arch',       type=str,   default='gru_attn',
+                   help=f'アーキテクチャ: {list(ARCH_MAP.keys())}')
+    p.add_argument('--label_type',    type=str,   default='triple_barrier',
+                   help='triple_barrier | directional')
+    p.add_argument('--wd',            type=float, default=1e-2,  help='weight_decay')
+    p.add_argument('--scheduler',     type=str,   default='onecycle',
+                   help='onecycle | cosine | step')
+    p.add_argument('--train_months',  type=int,   default=0,
+                   help='訓練期間を直近N月に限定 (0=全期間)')
+    p.add_argument('--feat_frac',     type=float, default=1.0,
+                   help='(後方互換) 使用する特徴量の割合')
+    p.add_argument('--n_features',    type=int,   default=0,
+                   help='使用する特徴量数 (0=全70, 2-70で指定)')
+    p.add_argument('--feat_set',      type=int,   default=-2,
+                   help='feature_sets.py のセット番号 (0-99), -1=ランダム数, -2=未指定')
+    p.add_argument('--feat_indices',  type=str,   default=None,
+                   help='使用する特徴量インデックスのリスト JSON形式 "[1,2,3]" (GAモード用)')
+    p.add_argument('--seed',          type=int,   default=42)
+    # run_train.py から渡される追加引数
+    p.add_argument('--trial',       type=int,   default=1)
+    p.add_argument('--total_trials',type=int,   default=1)
+    p.add_argument('--best_pf',     type=float, default=0.0)
+    p.add_argument('--start_time',  type=float, default=0.0)
+    p.add_argument('--out_dir',     type=str,   default='',
+                   help='出力ディレクトリ (並列モード用; 省略時は ai_ea/ 直下)')
+    return p.parse_args()
+
+
+def set_seed(seed):
+    np.random.seed(seed)
+    torch.manual_seed(seed)
+    if torch.cuda.is_available():
+        torch.cuda.manual_seed_all(seed)
+    # XLA RNG: xmp.spawn前に xm を呼ぶと "Runtime already initialized" エラー → スキップ
+
+
+# ─── データ準備 ────────────────────────────────────────────────────────────
+_DF_CACHE: dict = {}        # {timeframe: (df_tr, df_te)} プロセス内キャッシュ
+_WORKER_STATE: dict = {}    # ProcessPoolExecutor ワーカーが保持する常駐データ
+
+
+def prepare(args):
+    print(f"\n=== データ準備 [{args.timeframe}] ===")
+    t0 = time.time()
+
+    # WorkerPool 常駐ワーカーならメモリ上のデータを直接使用 (ディスクI/Oゼロ)
+    if _WORKER_STATE.get('df_tr') is not None:
+        df_tr_raw = _WORKER_STATE['df_tr']
+        df_te     = _WORKER_STATE['df_te']
+        print(f"  [WORKER-CACHE HIT] {len(df_tr_raw):,} / {len(df_te):,}")
+        # 後続の train_months フィルタに備えてコピーを返す
+        df_tr = df_tr_raw
+        # → 以下のキャッシュ処理はスキップして train_months フィルタへ直行
+        _DF_CACHE[args.timeframe] = (df_tr_raw, df_te)  # 通常パスとの互換性
+
+    # 同一プロセス内でのキャッシュ（シングルモード用）
+    # 並列モードでは各サブプロセスが独自にキャッシュを持つ
+    cache_key = args.timeframe
+    if cache_key in _DF_CACHE:
+        df_tr, df_te = _DF_CACHE[cache_key]
+        print(f"  データキャッシュHIT ({len(df_tr):,} / {len(df_te):,})")
+    else:
+        # ディスクキャッシュ: 並列試行間で共有 (ファイルロックで競合防止)
+        cache_path = OUT_DIR.parent / f'df_cache_{args.timeframe}.pkl'
+        lock_path  = cache_path.with_suffix('.lock')
+        import pickle, fcntl
+
+        def _load_cache():
+            with open(cache_path, 'rb') as f:
+                return pickle.load(f)
+
+        def _build_and_save():
+            df = load_data(str(DATA_PATH), timeframe=args.timeframe)
+            df = add_indicators(df)
+            df.replace([np.inf, -np.inf], np.nan, inplace=True)
+            df.dropna(inplace=True)
+            # テスト期間を 2025-01-01 以降に固定 (XLAグラフ形状を完全固定化するため)
+            import pandas as pd
+            TEST_SPLIT_DATE = pd.Timestamp('2025-01-01', tz=df.index.tz)
+            dtr = df[df.index < TEST_SPLIT_DATE].copy()
+            dte = df[df.index >= TEST_SPLIT_DATE].copy()
+            try:
+                tmp = cache_path.with_suffix('.tmp')
+                with open(tmp, 'wb') as f:
+                    pickle.dump((dtr, dte), f)
+                tmp.replace(cache_path)
+                print(f"  ディスクキャッシュ保存: {cache_path}")
+            except Exception as e:
+                print(f"  キャッシュ保存スキップ: {e}")
+            return dtr, dte
+
+        if cache_path.exists():
+            print(f"  ディスクキャッシュ読み込み中...")
+            try:
+                df_tr, df_te = _load_cache()
+                print(f"  キャッシュ読み込み完了 ({len(df_tr):,} / {len(df_te):,})  {time.time()-t0:.1f}秒")
+            except Exception:
+                # 破損キャッシュ → 再構築
+                print(f"  キャッシュ破損 → 再構築します")
+                cache_path.unlink(missing_ok=True)
+                df_tr, df_te = _build_and_save()
+        else:
+            # ファイルロックで1プロセスだけが構築し、他は待機して読む
+            print(f"  キャッシュ未作成 → 排他ロックで構築中...")
+            try:
+                lock_fh = open(lock_path, 'w')
+                fcntl.flock(lock_fh, fcntl.LOCK_EX)   # 排他ロック取得
+                try:
+                    if cache_path.exists():   # ロック待ち中に他が作成済み
+                        df_tr, df_te = _load_cache()
+                        print(f"  他プロセスが作成済みキャッシュを読み込み ({len(df_tr):,}/{len(df_te):,})")
+                    else:
+                        df_tr, df_te = _build_and_save()
+                finally:
+                    fcntl.flock(lock_fh, fcntl.LOCK_UN)
+                    lock_fh.close()
+            except (ImportError, AttributeError):
+                # Windows など fcntl 非対応環境はロックなしで実行
+                if cache_path.exists():
+                    df_tr, df_te = _load_cache()
+                else:
+                    df_tr, df_te = _build_and_save()
+
+        _DF_CACHE[cache_key] = (df_tr, df_te)
+
+    # 訓練期間を最近N月に絞る (分布シフト対策)  ※元 df_tr をコピーして使う
+    df_tr = df_tr.copy()
+    tm = getattr(args, 'train_months', 0)
+    _tpu_mode = (os.environ.get('PJRT_DEVICE', '').upper() == 'TPU'
+                 or os.environ.get('DEVICE_TYPE', '').upper() == 'TPU')
+    if _tpu_mode and tm > 0:
+        print(f"  [TPU] train_months={tm} を無効化 (XLAグラフ形状固定化のため全期間使用)")
+        tm = 0
+    # テスト期間を 2025-01-01 以降に固定 → 学習データの末尾を必ずここで切る (リーク防止)
+    import pandas as pd
+    _TEST_SPLIT = pd.Timestamp('2025-01-01', tz=df_tr.index.tz)
+    df_tr = df_tr[df_tr.index < _TEST_SPLIT].copy()
+    print(f"  [SPLIT] 学習期間: ~ {df_tr.index[-1].date()}  テスト期間: 2025-01-01 以降 (固定)")
+
+    if tm > 0:
+        train_start = df_tr.index[-1] - timedelta(days=tm * 30)
+        df_tr = df_tr[df_tr.index >= train_start].copy()
+        print(f"  訓練期間を直近{tm}ヶ月に限定: {df_tr.index[0].date()} ～")
+    print(f"  訓練: {len(df_tr):,}  テスト: {len(df_te):,}")
+
+    print(f"  ラベル生成中... (triple_barrier)")
+    seq_len   = args.seq_len
+
+    # 特徴量セット選択 (優先順: feat_indices(直接指定) > feat_set > n_features > feat_frac > 全部)
+    feat_set_id = getattr(args, 'feat_set', -2)
+    n_feat_arg  = getattr(args, 'n_features', 0)
+    feat_frac   = getattr(args, 'feat_frac', 1.0)
+    feat_indices_direct = getattr(args, 'feat_indices', None)
+    # run_train.py が str(list) で渡す場合 (例: "[1, 13, 22]") を JSON パース
+    if feat_indices_direct and isinstance(feat_indices_direct, str):
+        import json as _json
+        try:
+            feat_indices_direct = _json.loads(feat_indices_direct)
+        except Exception:
+            feat_indices_direct = None
+
+    _tpu_mode = (os.environ.get('PJRT_DEVICE', '').upper() == 'TPU'
+                 or os.environ.get('DEVICE_TYPE', '').upper() == 'TPU')
+
+    if feat_indices_direct and isinstance(feat_indices_direct, list):
+        # GAが重要特徴量から直接指定したグループインデックスリスト → カラム展開
+        group_ids    = sorted(int(i) for i in feat_indices_direct if 0 <= int(i) < N_GROUPS)
+        feat_indices = expand_groups(group_ids)
+        print(f"  特徴量直指定: グループ{len(group_ids)}個 → {len(feat_indices)}列 (逐次差分込み)")
+    elif 0 <= feat_set_id <= 99:
+        # 設計済みセット (グループインデックス) → カラム展開
+        group_ids    = FEATURE_SETS[feat_set_id]
+        feat_indices = expand_groups(group_ids)
+        print(f"  特徴量セット#{feat_set_id+1}: グループ{len(group_ids)}個 → {len(feat_indices)}列")
+    elif n_feat_arg > 0 and n_feat_arg < N_GROUPS:
+        # ランダム N グループ → カラム展開
+        n_sel = max(1, min(n_feat_arg, N_GROUPS))
+        _random.seed(args.seed)
+        group_ids    = sorted(_random.sample(range(N_GROUPS), n_sel))
+        feat_indices = expand_groups(group_ids)
+        print(f"  特徴量ランダム: グループ{n_sel}/{N_GROUPS} → {len(feat_indices)}列 (seed={args.seed})")
+    elif feat_frac < 1.0:
+        n_sel = max(1, int(N_GROUPS * feat_frac))
+        _random.seed(args.seed)
+        group_ids    = sorted(_random.sample(range(N_GROUPS), n_sel))
+        feat_indices = expand_groups(group_ids)
+        print(f"  特徴量サブセット: グループ{n_sel}/{N_GROUPS} → {len(feat_indices)}列 (frac={feat_frac:.0%})")
+    else:
+        feat_indices = None
+        print(f"  特徴量: 全{N_FEATURES}次元 ({N_GROUPS}グループ × 25列)")
+
+    # ===== TPU時の特殊処理：形状は固定しつつ、使わない列を0マスキングする =====
+    # build_dataset の中ではサブセット抽出させず、後から 0 に書き換える
+    build_feat_idx = None if _tpu_mode else feat_indices
+    
+    X_tr, y_tr, _ = build_dataset(df_tr, seq_len, args.tp, args.sl, args.forward,
+                                   feat_indices=build_feat_idx)
+    X_te, y_te, _ = build_dataset(df_te, seq_len, args.tp, args.sl, args.forward,
+                                   feat_indices=build_feat_idx)
+
+    if _tpu_mode and feat_indices is not None:
+        n_masked = N_FEATURES - len(feat_indices)
+        print(f"  [TPU] {N_FEATURES}次元を維持しつつ、選択外の{n_masked}列を0埋め (グループ単位マスク)")
+        mask = np.zeros(N_FEATURES, dtype=np.float32)
+        mask[feat_indices] = 1.0
+        X_tr = X_tr * mask  # Broadcasting across (batch, seq_len, features)
+        X_te = X_te * mask
+
+    # 正規化 (訓練データのみで計算)
+    n_feat_actual = X_tr.shape[2]          # サブセット後の実際の特徴量数
+    flat = X_tr.reshape(-1, n_feat_actual)
+    mean = flat.mean(0).astype(np.float32)
+    std  = flat.std(0).astype(np.float32)
+    std[std < 1e-8] = 1.0
+
+    with open(NORM_PATH, 'w', encoding='utf-8') as f:
+        json.dump({'mean': mean.tolist(), 'std': std.tolist(),
+                   'feature_cols': (FEATURE_COLS if feat_indices is None
+                                    else [FEATURE_COLS[i] for i in feat_indices]),
+                   'feat_indices': feat_indices,
+                   'timeframe': args.timeframe,
+                   'seq_len': seq_len}, f, indent=2)
+
+    print(f"  データ準備: {time.time()-t0:.1f}秒")
+    return X_tr, y_tr, X_te, y_te, mean, std, df_te, seq_len, feat_indices
+
+
+# ─── GPU 常駐データローダー ──────────────────────────────────────────────────
+class GPULoader:
+    """
+    全データを GPU に常駐させてバッチを GPU 上で切り出す。
+    CPU↔GPU 転送オーバーヘッドをゼロにして GPU 使用率を最大化。
+    drop_last=True (TPU用): XLA は全バッチが同じサイズでないと再コンパイルが走るため
+    最終の端数バッチを捨てることでグラフ形状を完全固定化する。
+    """
+    def __init__(self, X: np.ndarray, y: np.ndarray,
+                 device: torch.device, batch_size: int,
+                 weights: np.ndarray = None, shuffle: bool = False,
+                 drop_last: bool = False):
+        # TPU の場合は動的 Gather が激遅になるため CPU メモリ上に置いておく
+        self.is_tpu = (device.type == 'xla')
+        data_dev = torch.device('cpu') if self.is_tpu else device
+
+        self.X   = torch.tensor(X, dtype=torch.float32, device=data_dev)
+        self.y   = torch.tensor(y, dtype=torch.long,    device=data_dev)
+        
+        # TPU で「ラベル付与の数件のブレ」によるバッチ数変動＝再コンパイル を防ぐため
+        # 余裕を持たせた最小件数（例えば本来13371件なら13000件等）に丸め込むための引数
+        # ここでは「指定された N または len(y)」を実際の件数上限とする
+        self.n   = len(y)
+        if hasattr(self, 'target_n') and self.target_n > 0:
+            self.n = min(self.n, self.target_n)
+            
+        self.bs  = batch_size
+        self.dev = device  # 本当のターゲットデバイス
+        self.shuf = shuffle
+        self.drop_last = drop_last
+        # 重み付きサンプリング用 (CPU/GPU上で multinomial)
+        if weights is not None:
+            self.w = torch.tensor(weights[:self.n], dtype=torch.float32, device=data_dev)
+        else:
+            self.w = None
+
+    def __len__(self):
+        if self.drop_last:
+            return max(1, self.n // self.bs)
+        return max(1, (self.n + self.bs - 1) // self.bs)
+
+    def __iter__(self):
+        # drop_last 時は端数が出ないよう (n//bs)*bs 件だけサンプリング
+        n_use = (self.n // self.bs) * self.bs if self.drop_last else self.n
+        n_use = max(n_use, self.bs)  # 最低1バッチは確保
+
+        if self.w is not None:
+            idx = torch.multinomial(self.w, n_use, replacement=True)
+        elif self.shuf:
+            idx = torch.randperm(self.n, device=self.X.device)[:n_use]
+        else:
+            idx = torch.arange(self.n, device=self.X.device)[:n_use]
+        if self.is_tpu:
+            # TPU 最適化: エポック全データを一括 CPU→TPU 転送してから TPU 側でスライス
+            # per-batch 転送 (11回) → 一括転送 (1回) に削減。
+            # XLA の動的 Gather は激遅だが、連続スライスは XLA view で essentially free。
+            X_epoch = self.X[idx]           # CPU gather (np.random と同等)
+            y_epoch = self.y[idx]           # CPU gather
+            X_dev   = X_epoch.to(self.dev)  # 一括 HtoD 転送
+            y_dev   = y_epoch.to(self.dev)
+            del X_epoch, y_epoch            # CPU バッファを即解放
+            for start in range(0, n_use, self.bs):
+                yield X_dev[start:start + self.bs], y_dev[start:start + self.bs]
+        else:
+            for start in range(0, n_use, self.bs):
+                sl = idx[start:start + self.bs]
+                xb, yb = self.X[sl], self.y[sl]
+                yield xb, yb
+
+
+def make_loaders(X_tr, y_tr, X_te, y_te, args, device, drop_last: bool = False):
+    counts = np.bincount(y_tr, minlength=3).astype(float)
+    counts = np.where(counts == 0, 1.0, counts)
+    n      = len(y_tr)
+    tw     = 1.0 + np.linspace(0, 1, n)          # 新データ重視
+    weights = (1.0 / counts)[y_tr] * tw
+
+    # ========= TPU再コンパイル対策（バッチ数＝グラフ形状の完全固定化） =========
+    # ラベル(triple_barrier)の条件でNaN落ちする件数が数件ブレるため、
+    # 常に一定件数（バッチ数の整数倍）に切り落としてXLAのグラフサイズが変わらないようにする。
+    _is_tpu = (device.type == 'xla')
+    tr_dl = GPULoader(X_tr, y_tr, device, args.batch, weights=weights, drop_last=drop_last)
+    va_dl = GPULoader(X_te, y_te, device, args.batch, shuffle=False, drop_last=drop_last)
+    
+    if _is_tpu and drop_last:
+        # 例えば理論値最大 13371 なら、安全に 13000 とするなどの固定（ここでは最低限 -100件の切り捨てを想定）
+        # ※ TPU以外ではそのまま
+        safe_tr_batches = (len(X_tr) - 200) // args.batch
+        safe_te_batches = (len(X_te) - 200) // args.batch
+        safe_tr_batches = max(1, safe_tr_batches)
+        safe_te_batches = max(1, safe_te_batches)
+        tr_dl.target_n = safe_tr_batches * args.batch
+        va_dl.target_n = safe_te_batches * args.batch
+        tr_dl.n = tr_dl.target_n
+        va_dl.n = va_dl.target_n
+
+    print(f"  GPU常駐データ: 訓練{len(X_tr):,} テスト{len(X_te):,} "
+          f"batch={args.batch} batches/ep={len(tr_dl)}"
+          + (f" [固定化: {tr_dl.n}]" if _is_tpu else "")
+          + (" [drop_last=ON]" if drop_last else ""))
+    return tr_dl, va_dl
+
+
+# ─── 学習 ────────────────────────────────────────────────────────────────────
+def _detect_device():
+    """実行デバイスを検出。entrypoint.sh の DEVICE_TYPE 環境変数を最優先で参照し、
+    torch_xla がインストールされていても GPU 環境で誤って XLA を使わないようにする。"""
+    import os as _os
+    _dt = _os.environ.get("DEVICE_TYPE", "").upper()
+
+    # entrypoint.sh が GPU と判定済み → 即 CUDA を返す（torch_xla 干渉を回避）
+    if _dt == "GPU":
+        # torch_xla がワーカープロセス起動時に CUDA_VISIBLE_DEVICES を空にする場合があるため
+        # DEVICE_TYPE=GPU が指定されていれば強制的にリセットしてから確認する
+        if not _os.environ.get('CUDA_VISIBLE_DEVICES'):
+            _os.environ['CUDA_VISIBLE_DEVICES'] = '0'
+        _os.environ['PJRT_DEVICE'] = 'CUDA'
+        if torch.cuda.is_available():
+            return torch.device('cuda'), 'cuda'
+        # それでも使えない場合は警告して続行
+        print("  [WARN] DEVICE_TYPE=GPU だが torch.cuda.is_available()=False — CPU にフォールバック")
+        return torch.device('cpu'), 'cpu'
+
+    # entrypoint.sh が TPU と判定済み → XLA を使用
+    if _dt == "TPU":
+        try:
+            # torch_xla が dynamo/Inductor を自動起動してデッドロックするのを防ぐ
+            import torch._dynamo as _dynamo  # type: ignore
+            _dynamo.config.disable = True
+        except Exception:
+            pass
+        # torch_xla が LIBTPU_INIT_ARGS に非対応フラグを追加してlibtpuがクラッシュするのを防ぐ
+        _os.environ.setdefault('LIBTPU_INIT_ARGS', '')
+        try:
+            import torch_xla.core.xla_model as xm  # type: ignore
+            dev = xm.xla_device()
+            return dev, 'xla'
+        except Exception as _e:
+            print(f"  [WARN] DEVICE_TYPE=TPU だが torch_xla が利用不可 ({type(_e).__name__}: {str(_e)[:150]}) — CPU にフォールバック")
+            return torch.device('cpu'), 'cpu'
+
+    # DEVICE_TYPE 未設定 (直接 python 起動など): 従来通りの自動検出
+    if torch.cuda.is_available():
+        return torch.device('cuda'), 'cuda'
+    try:
+        import torch_xla.core.xla_model as xm  # type: ignore
+        return xm.xla_device(), 'xla'
+    except Exception:
+        pass
+    return torch.device('cpu'), 'cpu'
+
+
+def _xmp_spawn_worker(rank, data_path, result_path, n_dev):
+    """xmp.spawn(start_method='spawn') から呼ばれるトップレベルワーカー。
+    spawn では親プロセスのメモリを共有しないため、データはファイル経由で渡す。
+    XLA 関連コードはすべてこの関数内 (ローカルスコープ) で初期化する。"""
+    import pickle, sys
+    sys.path.insert(0, str(Path(__file__).parent))
+
+    with open(data_path, 'rb') as _f:
+        _d = pickle.load(_f)
+    X_tr   = _d['X_tr'];  y_tr = _d['y_tr']
+    X_te   = _d['X_te'];  y_te = _d['y_te']
+    mean   = _d['mean'];  std  = _d['std']
+    n_feat = _d['n_feat']
+
+    class _A: pass
+    args = _A()
+    for k, v in _d['args'].items():
+        setattr(args, k, v)
+
+    train(args, X_tr, y_tr, X_te, y_te, mean, std, n_feat,
+          _spawn_rank=rank, _spmd_n_dev=n_dev, _spmd_result=result_path)
+
+
+def _dispatch_spmd(args, X_tr, y_tr, X_te, y_te, mean, std, n_feat, n_dev):
+    """xmp.spawn で n_dev チップに学習を分散する。
+    PJRT 推奨の start_method='spawn' を使用し、データは /dev/shm 経由で渡す。
+    この関数は XLA/PJRT を初期化する前に呼び出す必要がある。"""
+    import pickle
+    try:
+        import torch_xla.distributed.xla_multiprocessing as xmp  # type: ignore
+    except ImportError:
+        print("[WARN] xla_multiprocessing が利用不可 → シングルチップにフォールバック", flush=True)
+        return train(args, X_tr, y_tr, X_te, y_te, mean, std, n_feat,
+                     _spawn_rank=0, _spmd_n_dev=1, _spmd_result='')
+
+    pid         = os.getpid()
+    data_path   = f'/dev/shm/xmp_data_{pid}.pkl'
+    result_path = f'/dev/shm/xmp_result_{pid}.pt'
+
+    print(f"\n=== SPMD 並列学習 [{n_dev} チップ] ===", flush=True)
+
+    _args_dict = {k: v for k, v in vars(args).items()} if hasattr(args, '__dict__') else {}
+    with open(data_path, 'wb') as _f:
+        pickle.dump({'X_tr': X_tr, 'y_tr': y_tr, 'X_te': X_te, 'y_te': y_te,
+                     'mean': mean, 'std': std, 'n_feat': n_feat,
+                     'args': _args_dict}, _f)
+    try:
+        # nprocs=None: PJRT が利用可能な全チップを自動割り当て
+        # start_method='spawn': PJRT 推奨。トップレベル関数が必要
+        xmp.spawn(_xmp_spawn_worker,
+                  args=(data_path, result_path, n_dev),
+                  nprocs=None,
+                  start_method='spawn')
+    finally:
+        try: Path(data_path).unlink()
+        except Exception: pass
+
+    # rank 0 が保存したモデルをロード
+    seq_len = X_tr.shape[1]
+    n_in    = n_feat or N_FEATURES
+    arch    = getattr(args, 'arch', 'gru_attn')
+    model   = build_model(arch, n_in, seq_len, args.hidden, args.layers, args.dropout)
+    try:
+        state = torch.load(result_path, map_location='cpu', weights_only=True)
+        model.load_state_dict(state)
+        print(f"  [SPMD] モデルロード完了", flush=True)
+    except Exception as _e:
+        print(f"  [WARN] SPMD モデルロード失敗: {_e}", flush=True)
+    try:
+        Path(result_path).unlink()
+    except Exception:
+        pass
+    return model
+
+
+def train(args, X_tr, y_tr, X_te, y_te, mean, std, n_feat=None, _spawn_rank=None,
+          _spmd_n_dev=None, _spmd_result=None):
+    # ── SPMD ディスパッチ (XLA 初期化前に実行) ──────────────────────────────
+    _is_tpu_env = os.environ.get('DEVICE_TYPE', '').upper() == 'TPU'
+    _n_dev = _spmd_n_dev if _spmd_n_dev is not None else (
+        int(os.environ.get('TPU_NUM_DEVICES', '1')) if _is_tpu_env else 1)
+    # xmp.spawn は subprocess.Popen 経由では使用不可 (XLA二重init問題)
+    # → MAX_PARALLEL=4 で各サブプロセスが xla:0 で独立学習 (1チップ×4並列)
+    if False and _spawn_rank is None and _is_tpu_env and _n_dev > 1:
+        return _dispatch_spmd(args, X_tr, y_tr, X_te, y_te, mean, std, n_feat, _n_dev)
+
+    _spmd_mode = _spawn_rank is not None   # xmp.spawn ワーカー内
+    _is_main   = not _spmd_mode or _spawn_rank == 0   # rank 0 か シングル
+
+    device, dev_type = _detect_device()
+    if _is_main:
+        print(f"\n=== 学習 [{device}] ===")
+
+    # デバイス別の最適化設定
+    is_h100    = False
+    is_tpu     = (dev_type == 'xla')
+    # TPU は BF16 ネイティブ。CUDA (CC9=H100/CC8=A100) も BF16 が高速
+    amp_dtype  = torch.bfloat16 if is_tpu else torch.float16
+
+    if dev_type == 'cuda':
+        gpu_name = torch.cuda.get_device_name(0)
+        cc       = torch.cuda.get_device_capability(0)
+        print(f"  GPU: {gpu_name}  CC={cc[0]}.{cc[1]}")
+        torch.set_float32_matmul_precision('high')   # TF32 matmul グローバル有効化 (Ampere+)
+        torch.backends.cudnn.benchmark    = True
+        torch.backends.cudnn.deterministic = False
+        if cc[0] >= 8:
+            torch.backends.cuda.matmul.allow_tf32 = True
+            torch.backends.cudnn.allow_tf32       = True
+            amp_dtype = torch.bfloat16              # A100+ (CC8+) は BF16 ネイティブ対応
+            torch.backends.cuda.enable_flash_sdp(True)           # Flash Attention 有効化
+            torch.backends.cuda.enable_mem_efficient_sdp(True)   # メモリ効率 SDP 有効化
+        if cc[0] >= 9:
+            is_h100   = True
+            print(f"  H100 モード: BF16 + TF32 + Flash SDP + torch.compile(max-autotune) 有効")
+        elif cc[0] >= 8:
+            print(f"  A100 モード: BF16 + TF32 + Flash SDP + torch.compile 有効")
+        else:
+            print(f"  FP16 AMP モード")
+    elif is_tpu:
+        # XLA persistent cache を rank ごとに明示初期化 (XLA_PERSISTENT_CACHE_PATH より確実)
+        try:
+            import torch_xla.runtime as xr  # type: ignore
+            _rank = int(os.environ.get('PJRT_LOCAL_PROCESS_RANK', '0'))
+            _cache_base = os.environ.get('XLA_PERSISTENT_CACHE_PATH',
+                                         '/workspace/local_xla')
+            import pathlib as _pl
+            _pl.Path(_cache_base).mkdir(parents=True, exist_ok=True)
+            xr.initialize_cache(_cache_base, readonly=False)
+        except Exception:
+            pass
+        if _is_main:
+            try:
+                import torch_xla.core.xla_model as xm  # type: ignore
+                tpu_info = xm.get_xla_supported_devices()
+                _spmd_tag = f" [SPMD rank={_spawn_rank}/{_n_dev}]" if _spmd_mode else ""
+                print(f"  TPU モード: デバイス数={len(tpu_info)}  BF16 AMP 有効{_spmd_tag}")
+            except Exception:
+                print(f"  TPU モード: BF16 AMP 有効")
+
+    # TPU XLA: バッチサイズを1024に固定 + drop_last でグラフ形状を完全統一
+    # → 同じ arch/hidden の2回目以降はXLAコンパイルキャッシュが効き高速化
+    if is_tpu:
+        tpu_batch = 1024
+        if args.batch != tpu_batch:
+            print(f"  [TPU] batch {args.batch} → {tpu_batch} に固定 (XLAグラフ固定化)")
+            args.batch = tpu_batch
+        tpu_drop_last = True
+    else:
+        tpu_drop_last = False
+
+    # SPMD データシャーディング: このランクが担当するサンプルのみ使用
+    if _spmd_mode and _n_dev > 1:
+        _shard_idx = list(range(_spawn_rank, len(X_tr), _n_dev))
+        X_tr = X_tr[_shard_idx]
+        y_tr = y_tr[_shard_idx]
+        print(f"  [SPMD rank={_spawn_rank}] データシャード: {len(X_tr):,} / {len(_shard_idx)*_n_dev:,} サンプル", flush=True)
+
+    tr_dl, va_dl = make_loaders(X_tr, y_tr, X_te, y_te, args, device,
+                                drop_last=tpu_drop_last)
+
+    # AMP 設定: TPU は BF16 (GradScaler 不要), CUDA FP16 は Scaler 使用
+    use_amp    = True  # GPU/TPU ともに混合精度を使用
+    use_scaler = (dev_type == 'cuda') and (amp_dtype == torch.float16)
+    _amp_backend = dev_type if dev_type in ('cuda', 'xla') else 'cpu'
+    scaler     = torch.amp.GradScaler('cuda', enabled=use_scaler) if dev_type == 'cuda' else None
+
+    seq_len  = X_tr.shape[1]
+    arch     = getattr(args, 'arch', 'gru_attn')
+    n_in     = n_feat if n_feat is not None else N_FEATURES
+
+    def _build_and_place():
+        return build_model(arch, n_in, seq_len,
+                           args.hidden, args.layers, args.dropout).to(device)
+
+    try:
+        model = _build_and_place()
+    except (RuntimeError, torch.cuda.OutOfMemoryError) as e:
+        # OOM (CUDA) または XLA メモリ不足: バッチ半減・モデル縮小でリトライ
+        print(f"  [OOM] モデル生成失敗 ({type(e).__name__}) → hidden/2, batch/2 でリトライ")
+        if dev_type == 'cuda':
+            torch.cuda.empty_cache()
+        args.hidden = max(64, args.hidden // 2)
+        if not is_tpu:  # TPUはbatch固定のため変更しない
+            args.batch = max(256, args.batch // 2)
+        tr_dl, va_dl = make_loaders(X_tr, y_tr, X_te, y_te, args, device,
+                                    drop_last=tpu_drop_last)
+        model = _build_and_place()
+
+    # torch.compile は optimizer 作成後に step 関数ごとコンパイル (↓ scheduler 作成後に実施)
+    # TPU: lazy eval (tracing mode) が既に最適 → torch.compile 不使用
+    model_for_export = model
+    # WorkerPool ワーカー (_FX_WORKERPOOL=1) は長命プロセスなので torch.compile を有効にする
+    # ParallelTrainer のサブプロセス (1試行で終了) は compile コストが無駄なのでスキップ
+    _is_worker    = bool(getattr(args, 'out_dir', '')) and not os.environ.get('_FX_WORKERPOOL')
+    _compiled_step = None   # GPU コンパイル済みステップ関数 (None=フォールバック)
+    if is_tpu:
+        print(f"  XLA lazy eval (tracing mode) 使用")
+
+    n_params = sum(p.numel() for p in model.parameters())
+    ratio    = len(X_tr) / max(n_params, 1)
+    print(f"  arch={arch}  パラメータ数: {n_params:,}  サンプル/パラメータ比: {ratio:.1f}")
+
+    criterion = nn.CrossEntropyLoss(label_smoothing=0.1)
+    wd        = getattr(args, 'wd', 1e-2)
+    if is_tpu:
+        # TPU: syncfree.AdamW は AMP optimizer_step 内の余分な sync を排除する
+        # torch.optim.AdamW は BF16 AMP 時に追加 sync が入るが syncfree 版は不要
+        try:
+            from torch_xla.amp import syncfree as _sf  # type: ignore
+            optimizer = _sf.AdamW(model.parameters(), lr=args.lr, weight_decay=wd)
+            print(f"  syncfree.AdamW 有効 (TPU AMP sync 削減)")
+        except ImportError:
+            optimizer = torch.optim.AdamW(model.parameters(), lr=args.lr, weight_decay=wd)
+            print(f"  syncfree.AdamW 未対応 → 標準 AdamW 使用")
+    else:
+        try:
+            # fused=True: 単一CUDAカーネルで optimizer step → 5-10% 高速化 (PyTorch 2.0+)
+            optimizer = torch.optim.AdamW(model.parameters(), lr=args.lr,
+                                          weight_decay=wd,
+                                          fused=(dev_type == 'cuda'))
+            if dev_type == 'cuda':
+                print(f"  AdamW(fused=True) 有効")
+        except TypeError:
+            optimizer = torch.optim.AdamW(model.parameters(), lr=args.lr,
+                                          weight_decay=wd)
+    dtype_str = 'BF16' if amp_dtype == torch.bfloat16 else 'FP16'
+    print(f"  AMP({dtype_str})={'ON' if use_amp else 'OFF'}  GradScaler={'ON' if use_scaler else 'OFF (BF16不要)'}")
+
+    sched_name = getattr(args, 'scheduler', 'onecycle')
+    # TPU: LR を固定 (CosineAnnealingLR は毎エポック LR 変化 → XLA 定数として埋め込まれ毎回再コンパイル)
+    # → gradient accumulation (1 mark_step/epoch) と組み合わせて epoch 全体を 1 グラフにまとめ、
+    #   LR 固定によりグラフが全エポック同一 → ep1 コンパイル後は完全キャッシュヒット
+    # GPU: バッチ単位で変化させる (従来通り)
+    _sched_steps = 1 if is_tpu else len(tr_dl)
+    _sched_epochs = args.epochs
+    if is_tpu:
+        # TPU: LR 固定スケジューラ (ConstantLR, factor=1.0 → LR 変化なし)
+        scheduler = torch.optim.lr_scheduler.ConstantLR(optimizer, factor=1.0, total_iters=0)
+        print(f"  scheduler=fixed_lr (TPU XLA再コンパイル防止)")
+    elif sched_name == 'cosine':
+        scheduler = torch.optim.lr_scheduler.CosineAnnealingLR(
+            optimizer,
+            T_max=_sched_epochs * _sched_steps,
+            eta_min=args.lr * 0.01,
+        )
+        print(f"  scheduler={sched_name}")
+    elif sched_name == 'step':
+        scheduler = torch.optim.lr_scheduler.StepLR(
+            optimizer, step_size=max(1, args.epochs // 5), gamma=0.5,
+        )
+        print(f"  scheduler={sched_name}")
+    else:  # onecycle
+        scheduler = torch.optim.lr_scheduler.OneCycleLR(
+            optimizer, max_lr=args.lr * 3,
+            steps_per_epoch=_sched_steps, epochs=_sched_epochs,
+            pct_start=0.03, anneal_strategy='cos',
+        )
+        print(f"  scheduler={sched_name}")
+
+    # ── GPU: torch.compile は 非ワーカー専用 ──────────────────────────────────
+    # ワーカー（並列試行）は短命 (早期終了 50~200ep が多い)。
+    # コンパイルコスト (5〜30秒) >> GPU計算節約分 → ワーカーに compile は逆効果。
+    # 非ワーカー (train.py 直実行の長い最終学習) のみ compile を適用。
+    # reduce-overhead: CUDA graph で Python ループオーバーヘッドをゼロ化 (数秒でコンパイル)
+    # max-autotune: Triton kernel 最適化 + CUDA graph (長時間学習で元を取る H100 専用)
+    if dev_type == 'cuda' and not _is_worker:
+        _is_workerpool = bool(os.environ.get('_FX_WORKERPOOL'))
+        # WorkerPool ワーカー: reduce-overhead (CUDA graph, Triton検索なし → 数秒でコンパイル)
+        # 非ワーカー (長時間最終学習): max-autotune (Triton最適化, 数分かかるが元を取る)
+        _step_mode = 'reduce-overhead' if _is_workerpool else ('max-autotune' if is_h100 else 'reduce-overhead')
+        # dynamo インメモリキャッシュ上限を拡張 (デフォルト8 → 64)
+        # 同一プロセスで複数アーキテクチャを試す場合にキャッシュが溢れて再コンパイルされるのを防ぐ
+        try:
+            import torch._dynamo.config as _dynamo_cfg
+            _dynamo_cfg.cache_size_limit = 64
+        except Exception:
+            pass
+        _m, _c, _o  = model, criterion, optimizer
+        _amp_en, _amp_dt = use_amp, amp_dtype
+        _use_sc, _sc = use_scaler, scaler
+        def _gpu_step_fn(xb, yb):
+            _o.zero_grad(set_to_none=True)
+            with torch.amp.autocast('cuda', enabled=_amp_en, dtype=_amp_dt):
+                loss = _c(_m(xb), yb)
+            if _use_sc and _sc is not None:
+                _sc.scale(loss).backward()
+                _sc.unscale_(_o)
+                nn.utils.clip_grad_norm_(_m.parameters(), 1.0, foreach=True)
+                _sc.step(_o)
+                _sc.update()
+            else:
+                loss.backward()
+                nn.utils.clip_grad_norm_(_m.parameters(), 1.0, foreach=True)
+                _o.step()
+            return loss.detach()
+        try:
+            # WorkerPool ワーカーの場合: コンパイルを時分散して並列コンパイルの競合を緩和
+            # 並列ワーカーが同時にコンパイルするとCPU/GPU競合 → 0〜10秒ランダム待機で分散
+            if _is_workerpool:
+                import random as _rand
+                _stagger = _rand.uniform(0, 10)
+                if _stagger > 1.0:
+                    print(f"  [CompileStagger] {_stagger:.1f}秒待機中 (並列コンパイル競合緩和)")
+                    time.sleep(_stagger)
+            _compiled_step = None
+            print(f"  torch.compile を無効化しました (eager フォールバック)")
+        except Exception as e:
+            print(f"  torch.compile step スキップ → eager フォールバック: {e}")
+            _compiled_step = None
+    elif dev_type == 'cuda' and _is_worker:
+        print(f"  torch.compile スキップ (ワーカーモード: コンパイルコスト > 短命試行の節約)")
+
+    import math as _math  # ループ内 import を削除してここで一度だけ
+    best_loss      = float('inf')
+    best_state     = None
+    warmup_end     = max(20, int(args.epochs * 0.05))  # 5% warmup
+    patience       = max(30, int(args.epochs * 0.08))  # 8% → 800ep=64 (旧15%=120)
+    overfit_pat    = 15                                 # 15ep連続で判定
+    min_epochs     = warmup_end + 5
+    no_imp         = 0
+    overfit_count  = 0
+    stop_reason    = ''
+    recent_gaps    = []
+    prev_v_loss    = float('inf')    # val_loss の前エポック値 (下降判定用)
+    # バリデーション頻度: TPU はメモリ圧力 + eval XLA グラフ再コンパイルのコストが高い
+    # → 検索速度優先で頻度を大幅削減 (GPU: 800ep→4ep毎, TPU: 800ep→16ep毎)
+    if is_tpu:
+        val_every = max(5, args.epochs // 50)   # 800ep → 16ep毎 (GPU比 4x 削減)
+    else:
+        val_every = max(1, args.epochs // 200)
+    # 進捗JSON書き込み頻度 (非同期だが頻度を下げることで辞書更新コストも削減)
+    progress_every = max(5, args.epochs // 100)
+    print(f"  early_stop: ep{min_epochs}～, patience={patience}, wd={wd}"
+          f"  val_every={val_every}  progress_every={progress_every}")
+
+    v_loss = float('inf')   # 最初のvalidationまでの初期値
+    acc    = 0.0
+    _nan_count = 0          # NaN連続カウント (BF16 gradient 爆発検出用)
+
+    _xla_compiled = False   # 初回バッチのXLAコンパイル完了フラグ
+    import time as _time
+    _ep_start = _time.time()
+
+    # TPUチップID (PJRT_LOCAL_PROCESS_RANK から取得。未設定なら0)
+    _tpu_chip = int(os.environ.get('PJRT_LOCAL_PROCESS_RANK',
+                                    os.environ.get('LOCAL_RANK', '0')))
+    # XLA ExecuteTime ベースライン (利用率計算用)
+    _xla_prev_execute_ns: int = 0
+    _xla_prev_wall_ns: int = _time.time_ns()
+
+    def _get_xla_execute_ns() -> int:
+        """torch_xla.debug.metrics から累積XLA実行時間(ns)を取得"""
+        try:
+            import torch_xla.debug.metrics as _met  # type: ignore
+            # metric_data は [(timestamp_ns, duration_ns), ...] のリスト
+            # 全サンプルの合計が累積実行時間 (data[-1][1] は最後の1回分のみ)
+            data = _met.metric_data('ExecuteTime')
+            if data:
+                return sum(int(v) for _, v in data)
+            # fallback: metrics_report() 文字列の Accumulator を解析
+            import re as _re
+            report = _met.metrics_report()
+            m = _re.search(r'Metric: ExecuteTime\b.*?Accumulator:\s*(\d+)', report, _re.DOTALL)
+            if m:
+                return int(m.group(1))
+        except Exception:
+            pass
+        return 0
+
+    for epoch in range(1, args.epochs + 1):
+        _ep_t0 = _time.time()
+        model.train()
+        try:
+            # XLA 初回コンパイル中の表示
+            if is_tpu and not _xla_compiled and epoch == 1:
+                print(f"  [XLA] グラフコンパイル中... (初回のみ数分かかります)", flush=True)
+                _compile_start = _ep_t0
+
+            # TPU: gradient accumulation (1 mark_step/epoch)
+            # → epoch 全体を 1 XLA グラフにまとめ、LR 固定と組み合わせて完全キャッシュヒット
+            # → 従来: 11 mark_step/epoch × 再コンパイル = 11×40-130s = 激遅
+            # → 新: 1 mark_step/epoch × キャッシュヒット = ep1 コンパイル後ほぼ瞬時
+            t_loss_sum = 0.0
+            t_steps = 0
+            if is_tpu:
+                import torch_xla.core.xla_model as xm  # type: ignore
+                _n_batches = len(tr_dl)
+                optimizer.zero_grad(set_to_none=True)
+                t_loss_acc = torch.zeros(1, device=device)  # lazy accumulator
+                for xb, yb in tr_dl:
+                    with torch.amp.autocast(_amp_backend, enabled=use_amp, dtype=amp_dtype):
+                        _loss = criterion(model(xb), yb) / _n_batches  # normalize
+                    _loss.backward()  # lazy gradient accumulation (no mark_step)
+                    t_loss_acc = t_loss_acc + _loss.detach()  # lazy loss accumulation
+                    t_steps += 1
+                # Gradient clipping (device-side, no .item() sync)
+                _grads = [p.grad.detach() for p in model.parameters() if p.grad is not None]
+                if _grads:
+                    _g_norms = torch.stack([g.norm(2) for g in _grads])
+                    _total   = _g_norms.norm(2).clamp(min=1e-6)
+                    _coef    = (1.0 / _total).clamp(max=1.0)
+                    for _g in _grads:
+                        _g.mul_(_coef)
+                xm.optimizer_step(optimizer)  # mark_step() + lazy optimizer.step() ops submit
+                xm.mark_step()  # optimizer.step() lazy ops を即 flush (次エポックへ蓄積防止)
+                t_loss = t_loss_acc.item()  # sync (グラフ完了待ち)
+            else:
+                # GPU loss はデバイス側テンソルに蓄積 → エポック終わりに1回だけ sync
+                # (compiled / eager どちらも同じ方式で per-batch GPU sync を除去)
+                _t_loss_acc = torch.zeros(1, device=device) if dev_type == 'cuda' else None
+                if _compiled_step is not None:
+                    # 非ワーカー: CUDA graph replay → Python overhead ほぼゼロ
+                    for xb, yb in tr_dl:
+                        _t_loss_acc += _compiled_step(xb, yb)
+                        scheduler.step()   # Python-side LR 更新
+                        t_steps += 1
+                else:
+                    for xb, yb in tr_dl:
+                        loss = _train_step(model, xb, yb,
+                                           optimizer, criterion, scheduler, scaler,
+                                           use_amp, amp_dtype, use_scaler,
+                                           _amp_backend, is_tpu, _spmd_mode,
+                                           do_sched=True)
+                        if _t_loss_acc is not None:
+                            _t_loss_acc += loss   # GPU 側蓄積、sync なし
+                        else:
+                            t_loss_sum += loss.item()
+                        t_steps += 1
+                if _t_loss_acc is not None:
+                    t_loss = (_t_loss_acc / max(1, t_steps)).item()  # エポック 1回 sync
+                else:
+                    t_loss = t_loss_sum / max(1, t_steps)
+
+            if is_tpu and not _xla_compiled and epoch == 1:
+                _xla_compiled = True
+                _compile_sec = _time.time() - _compile_start
+                n_samples = len(tr_dl) * tr_dl.bs
+                _tput = n_samples / max(_compile_sec, 0.01)
+                print(f"  [XLA] コンパイル完了 ({_compile_sec:.0f}秒) | "
+                      f"スループット: {_tput:.0f} samples/sec", flush=True)
+        except (RuntimeError, torch.cuda.OutOfMemoryError) as e:
+            if dev_type == 'cuda':
+                torch.cuda.empty_cache()
+            oom_msg = 'CUDA OOM' if dev_type == 'cuda' else 'XLA OOM'
+            print(f"  [OOM] ep{epoch} {oom_msg} → 学習打ち切り: {e}")
+            stop_reason = f'{oom_msg} (ep{epoch})'
+            break
+
+        # validation は val_every エポックごとに実行
+        if epoch % val_every == 0 or epoch == 1 or epoch == args.epochs:
+            model.eval()
+            if is_tpu:
+                # TPU: per-batch mark_step → warmup eval グラフと完全一致 → キャッシュヒット
+                # (従来: 全バッチ合体 1 グラフ → warmup と HLO 不一致 → 毎回再コンパイル 300s)
+                import torch_xla.core.xla_model as xm  # type: ignore
+                _v_loss_cpu = 0.0
+                _correct_cpu = 0
+                _total_sum = 0
+                with torch.no_grad():
+                    for xb, yb in va_dl:
+                        with torch.amp.autocast(_amp_backend, enabled=use_amp, dtype=amp_dtype):
+                            lo = model(xb)
+                        _b_loss    = criterion(lo, yb).detach()
+                        _b_correct = (lo.argmax(1) == yb).sum()
+                        xm.mark_step()  # per-batch submit → warmup eval グラフと一致
+                        _v_loss_cpu  += _b_loss.item()    # sync (グラフ完了後 fast)
+                        _correct_cpu += _b_correct.item()
+                        _total_sum   += yb.shape[0]
+                v_loss = _v_loss_cpu / max(len(va_dl), 1)
+                acc    = _correct_cpu / max(_total_sum, 1)
+            else:
+                v_loss_sum  = torch.zeros(1, device=device)
+                correct_sum = torch.zeros(1, device=device, dtype=torch.long)
+                total_sum   = 0
+                with torch.inference_mode():
+                    for xb, yb in va_dl:
+                        with torch.amp.autocast(_amp_backend, enabled=use_amp, dtype=amp_dtype):
+                            lo = model(xb)
+                        v_loss_sum  += criterion(lo, yb)
+                        correct_sum += (lo.argmax(1) == yb).sum()
+                        total_sum   += len(yb)
+                v_loss = (v_loss_sum / len(va_dl)).item()
+                acc    = correct_sum.item() / max(total_sum, 1)
+
+        gap = v_loss - t_loss   # 過学習ギャップ
+
+        # ── NaN/Inf 発散検出: BF16 gradient 爆発で loss=nan になる場合を即終了 ──
+        if _math.isnan(t_loss) or _math.isinf(t_loss):
+            _nan_count += 1
+            if _nan_count >= 3:
+                stop_reason = f'NaN/Inf発散 ({_nan_count}ep連続) → 早期終了 ep={epoch}'
+                break
+        else:
+            _nan_count = 0
+
+        if _is_main and (epoch % 10 == 0 or epoch <= 5):
+            lr_now  = optimizer.param_groups[0]['lr']
+            _ep_sec = _time.time() - _ep_t0
+            _n_samp = len(tr_dl) * tr_dl.bs
+            _tput   = _n_samp / max(_ep_sec, 0.001)
+            _tpu_tag = f"  {_tput:.0f}samp/s" if is_tpu else ""
+            _spmd_tag = f" [r{_spawn_rank}]" if _spmd_mode else ""
+            print(f"  Ep{epoch:4d}/{args.epochs}  "
+                  f"tr={t_loss:.4f}  va={v_loss:.4f}  "
+                  f"gap={gap:+.4f}  acc={acc:.3f}  lr={lr_now:.2e}"
+                  f"  [{_ep_sec:.1f}s{_tpu_tag}]{_spmd_tag}")
+
+        # 進捗更新 (progress_every エポックごと / 非同期書き込み / rank 0 のみ)
+        if _is_main and (epoch % progress_every == 0 or epoch <= 5):
+            _dash['epoch']       = epoch
+            _dash['total_epochs']= args.epochs
+            _dash['train_loss']  = round(t_loss, 5)
+            _dash['val_loss']    = round(v_loss, 5)
+            _dash['accuracy']    = round(acc, 4)
+            _dash.setdefault('epoch_log', []).append(
+                {'epoch': epoch, 'train_loss': round(t_loss,6),
+                 'val_loss': round(v_loss,6), 'acc': round(acc,4)})
+
+            # TPU利用率: XLA ExecuteTime の差分 / 壁時計時間
+            _ep_sec_now = _time.time() - _ep_t0
+            _tpu_util_pct = 0.0
+            if is_tpu:
+                _xla_now_ns   = _get_xla_execute_ns()
+                _wall_now_ns  = _time.time_ns()
+                _delta_xla    = _xla_now_ns  - _xla_prev_execute_ns
+                _delta_wall   = _wall_now_ns - _xla_prev_wall_ns
+                if _delta_wall > 0 and _delta_xla > 0:
+                    _tpu_util_pct = min(100.0, round(_delta_xla / _delta_wall * 100, 1))
+                _xla_prev_execute_ns = _xla_now_ns
+                _xla_prev_wall_ns    = _wall_now_ns
+
+            # 並列モード: trial_progress.json に非同期書き込み (GPUをブロックしない)
+            _write_trial_progress(OUT_DIR, {
+                'trial': args.trial, 'arch': getattr(args, 'arch', '?'),
+                'hidden': getattr(args, 'hidden', 0),
+                'epoch': epoch, 'total_epochs': args.epochs,
+                'train_loss': round(t_loss, 5), 'val_loss': round(v_loss, 5),
+                'accuracy': round(acc, 4), 'phase': 'training',
+                'ep_sec': round(_ep_sec_now, 2),
+                'tpu_chip': _tpu_chip,
+                'tpu_util_pct': _tpu_util_pct,
+            })
+            # シングルモード: HTML ダッシュボードも更新
+            if not getattr(args, 'out_dir', ''):
+                try: update_dashboard(_dash)
+                except Exception: pass
+
+        # ── val_loss 改善チェック ──────────────────────────────────────────
+        if v_loss < best_loss - 1e-5:
+            best_loss  = v_loss
+            # GPU上に保持 (cpu().clone()はI/Oボトルネック → detach().clone()に変更)
+            best_state = {k: v.detach().clone() for k, v in model.state_dict().items()}
+            no_imp     = 0
+        else:
+            no_imp += 1
+
+        # ── 即時発散: val が爆発 かつ 下がっていない ────────────────────────
+        # 意味のある改善 = 前エポック比で 1e-4 以上の減少 (微小ノイズを除外)
+        val_falling = v_loss < prev_v_loss - 1e-4
+        if epoch >= 10 and gap > 0.35 and v_loss > 1.30:
+            stop_reason = f'即時発散 (ep{epoch}: gap={gap:+.4f}, val={v_loss:.4f})'
+            break
+        prev_v_loss = v_loss
+
+        # ── 過学習検出 (min_epochs 経過後) ──────────────────────────────────
+        if epoch >= min_epochs:
+            recent_gaps.append(gap)
+            if len(recent_gaps) > overfit_pat:
+                recent_gaps.pop(0)
+
+            # 条件1: gap が大きく持続 かつ val が意味ある改善なし
+            if (len(recent_gaps) == overfit_pat
+                    and all(g > 0.20 for g in recent_gaps)
+                    and not val_falling):
+                overfit_count += 1
+                if overfit_count >= 3:
+                    stop_reason = f'過学習検出 (gap={gap:+.4f} が {overfit_pat}ep継続)'
+                    break
+            else:
+                overfit_count = 0
+
+            # 条件2: val が改善なし かつ 過学習が顕著 (val下降中は免除)
+            if gap > 0.25 and no_imp >= 20 and not val_falling:
+                stop_reason = f'過学習早期終了 (gap={gap:+.4f}, no_imp={no_imp})'
+                break
+
+            # 条件3: patience 到達 (意味ある改善なし)
+            if no_imp >= patience and not val_falling:
+                stop_reason = f'改善なし早期終了 (patience={patience})'
+                break
+
+            # 条件4: patience の2倍を超えたら val_falling 免除で強制終了
+            if no_imp >= patience * 2:
+                stop_reason = f'改善なし強制終了 (no_imp={no_imp} >= patience*2={patience*2})'
+                break
+
+    if _is_main:
+        if stop_reason:
+            print(f"  [STOP] {stop_reason}  ep={epoch}  best_val={best_loss:.4f}")
+        else:
+            print(f"  [DONE] 全エポック完了  best_val={best_loss:.4f}")
+
+    if best_state:
+        # compiled model と元モデルの両方に best_state を反映
+        try:
+            model.load_state_dict(best_state)
+        except Exception:
+            pass
+        # ONNX export 用の元モデル (compile前) にも反映
+        if model_for_export is not model:
+            try:
+                model_for_export.load_state_dict(best_state)
+            except Exception:
+                pass
+
+    # SPMD rank 0 → モデルの重みを CPU に移して保存 (dispatch 側がロード)
+    if _spmd_mode and _spawn_rank == 0 and _spmd_result:
+        try:
+            import torch_xla.core.xla_model as xm  # type: ignore
+            xm.mark_step()
+            state = {k: v.cpu() for k, v in model_for_export.state_dict().items()}
+            torch.save(state, _spmd_result)
+            print(f"  [SPMD rank=0] モデル保存完了", flush=True)
+        except Exception as _e:
+            print(f"  [WARN] SPMD モデル保存失敗: {_e}", flush=True)
+
+    return model_for_export  # ONNX export には compile前モデルを返す
+
+
+def _train_step(model, xb, yb, opt, crit, sched,
+                scaler=None, use_amp=False,
+                amp_dtype=torch.float16, use_scaler=False,
+                amp_backend='cuda', is_tpu=False, spmd_mode=False,
+                do_sched=True):
+    opt.zero_grad(set_to_none=True)
+    with torch.amp.autocast(amp_backend, enabled=use_amp, dtype=amp_dtype):
+        loss = crit(model(xb), yb)
+    if use_scaler and scaler is not None:
+        scaler.scale(loss).backward()
+        scaler.unscale_(opt)
+        nn.utils.clip_grad_norm_(model.parameters(), 1.0, foreach=True)
+        scaler.step(opt)
+        scaler.update()
+    else:
+        loss.backward()
+        if is_tpu:
+            import torch_xla.core.xla_model as xm  # type: ignore
+            # TPU: 標準 clip_grad_norm_ は内部で .item() を呼び XLA sync が発生する
+            # → デバイスサイドの gradient clipping でバッチ毎 sync を完全排除
+            # NaN 対策: clamp(min=1e-6) で ゼロ除算/inf を防止
+            _grads = [p.grad.detach() for p in model.parameters()
+                      if p.grad is not None]
+            if _grads:
+                _g_norms = torch.stack([g.norm(2) for g in _grads])
+                _total   = _g_norms.norm(2).clamp(min=1e-6)  # ゼロ除算防止
+                _coef    = (1.0 / _total).clamp(max=1.0)      # max_norm=1.0
+                for _g in _grads:
+                    _g.mul_(_coef)
+            xm.optimizer_step(opt)  # mark_step()内包: lazy eval graph を一括 submit
+        else:
+            nn.utils.clip_grad_norm_(model.parameters(), 1.0, foreach=True)
+            opt.step()
+    if do_sched:
+        sched.step()
+    return loss.detach()
+
+
+# ─── バックテスト ─────────────────────────────────────────────────────────
+def _generate_report(trades: list, equity: np.ndarray, dd: np.ndarray,
+                     result: dict, out_dir: Path, trial_no: int) -> None:
+    """資産曲線・DDチャートのスタンドアロン HTML を生成"""
+    capital  = result.get('capital', BT_CAPITAL)
+    lev      = result.get('leverage', BT_LEVERAGE)
+    # 資産曲線・DDはすでに円ベース (ラベルは各取引の決済日付)
+    eq_data    = [round(float(v), 0) for v in equity]
+    dd_data    = [round(float(v), 0) for v in dd]
+    trade_dates = [t.get('date', '') for t in trades]  # 取引日付ラベル
+    # 日別損益 (円)
+    daily: dict = {}
+    for t in trades:
+        d = t.get('date', '?')
+        daily[d] = round(daily.get(d, 0.0) + t.get('pnl_yen', t['pnl']), 0)
+    dl   = list(daily.keys())
+    dv   = [round(daily[k], 0) for k in dl]
+    dclr = [('rgba(63,185,80,.6)' if v >= 0 else 'rgba(248,81,73,.6)') for v in dv]
+    pf_c    = '#f0883e' if result['pf'] >= 2 else '#3fb950' if result['pf'] >= 1.5 else '#ffa657' if result['pf'] >= 1.2 else '#f85149'
+    net_pnl = result.get('net_pnl', 0)
+    fin_eq  = result.get('final_equity', capital)
+    ret_pct = result.get('return_pct', 0)
+    mdd     = result.get('max_dd', 0)
+    mdd_pct = result.get('max_dd_pct', 0)
+
+    html = f"""<!DOCTYPE html>
+<html lang="ja"><head><meta charset="UTF-8">
+<title>Trial #{trial_no} Backtest</title>
+<script src="https://cdn.jsdelivr.net/npm/chart.js@4/dist/chart.umd.min.js"></script>
+<style>
+*{{box-sizing:border-box;margin:0;padding:0}}
+body{{background:#0d1117;color:#e6edf3;font-family:'Segoe UI',sans-serif;padding:20px}}
+h1{{color:#58a6ff;font-size:1.15em;margin-bottom:4px}}
+.sub{{font-size:.72em;color:#8b949e;margin-bottom:14px}}
+.stats{{display:flex;gap:10px;margin-bottom:14px;flex-wrap:wrap}}
+.s{{background:#161b22;border:1px solid #30363d;border-radius:8px;padding:10px 16px;text-align:center;min-width:100px}}
+.sv{{font-size:1.45em;font-weight:700}}
+.sl{{font-size:.7em;color:#8b949e;margin-top:3px}}
+.cw{{background:#161b22;border:1px solid #30363d;border-radius:8px;padding:14px;margin-bottom:12px}}
+.ct{{font-size:.7em;color:#8b949e;text-transform:uppercase;letter-spacing:.8px;margin-bottom:8px}}
+canvas{{max-height:250px}}
+</style></head><body>
+<h1>Trial #{trial_no} バックテストレポート</h1>
+<div class="sub">資金: {capital:,.0f}円 / レバレッジ: {lev:.0f}倍 / リスク: {BT_RISK_PCT:.0f}%/取引 (動的ロット)</div>
+<div class="stats">
+  <div class="s"><div class="sv" style="color:{pf_c}">{result['pf']:.4f}</div><div class="sl">Profit Factor</div></div>
+  <div class="s"><div class="sv" style="color:{'#3fb950' if net_pnl>=0 else '#f85149'}">{net_pnl:+,.0f}円</div><div class="sl">純利益</div></div>
+  <div class="s"><div class="sv" style="color:{'#3fb950' if ret_pct>=0 else '#f85149'}">{ret_pct:+.1f}%</div><div class="sl">リターン</div></div>
+  <div class="s"><div class="sv" style="color:#79c0ff">{result.get('sr',0):.3f}</div><div class="sl">Sharpe Ratio</div></div>
+  <div class="s"><div class="sv" style="color:#f85149">{mdd:,.0f}円<br><span style="font-size:.55em">({mdd_pct:.1f}%)</span></div><div class="sl">最大 DD</div></div>
+  <div class="s"><div class="sv" style="color:#58a6ff">{fin_eq:,.0f}円</div><div class="sl">最終資産</div></div>
+  <div class="s"><div class="sv">{result['trades']}</div><div class="sl">取引数</div></div>
+  <div class="s"><div class="sv" style="color:#3fb950">{result['win_rate']*100:.1f}%</div><div class="sl">勝率</div></div>
+</div>
+<div class="cw"><div class="ct">資産曲線 (累積損益)</div>
+  <canvas id="eq"></canvas></div>
+<div class="cw"><div class="ct">ドローダウン</div>
+  <canvas id="dd"></canvas></div>
+<div class="cw"><div class="ct">日別損益</div>
+  <canvas id="dl"></canvas></div>
+<script>
+const eq={json.dumps(eq_data)};
+const eql={json.dumps(trade_dates)};
+const ddv={json.dumps(dd_data)};
+const dlv={json.dumps(dv)};
+const dll={json.dumps(dl)};
+const dlc={json.dumps(dclr)};
+function mc(id,lbl,data,color,fill,type='line'){{
+  new Chart(document.getElementById(id),{{
+    type,data:{{labels:lbl,datasets:[{{data,borderColor:color,
+      backgroundColor:fill,borderWidth:type==='bar'?0:1.5,
+      pointRadius:0,fill:type==='line',tension:.1}}]}},
+    options:{{responsive:true,maintainAspectRatio:false,animation:false,
+      plugins:{{legend:{{display:false}},
+               tooltip:{{callbacks:{{label:ctx=>ctx.parsed.y.toLocaleString('ja-JP')+'円'}}}}}},
+      scales:{{x:{{ticks:{{color:'#8b949e',maxTicksLimit:14,maxRotation:45}},grid:{{color:'#21262d'}}}},
+              y:{{ticks:{{color:'#8b949e',callback:v=>v.toLocaleString('ja-JP')+'円'}},grid:{{color:'#21262d'}}}}}}}}
+  }});
+}}
+mc('eq',eql,eq,'#3fb950','#3fb95018');
+mc('dd',eql,ddv,'#f85149','#f8514918');
+mc('dl',dll,dlv,'rgba(0,0,0,0)','rgba(0,0,0,0)','bar');
+// 日別バーは個別色
+const dChart=Chart.getChart('dl');
+if(dChart)dChart.data.datasets[0].backgroundColor=dlc,dChart.update('none');
+</script>
+</body></html>"""
+    try:
+        out_dir.mkdir(parents=True, exist_ok=True)
+        (out_dir / 'report.html').write_text(html, encoding='utf-8')
+    except Exception as e:
+        print(f"  [WARN] レポート生成失敗: {e}")
+
+
+_BT_MODE: str | None = None  # キャッシュ: 'cpu' / 'cuda_iobind' / 'cuda'
+# Windows では /tmp が存在しないため tempfile.gettempdir() を使用する
+import tempfile as _tempfile
+_BT_MODE_CACHE_FILE = Path(_tempfile.gettempdir()) / 'fx_bt_mode.txt'
+
+def _bench_onnx_providers(onnx_path: str, full_data: np.ndarray) -> str:
+    """CUDA利用可能時はCUDA vs CUDA+IOBindingのみ比較（CPUベンチはスキップ）。
+    結果はインメモリ + ファイルキャッシュで再利用し、並列試行での再計測を防ぐ。"""
+    global _BT_MODE
+    if _BT_MODE is not None:
+        return _BT_MODE
+
+    # ── ファイルキャッシュ確認（並列サブプロセス間で共有）──────────────
+    if _BT_MODE_CACHE_FILE.exists():
+        try:
+            cached = _BT_MODE_CACHE_FILE.read_text().strip()
+            if cached in ('cpu', 'cuda', 'cuda_iobind'):
+                _BT_MODE = cached
+                print(f'  [BT-bench] キャッシュ使用: {_BT_MODE}')
+                return _BT_MODE
+        except Exception:
+            pass
+
+    import onnxruntime as ort
+    import time
+
+    available = ort.get_available_providers()
+    if 'CUDAExecutionProvider' not in available:
+        _BT_MODE = 'cpu'
+        print('  [BT-bench] CUDA unavailable → CPU')
+        _BT_MODE_CACHE_FILE.write_text(_BT_MODE)
+        return _BT_MODE
+
+    # ── CUDA利用可能: CPUベンチはスキップしCUDA vs CUDA+IOBindのみ比較 ──
+    # CUDAが常にCPUより高速なため、CPUの38秒ベンチを省略して高速化
+    x = np.ascontiguousarray(full_data[:1024])  # 1024サンプルで十分
+    cuda_pvd = ['CUDAExecutionProvider', 'CPUExecutionProvider']
+    results = {}
+
+    # ── CUDA (通常バッチ転送) ───────────────────────────────────────────
+    try:
+        s = ort.InferenceSession(onnx_path, providers=cuda_pvd)
+        s.run(None, {'input': x[:64]})   # ウォームアップ
+        t0 = time.perf_counter()
+        for _ in range(3):
+            s.run(None, {'input': x})[0]
+        results['cuda'] = (time.perf_counter() - t0) / 3
+    except Exception as e:
+        print(f'  [BT-bench] CUDA error: {e}')
+        results['cuda'] = float('inf')
+
+    # ── CUDA + IOBinding (データをGPUメモリに常駐) ─────────────────────
+    try:
+        s2 = ort.InferenceSession(onnx_path, providers=cuda_pvd)
+        io = s2.io_binding()
+        x_ort   = ort.OrtValue.ortvalue_from_numpy(x, 'cuda', 0)
+        out_ort = ort.OrtValue.ortvalue_from_shape_and_type((len(x), 3), np.float32, 'cuda', 0)
+        io.bind_ortvalue_input('input', x_ort)
+        io.bind_ortvalue_output('output', out_ort)
+        s2.run_with_iobinding(io)   # ウォームアップ
+        t0 = time.perf_counter()
+        for _ in range(3):
+            s2.run_with_iobinding(io)
+        _ = out_ort.numpy()
+        results['cuda_iobind'] = (time.perf_counter() - t0) / 3
+    except Exception as e:
+        print(f'  [BT-bench] CUDA+IOBind error: {e}')
+        results['cuda_iobind'] = float('inf')
+
+    _BT_MODE = min(results, key=results.get)
+    print(f'  [BT-bench] CUDA={results.get("cuda",99)*1000:.1f}ms  '
+          f'CUDA+IOBind={results.get("cuda_iobind",99)*1000:.1f}ms  '
+          f'→ {_BT_MODE} を採用')
+    # ファイルキャッシュに保存（以降の全試行がスキップ可能）
+    try:
+        _BT_MODE_CACHE_FILE.write_text(_BT_MODE)
+    except Exception:
+        pass
+    return _BT_MODE
+
+
+def _run_inference(sess, x: np.ndarray, mode: str) -> np.ndarray:
+    """採用モードに応じて全データ一括推論し確率配列を返す"""
+    import onnxruntime as ort
+    n = len(x)
+
+    if mode == 'cuda_iobind':
+        try:
+            io = sess.io_binding()
+            x_ort   = ort.OrtValue.ortvalue_from_numpy(
+                          np.ascontiguousarray(x), 'cuda', 0)
+            out_ort = ort.OrtValue.ortvalue_from_shape_and_type(
+                          (n, 3), np.float32, 'cuda', 0)
+            io.bind_ortvalue_input('input', x_ort)
+            io.bind_ortvalue_output('output', out_ort)
+            sess.run_with_iobinding(io)
+            return out_ort.numpy()
+        except Exception:
+            pass   # フォールバック
+
+    # CPU / CUDA 通常バッチ
+    probs = np.zeros((n, 3), dtype=np.float32)
+    bs = 4096 if mode == 'cpu' else 512
+    for i in range(0, n, bs):
+        probs[i:i+bs] = sess.run(None, {'input': x[i:i+bs]})[0]
+    return probs
+
+
+def calc_feature_importance(model, X_te: np.ndarray,
+                            feat_indices: list | None,
+                            n_samples: int = 100) -> list[tuple[str, float]]:
+    """Permutation Importance: 全特徴量を1バッチで並列シャッフル推論 (高速版)。
+    特徴量ごとのループをバッチ化してGPU転送回数を削減。
+    Returns: [(feat_name, importance_score), ...] 降順ソート済み
+    """
+    import torch
+    from features import FEATURE_COLS
+    device = next(model.parameters()).device
+    model.eval()
+    n = min(n_samples, len(X_te))
+    X_s = np.ascontiguousarray(X_te[:n])   # (n, seq, feat)
+    n_feat = X_s.shape[2]
+
+    rng = np.random.default_rng(42)
+    # 全特徴量分のシャッフル済みデータを一括生成 (n_feat, n, seq, feat)
+    X_all = np.stack([X_s.copy() for _ in range(n_feat)], axis=0)
+    for i in range(n_feat):
+        perm = rng.permutation(n)
+        X_all[i, :, :, i] = X_all[i, perm, :, i]
+
+    with torch.no_grad():
+        # baseline
+        xb = torch.from_numpy(X_s).to(device)
+        base_probs = model(xb).float().cpu().numpy()
+        base_ent = float(-np.mean(base_probs * np.log(base_probs + 1e-9)))
+
+        # 全特徴量を結合してまとめて推論 (n_feat*n, seq, feat)
+        X_flat = X_all.reshape(n_feat * n, X_s.shape[1], n_feat)
+        bs = 512
+        perm_probs_list = []
+        for start in range(0, len(X_flat), bs):
+            xb = torch.from_numpy(np.ascontiguousarray(X_flat[start:start+bs])).to(device)
+            perm_probs_list.append(model(xb).float().cpu().numpy())
+        perm_probs_all = np.concatenate(perm_probs_list, axis=0).reshape(n_feat, n, 3)
+
+    importances = []
+    for i in range(n_feat):
+        pp = perm_probs_all[i]
+        perm_ent = float(-np.mean(pp * np.log(pp + 1e-9)))
+        score = abs(perm_ent - base_ent)
+        global_idx = feat_indices[i] if feat_indices else i
+        fname = FEATURE_COLS[global_idx] if global_idx < len(FEATURE_COLS) else f'feat_{global_idx}'
+        importances.append((fname, round(score, 6)))
+
+    importances.sort(key=lambda x: -x[1])
+    return importances
+
+
+def backtest_torch(model, X_te, df_te, threshold, tp_mult, sl_mult,
+                   seq_len=20, hold_bars=48, report_dir: Path = None, trial_no: int = 0):
+    """PyTorchモデルで直接推論するバックテスト。
+    ONNX エクスポート/ロードを省略して高速化。ゴミモデル1試行あたり約2秒節約。"""
+    import torch
+    device = next(model.parameters()).device
+    model.to(device).eval()   # パラメータ + バッファを同じデバイスに揃える
+    n = len(X_te)
+    probs = np.zeros((n, 3), dtype=np.float32)
+    bs = 1024
+    with torch.no_grad():
+        for i in range(0, n, bs):
+            xb = torch.from_numpy(np.ascontiguousarray(X_te[i:i+bs])).to(device)
+            with torch.amp.autocast('cuda', enabled=device.type == 'cuda', dtype=torch.float16):
+                out = model(xb)
+            probs[i:i+bs] = out.float().cpu().numpy()
+    close    = df_te['close'].values
+    atr      = df_te['atr14'].values
+    high     = df_te['high'].values
+    low      = df_te['low'].values
+    open_arr = df_te['open'].values
+    dates    = df_te.index
+    trades = _simulate_trades(probs, close, high, low, open_arr, atr,
+                              n, seq_len, hold_bars, threshold, tp_mult, sl_mult, dates)
+    return _backtest_evaluate(trades, dates, report_dir, trial_no)
+
+
+def backtest(onnx_path, X_te, df_te, threshold, tp_mult, sl_mult,
+             seq_len=20, hold_bars=48, report_dir: Path = None, trial_no: int = 0):
+    import onnxruntime as ort
+    mode = _bench_onnx_providers(str(onnx_path), X_te)
+    pvd  = (['CUDAExecutionProvider', 'CPUExecutionProvider']
+            if mode in ('cuda', 'cuda_iobind') else ['CPUExecutionProvider'])
+    sess = ort.InferenceSession(str(onnx_path), providers=pvd)
+    close    = df_te['close'].values
+    atr      = df_te['atr14'].values
+    high     = df_te['high'].values
+    low      = df_te['low'].values
+    open_arr = df_te['open'].values
+    dates    = df_te.index
+    n        = len(X_te)
+
+    # 全データ一括推論 (採用モードで最適化)
+    probs = _run_inference(sess, X_te, mode)
+
+    trades = _simulate_trades(
+        probs, close, high, low, open_arr, atr,
+        n, seq_len, hold_bars, threshold, tp_mult, sl_mult, dates
+    )
+    return _backtest_evaluate(trades, dates, report_dir, trial_no)
+
+
+def _simulate_trades(probs, close, high, low, open_arr, atr,
+                     n, seq_len, hold_bars, threshold, tp_mult, sl_mult, dates):
+    """NumPy最適化版トレードシミュレーション。
+    推論結果(probs)をもとにTP/SL/hold決済を処理し取引リストを返す。"""
+    # シグナル検出をNumPyで一括計算
+    cls_arr   = np.argmax(probs, axis=1).astype(np.int8)       # (n,)
+    conf_arr  = probs[np.arange(n), cls_arr]                   # (n,)
+    signal    = (conf_arr > threshold) & (cls_arr != 0)        # (n,) bool
+
+    trades    = []
+    in_pos    = False
+    side      = 0
+    entry     = 0.0
+    tp_price  = 0.0
+    sl_price  = 0.0
+    entry_i   = 0
+
+    for i in range(n):
+        bi = seq_len - 1 + i
+        if bi >= len(close):
+            break
+
+        if in_pos:
+            hi  = high[bi]
+            lo  = low[bi]
+            age = i - entry_i
+            pnl = None
+            if side == 1:
+                if   lo  <= sl_price: pnl = sl_price - entry - SPREAD
+                elif hi  >= tp_price: pnl = tp_price - entry - SPREAD
+            else:
+                if   hi  >= sl_price: pnl = entry - sl_price - SPREAD
+                elif lo  <= tp_price: pnl = entry - tp_price - SPREAD
+            if pnl is None and age > hold_bars:
+                # age > hold_bars (= hold_bars+1本目の始値で決済) → MQL5 g_pos_bars >= hold_bars と同一
+                pnl = (open_arr[bi] - entry) * side - SPREAD
+            if pnl is not None:
+                date_str = str(dates[bi].date()) if bi < len(dates) else str(bi)
+                trades.append({'pnl': pnl, 'side': side,
+                               'date': date_str, 'entry': entry})
+                in_pos = False
+
+        if not in_pos and signal[i]:
+            next_bi = bi + 1
+            if next_bi >= len(close):
+                break
+            a         = atr[bi]
+            next_open = open_arr[next_bi]
+            side      = int(cls_arr[i])   # 1=BUY, 2→-1=SELL
+            if side == 1:
+                entry    = next_open + SPREAD
+                tp_price = entry + tp_mult * a
+                sl_price = entry - sl_mult * a
+            else:
+                side     = -1
+                entry    = next_open - SPREAD
+                tp_price = entry - tp_mult * a
+                sl_price = entry + sl_mult * a
+            entry_i  = i
+            in_pos   = True
+
+    return trades
+
+
+def _backtest_evaluate(trades, dates, report_dir, trial_no):
+
+    MIN_TRADES = 200
+
+    if len(trades) < MIN_TRADES:
+        print(f"  [SKIP] 取引数 {len(trades)} < {MIN_TRADES} → PF=0 (除外)")
+        return {'pf': 0.0, 'trades': len(trades), 'win_rate': 0.0,
+                'gross_profit': 0.0, 'gross_loss': 0.0, 'net_pnl': 0.0,
+                'sr': 0.0, 'max_dd': 0.0, 'max_dd_pct': 0.0,
+                'final_equity': BT_CAPITAL, 'return_pct': 0.0}
+
+    # ── 動的ロットサイズ計算 (MQL5 LotSize() 相当) ──────────────────────────
+    # 各トレード時点の残高に基づいてロットを動的計算 → 複利効果
+    cur_equity = BT_CAPITAL
+    pnl_yen_list   = []
+    equity_curve_list = [BT_CAPITAL]
+    for t in trades:
+        lot        = _calc_lot(cur_equity, BT_RISK_PCT)
+        lot_units  = round(lot * 100_000)          # 単位数 (整数)
+        pnl_yen    = t['pnl'] * lot_units          # 損益(円)
+        margin     = t.get('entry', 150.0) * lot_units / BT_LEVERAGE
+        cur_equity += pnl_yen
+        pnl_yen_list.append(pnl_yen)
+        equity_curve_list.append(cur_equity)
+        t['pnl_yen']   = round(pnl_yen, 0)
+        t['lot']       = lot
+        t['lot_units'] = lot_units
+        t['margin']    = round(margin, 0)
+        t['equity']    = round(cur_equity, 0)
+
+    pnl          = np.array(pnl_yen_list)
+    equity_curve = np.array(equity_curve_list[1:])  # 各取引後の資産
+    gp           = float(pnl[pnl>0].sum())
+    gl           = float(abs(pnl[pnl<0].sum()))
+    peak         = np.maximum.accumulate(equity_curve)
+    dd           = equity_curve - peak
+    max_dd       = float(dd.min())
+    max_dd_pct   = float(max_dd / BT_CAPITAL * 100)
+
+    # 日別 Sharpe Ratio: テスト期間の全営業日を対象にゼロ埋めして計算
+    # 取引がない日を除外すると SR が過大評価されるため全日を使用
+    daily_trade: dict = {}
+    for t in trades:
+        d = t.get('date', '0')
+        daily_trade[d] = daily_trade.get(d, 0.0) + t['pnl_yen']
+    # テスト期間の全ユニーク日付を取得してゼロ埋め
+    all_dates = sorted({str(d.date()) for d in dates})
+    dr = np.array([daily_trade.get(d, 0.0) for d in all_dates])
+    sr = float((dr.mean() / dr.std()) * np.sqrt(252)) if len(dr) > 1 and dr.std() > 0 else 0.0
+
+    net_pnl_yen    = round(float(pnl.sum()), 0)
+    final_equity   = round(float(equity_curve[-1]), 0)
+    return_pct     = round((final_equity - BT_CAPITAL) / BT_CAPITAL * 100, 2)
+
+    result = {
+        'pf':           round(gp / max(gl, 1e-9), 4),
+        'trades':       len(trades),
+        'win_rate':     round(float((pnl>0).mean()), 4),
+        'gross_profit': round(gp, 0),
+        'gross_loss':   round(gl, 0),
+        'net_pnl':      net_pnl_yen,
+        'sr':           round(sr, 3),
+        'max_dd':       round(max_dd, 0),
+        'max_dd_pct':   round(max_dd_pct, 2),
+        'final_equity': final_equity,
+        'return_pct':   return_pct,
+        'capital':      BT_CAPITAL,
+        'risk_pct':     BT_RISK_PCT,
+        'leverage':     BT_LEVERAGE,
+    }
+    print(f"  SR={sr:.3f}  MaxDD={max_dd:,.0f}円({max_dd_pct:.1f}%)  "
+          f"NetPnL={net_pnl_yen:,.0f}円  最終資産={final_equity:,.0f}円  "
+          f"リターン={return_pct:.1f}%")
+
+    # 資産曲線 HTML レポート生成
+    if report_dir is not None:
+        _generate_report(trades, equity_curve, dd, result, Path(report_dir), trial_no)
+
+    return result
+
+
+def _write_trial_progress(out_dir: Path, data: dict) -> None:
+    """並列モード: 試行固有の進捗を trial_progress.json に非同期で書く (GPU待機なし)"""
+    try:
+        _async_write(out_dir / 'trial_progress.json',
+                     json.dumps(data, ensure_ascii=False))
+    except Exception:
+        pass
+
+
+# ─── メイン ──────────────────────────────────────────────────────────────────
+def main():
+    global OUT_DIR, ONNX_PATH, NORM_PATH
+    args = parse_args()
+    set_seed(args.seed)
+
+    # --out_dir が指定されていれば出力先を切り替え (並列モード)
+    parallel_mode = bool(getattr(args, 'out_dir', ''))
+    if parallel_mode:
+        OUT_DIR   = Path(args.out_dir)
+        ONNX_PATH = OUT_DIR / 'fx_model.onnx'
+        NORM_PATH = OUT_DIR / 'norm_params.json'
+        OUT_DIR.mkdir(parents=True, exist_ok=True)
+
+    # ダッシュボード初期化
+    st = args.start_time or time.time()
+
+    if not parallel_mode:
+        _all_res_path = OUT_DIR / 'all_results.json'
+        _best_path    = OUT_DIR / 'best_result.json'
+        prev_results  = json.loads(_all_res_path.read_text()) if _all_res_path.exists() else []
+        best_pf_saved = (json.loads(_best_path.read_text()).get('pf', 0.0)
+                         if _best_path.exists() else 0.0)
+        best_pf_show  = max(args.best_pf, best_pf_saved)
+        _dash.update({
+            'phase': 'training',
+            'trial': args.trial, 'total_trials': args.total_trials,
+            'best_pf': best_pf_show, 'target_pf': 0,
+            'current_params': {k: v for k, v in vars(args).items()
+                               if k not in ('trial','total_trials','best_pf','start_time','out_dir')},
+            'epoch': 0, 'total_epochs': args.epochs,
+            'train_loss': 0.0, 'val_loss': 0.0, 'accuracy': 0.0,
+            'epoch_log': [], 'trial_results': prev_results,
+            'start_time': st, 'message': f'試行{args.trial}: データ準備中...',
+        })
+        try: update_dashboard(_dash)
+        except Exception: pass
+
+    # 並列モードでも trial_progress.json に初期状態を書く
+    _write_trial_progress(OUT_DIR, {
+        'trial': args.trial, 'arch': getattr(args, 'arch', '?'),
+        'hidden': getattr(args, 'hidden', 0),
+        'epoch': 0, 'total_epochs': args.epochs,
+        'train_loss': 0.0, 'val_loss': 0.0, 'accuracy': 0.0,
+        'phase': 'training',
+    })
+
+    X_tr, y_tr, X_te, y_te, mean, std, df_te, seq_len, feat_indices = prepare(args)
+    n_feat = X_tr.shape[2]
+    model = train(args, X_tr, y_tr, X_te, y_te, mean, std, n_feat=n_feat)
+
+    wrapped = FXPredictorWithNorm(model, mean, std)
+
+    print("\n=== バックテスト (テスト期間) ===")
+    r = backtest_torch(wrapped, X_te, df_te, args.threshold, args.tp, args.sl,
+                       seq_len=seq_len,
+                       hold_bars=args.forward,
+                       report_dir=OUT_DIR,
+                       trial_no=args.trial)
+
+    if r['trades'] >= 200:
+        print(f"\n=== ONNX エクスポート (取引{r['trades']}件) ===")
+        export_onnx(wrapped, seq_len, n_feat, str(ONNX_PATH), opset=14)
+    print(f"  PF={r['pf']}  取引={r['trades']}  勝率={r['win_rate']:.1%}  "
+          f"SR={r.get('sr',0):.3f}  MaxDD={r.get('max_dd',0):.4f}")
+
+    # 特徴量重要度 (PF > 0 で取引があれば計算)
+    feat_imp = []
+    if r['trades'] >= 10:
+        try:
+            feat_imp = calc_feature_importance(wrapped, X_te, feat_indices, n_samples=300)
+            top5 = ', '.join(f'{n}({s:.4f})' for n, s in feat_imp[:5])
+            print(f"  特徴量重要度 TOP5: {top5}")
+        except Exception as e:
+            print(f"  [WARN] 特徴量重要度計算失敗: {e}")
+
+    # 結果保存
+    full = {**{k: v for k, v in vars(args).items() if k != 'out_dir'}, **r}
+    full['feature_importance'] = feat_imp
+    (OUT_DIR / 'last_result.json').write_text(
+        json.dumps(full, indent=2, ensure_ascii=False), encoding='utf-8')
+
+    # norm_params.json にEA用パラメータを追記
+    # EA はこのファイルを読んで threshold/tp/sl/hold_bars を自動適用する
+    try:
+        np_data = json.loads(NORM_PATH.read_text(encoding='utf-8'))
+        np_data['threshold'] = args.threshold
+        np_data['tp_atr']    = args.tp
+        np_data['sl_atr']    = args.sl
+        np_data['hold_bars'] = args.forward
+        NORM_PATH.write_text(json.dumps(np_data, indent=2, ensure_ascii=False),
+                             encoding='utf-8')
+        print(f"  norm_params更新: threshold={args.threshold} tp={args.tp} sl={args.sl} hold={args.forward}")
+    except Exception as e:
+        print(f"  [WARN] norm_params更新失敗: {e}")
+
+    _write_trial_progress(OUT_DIR, {
+        'trial': args.trial, 'arch': getattr(args, 'arch', '?'),
+        'hidden': getattr(args, 'hidden', 0),
+        'epoch': args.epochs, 'total_epochs': args.epochs,
+        'train_loss': 0.0, 'val_loss': 0.0, 'accuracy': 0.0,
+        'phase': 'done', 'pf': r['pf'], 'sr': r.get('sr', 0), 'max_dd': r.get('max_dd', 0),
+    })
+
+    if not parallel_mode:
+        _dash.update({
+            'phase': 'trial_done',
+            'message': (f"PF={r['pf']:.4f}  SR={r.get('sr',0):.3f}  "
+                        f"MaxDD={r.get('max_dd',0):.4f}  取引={r['trades']}"),
+        })
+        try: update_dashboard(_dash)
+        except Exception: pass
+
+    return r['pf']
+
+
+# ─── ProcessPoolExecutor ワーカー API ────────────────────────────────────────
+
+def worker_init(cache_pkl_path: str) -> None:
+    """ワーカープロセス初期化。Python起動 + torch import + CUDA初期化を1回だけ行う。
+    以降は run_trial_worker() を何度呼んでもオーバーヘッドなし。
+    """
+    import pickle
+    global _WORKER_STATE
+    t0 = time.time()
+    with open(cache_pkl_path, 'rb') as f:
+        df_tr, df_te = pickle.load(f)
+    _WORKER_STATE['df_tr'] = df_tr
+    _WORKER_STATE['df_te'] = df_te
+    # CUDA ウォームアップ (以後の試行でCUDA初期化コストが発生しないよう)
+    if torch.cuda.is_available():
+        _dummy = torch.zeros(1, device='cuda')
+        del _dummy
+        torch.cuda.synchronize()
+        torch.cuda.empty_cache()
+    print(f"  [WORKER pid={os.getpid()}] 初期化完了 {time.time()-t0:.1f}秒  "
+          f"df_tr={len(df_tr):,}  df_te={len(df_te):,}", flush=True)
+
+
+def run_trial_worker(trial_no: int, params: dict, trial_dir_str: str,
+                     best_pf: float, start_time: float) -> dict:
+    """ProcessPoolExecutor ワーカーで1試行を実行する。
+    worker_init() が事前に呼ばれ _WORKER_STATE にデータが入っている前提。
+    サブプロセス版と同一の last_result.json を出力する。
+    """
+    global OUT_DIR, ONNX_PATH, NORM_PATH
+
+    trial_dir = Path(trial_dir_str)
+    trial_dir.mkdir(parents=True, exist_ok=True)
+    OUT_DIR   = trial_dir
+    ONNX_PATH = trial_dir / 'fx_model.onnx'
+    NORM_PATH = trial_dir / 'norm_params.json'
+
+    # argparse 相当のオブジェクトを params から構築
+    class _A:
+        pass
+    args = _A()
+    _defaults = dict(
+        epochs=800, seed=42, timeframe='H1', label_type='triple_barrier',
+        train_months=0, feat_frac=1.0, n_features=0, feat_set=-2,
+        scheduler='onecycle', wd=1e-2, seq_len=20, batch=256,
+        lr=5e-4, dropout=0.5, hidden=64, layers=1, arch='gru_attn',
+        tp=1.5, sl=1.0, forward=20, threshold=0.4,
+    )
+    for k, v in _defaults.items():
+        setattr(args, k, v)
+    for k, v in params.items():
+        setattr(args, k, v)
+    args.trial        = trial_no
+    args.total_trials = 99999
+    args.best_pf      = best_pf
+    args.start_time   = start_time
+    args.out_dir      = trial_dir_str
+
+    set_seed(args.seed)
+    _write_trial_progress(trial_dir, {
+        'trial': trial_no, 'arch': getattr(args, 'arch', '?'),
+        'hidden': getattr(args, 'hidden', 0),
+        'epoch': 0, 'total_epochs': args.epochs,
+        'train_loss': 0.0, 'val_loss': 0.0, 'accuracy': 0.0, 'phase': 'training',
+    })
+
+    try:
+        # prepare() は _WORKER_STATE を参照するのでディスクI/Oなし
+        X_tr, y_tr, X_te, y_te, mean, std, df_te, seq_len, feat_indices = prepare(args)
+        n_feat = X_tr.shape[2]
+
+        model = train(args, X_tr, y_tr, X_te, y_te, mean, std, n_feat=n_feat)
+
+        wrapped = FXPredictorWithNorm(model, mean, std)
+
+        # ── PyTorch で直接バックテスト (ONNX エクスポート/ロード不要 → 2〜3秒節約) ──
+        r = backtest_torch(wrapped, X_te, df_te, args.threshold, args.tp, args.sl,
+                           seq_len=seq_len, hold_bars=args.forward,
+                           report_dir=trial_dir, trial_no=trial_no)
+
+        # ── ONNX エクスポート (採用基準 trades >= 200 のモデルのみ) ─────────────
+        if r['trades'] >= 200:
+            try:
+                export_onnx(wrapped, seq_len, n_feat, str(ONNX_PATH), opset=14)
+            except Exception as _e:
+                print(f"  [WARN] ONNX エクスポート失敗: {_e}")
+
+        # ── 特徴量重要度 (ONNX保存対象 trades>=200 のみ計算 / 軽量化)
+        # trades < 200 のゴミモデルに時間を使わない → H100 速度改善
+        feat_imp = []
+        if r['trades'] >= 200:
+            try:
+                feat_imp = calc_feature_importance(wrapped, X_te, feat_indices, n_samples=100)
+                top5 = ', '.join(f'{n}({s:.4f})' for n, s in feat_imp[:5])
+                print(f"  特徴量重要度 TOP5: {top5}")
+            except Exception as _e:
+                print(f"  [WARN] 特徴量重要度計算失敗: {_e}")
+
+        # norm_params に EA 用パラメータを追記
+        try:
+            nd = json.loads(NORM_PATH.read_text(encoding='utf-8'))
+            nd.update({'threshold': args.threshold, 'tp_atr': args.tp,
+                       'sl_atr': args.sl, 'hold_bars': args.forward})
+            NORM_PATH.write_text(json.dumps(nd, indent=2, ensure_ascii=False),
+                                 encoding='utf-8')
+        except Exception:
+            pass
+
+        # last_result.json 保存 (メインプロセスが読み取る)
+        full = {**{k: v for k, v in vars(args).items()
+                   if k not in ('out_dir', 'total_trials', 'best_pf', 'start_time')}, **r}
+        full['feature_importance'] = feat_imp
+        (trial_dir / 'last_result.json').write_text(
+            json.dumps(full, indent=2, ensure_ascii=False), encoding='utf-8')
+
+        _write_trial_progress(trial_dir, {
+            'trial': trial_no, 'arch': getattr(args, 'arch', '?'),
+            'hidden': getattr(args, 'hidden', 0),
+            'epoch': args.epochs, 'total_epochs': args.epochs,
+            'train_loss': 0.0, 'val_loss': 0.0, 'accuracy': 0.0,
+            'phase': 'done', 'pf': r['pf'], 'sr': r.get('sr', 0),
+            'max_dd': r.get('max_dd', 0),
+        })
+        print(f"  [WORKER #{trial_no}] PF={r['pf']:.4f}  取引={r['trades']}", flush=True)
+        return r
+
+    except Exception as e:
+        import traceback
+        print(f"  [WORKER ERROR] trial#{trial_no}: {e}\n{traceback.format_exc()}",
+              flush=True)
+        return {'pf': 0.0, 'trades': 0, 'error': str(e),
+                'sr': 0.0, 'max_dd': 0.0, 'win_rate': 0.0,
+                'net_pnl': 0.0, 'gross_profit': 0.0, 'gross_loss': 0.0}
+
+
+if __name__ == '__main__':
+    main()
