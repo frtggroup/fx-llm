@@ -434,15 +434,160 @@ except Exception as e:
 PYEOF
 }
 
+# ─── torch inductor キャッシュ S3 アップロード (ZIP圧縮) ────────────────────
+_inductor_cache_upload() {
+    [ "$DEVICE_TYPE" != "GPU" ] && return 0
+    [ -z "$S3_ENDPOINT" ] && return 0
+    [ -z "$TORCHINDUCTOR_CACHE_DIR" ] && return 0
+    python3 - <<'PYEOF'
+import logging, os, pathlib, tempfile, time, zipfile
+from concurrent.futures import ThreadPoolExecutor, as_completed
+logging.getLogger('urllib3.connectionpool').setLevel(logging.ERROR)
+try:
+    import boto3, urllib3
+    urllib3.disable_warnings()
+    cache_dir = pathlib.Path(os.environ['TORCHINDUCTOR_CACHE_DIR'])
+    if not cache_dir.exists():
+        import sys; sys.exit(0)
+    bucket    = os.environ.get('S3_BUCKET', 'fxea')
+    s3_prefix = os.environ.get('S3_PREFIX', 'mix') + '/torch_inductor_cache'
+
+    marker    = cache_dir / '.last_s3_sync'
+    last_sync = marker.stat().st_mtime if marker.exists() else 0
+    files = [f for f in cache_dir.rglob('*')
+             if f.is_file() and f.name != '.last_s3_sync'
+             and f.stat().st_mtime > last_sync]
+    if not files:
+        import sys; sys.exit(0)
+    print(f'[*] inductor キャッシュ S3 同期: {len(files)}件 (新規/更新のみ)', flush=True)
+
+    def make_client():
+        return boto3.client('s3',
+            endpoint_url=os.environ.get('S3_ENDPOINT', ''),
+            aws_access_key_id=os.environ.get('S3_ACCESS_KEY', ''),
+            aws_secret_access_key=os.environ.get('S3_SECRET_KEY', ''),
+            verify=False)
+
+    def upload(f):
+        rel    = f.relative_to(cache_dir)
+        s3_key = f'{s3_prefix}/{rel}.zip'
+        client = make_client()
+        for attempt in range(3):
+            tmp_path = None
+            try:
+                with tempfile.NamedTemporaryFile(suffix='.zip', delete=False) as tmp:
+                    tmp_path = pathlib.Path(tmp.name)
+                with zipfile.ZipFile(tmp_path, 'w', zipfile.ZIP_DEFLATED, compresslevel=1) as zf:
+                    zf.write(str(f), f.name)
+                client.upload_file(str(tmp_path), bucket, s3_key)
+                return f.name
+            except Exception as e:
+                if tmp_path and tmp_path.exists(): tmp_path.unlink(missing_ok=True)
+                if attempt < 2: time.sleep(2 ** attempt)
+                else: raise e
+            finally:
+                if tmp_path and tmp_path.exists(): tmp_path.unlink(missing_ok=True)
+
+    done = 0
+    with ThreadPoolExecutor(max_workers=4) as ex:
+        futs = {ex.submit(upload, f): f for f in files}
+        for fut in as_completed(futs):
+            try: fut.result(); done += 1
+            except Exception as e: print(f'  [WARN] upload failed: {e}')
+    marker.touch()
+    print(f'[OK] inductor S3 同期: {done}/{len(files)}件完了', flush=True)
+except Exception as e:
+    print(f'[WARN] inductor キャッシュ S3 保存失敗: {e}')
+PYEOF
+}
+
+# ─── torch inductor キャッシュ S3 ダウンロード (ZIP解凍対応) ────────────────
+_inductor_cache_download() {
+    [ "$DEVICE_TYPE" != "GPU" ] && return 0
+    [ -z "$S3_ENDPOINT" ] && return 0
+    [ -z "$TORCHINDUCTOR_CACHE_DIR" ] && return 0
+    echo "[*] inductor キャッシュを S3 から復元中..."
+    python3 - <<'PYEOF'
+import io, logging, os, pathlib, zipfile
+from concurrent.futures import ThreadPoolExecutor, as_completed
+logging.getLogger('urllib3.connectionpool').setLevel(logging.ERROR)
+try:
+    import boto3, urllib3
+    urllib3.disable_warnings()
+    cache_dir = pathlib.Path(os.environ['TORCHINDUCTOR_CACHE_DIR'])
+    cache_dir.mkdir(parents=True, exist_ok=True)
+    bucket    = os.environ.get('S3_BUCKET', 'fxea')
+    s3_prefix = os.environ.get('S3_PREFIX', 'mix') + '/torch_inductor_cache/'
+
+    def make_client():
+        return boto3.client('s3',
+            endpoint_url=os.environ.get('S3_ENDPOINT', ''),
+            aws_access_key_id=os.environ.get('S3_ACCESS_KEY', ''),
+            aws_secret_access_key=os.environ.get('S3_SECRET_KEY', ''),
+            verify=False)
+
+    s3 = make_client()
+    paginator = s3.get_paginator('list_objects_v2')
+    tasks = []
+    for page in paginator.paginate(Bucket=bucket, Prefix=s3_prefix):
+        for obj in page.get('Contents', []):
+            key = obj['Key']
+            rel = key[len(s3_prefix):]
+            if not rel:
+                continue
+            is_zip  = rel.endswith('.zip')
+            local_rel = rel[:-4] if is_zip else rel
+            dst = cache_dir / local_rel
+            if dst.exists():
+                continue
+            tasks.append((key, dst, is_zip))
+
+    if not tasks:
+        print('[OK] inductor キャッシュ: 全ファイル既存またはS3未存在 (スキップ)')
+    else:
+        print(f'[*] inductor キャッシュ: {len(tasks)}件をダウンロード中...', flush=True)
+        def download(args):
+            key, dst, is_zip = args
+            dst.parent.mkdir(parents=True, exist_ok=True)
+            if is_zip:
+                buf = io.BytesIO()
+                make_client().download_fileobj(bucket, key, buf)
+                buf.seek(0)
+                with zipfile.ZipFile(buf) as zf:
+                    names = zf.namelist()
+                    if names:
+                        dst.write_bytes(zf.read(names[0]))
+            else:
+                make_client().download_file(bucket, key, str(dst))
+            return dst.name
+
+        done = 0
+        with ThreadPoolExecutor(max_workers=8) as ex:
+            futs = {ex.submit(download, t): t for t in tasks}
+            for f in as_completed(futs):
+                try:
+                    f.result(); done += 1
+                    if done % 50 == 0:
+                        print(f'  ... {done}/{len(tasks)}', flush=True)
+                except Exception as e:
+                    print(f'  [WARN] DL失敗: {e}')
+        print(f'[OK] inductor キャッシュ復元完了: {done}/{len(tasks)}件')
+except Exception as e:
+    print(f'[INFO] inductor キャッシュ復元スキップ: {e}')
+PYEOF
+}
+
 _graceful_stop() {
     echo "[*] 停止シグナル受信..."
     _STOP_REQUESTED=1
     [ -n "$TRAIN_PID" ] && kill -0 "$TRAIN_PID" 2>/dev/null && kill -TERM "$TRAIN_PID"
     sleep 5
     [ -n "$TRAIN_PID" ] && kill -0 "$TRAIN_PID" 2>/dev/null && kill -KILL "$TRAIN_PID" || true
-    # XLA キャッシュを最終アップロード
+    # キャッシュを最終アップロード
     _xla_cache_upload
+    _inductor_cache_upload
     [ -n "$XLA_SYNC_PID" ] && kill "$XLA_SYNC_PID" 2>/dev/null || true
+    [ -n "$INDUCTOR_SYNC_PID" ] && kill "$INDUCTOR_SYNC_PID" 2>/dev/null || true
     echo "[OK] 停止完了"
 }
 trap '_graceful_stop' SIGTERM SIGINT
@@ -544,12 +689,25 @@ PYEOF
     fi
 fi
 
+# GPU: inductor キャッシュを S3 から復元 (起動時, 失敗しても続行)
+if [ "$DEVICE_TYPE" = "GPU" ] && [ -n "$S3_ENDPOINT" ]; then
+    _inductor_cache_download || true
+fi
+
 # 学習中の新規キャッシュ (train.py が生成) を定期的にS3へバックアップ (10分ごと)
 XLA_SYNC_PID=""
 if [ "$DEVICE_TYPE" = "TPU" ] && [ -n "$S3_ENDPOINT" ]; then
     (while true; do sleep 600; _xla_cache_upload; done) &
     XLA_SYNC_PID=$!
     echo "[*] 学習中XLAキャッシュ自動同期 開始 (10分ごと, PID: ${XLA_SYNC_PID})"
+fi
+
+# GPU: inductor キャッシュを学習中に定期バックアップ (10分ごと)
+INDUCTOR_SYNC_PID=""
+if [ "$DEVICE_TYPE" = "GPU" ] && [ -n "$S3_ENDPOINT" ]; then
+    (while true; do sleep 600; _inductor_cache_upload; done) &
+    INDUCTOR_SYNC_PID=$!
+    echo "[*] 学習中 inductor キャッシュ自動同期 開始 (10分ごと, PID: ${INDUCTOR_SYNC_PID})"
 fi
 
 # ── 自動再起動ループ ──────────────────────────────────────────────────────────
