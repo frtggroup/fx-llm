@@ -2213,6 +2213,121 @@ def main():
     _sync_thread = threading.Thread(target=_other_nodes_merge_loop, daemon=True, name='NodeSync')
     _sync_thread.start()
 
+    # ── inductor キャッシュ定期同期スレッド (GPU のみ) ──────────────────────
+    _INDUCTOR_SYNC_INTERVAL = 300   # 5分ごと
+    _inductor_sync_stop = threading.Event()
+
+    def _inductor_cache_sync_loop():
+        """torch inductor キャッシュを定期的に S3 と双方向同期 (ZIP圧縮)"""
+        import io, pathlib, tempfile, zipfile
+        cache_dir_str = os.environ.get('TORCHINDUCTOR_CACHE_DIR', '')
+        if not cache_dir_str or not S3_ENABLED:
+            return
+        cache_dir = pathlib.Path(cache_dir_str)
+        s3_prefix  = (S3_PREFIX.rstrip('/') + '/torch_inductor_cache') if S3_PREFIX else 'torch_inductor_cache'
+        marker     = cache_dir / '.last_s3_sync'
+
+        def _upload_new():
+            """新規/更新ファイルを ZIP 圧縮して S3 にアップロード"""
+            if not cache_dir.exists():
+                return 0
+            last_sync = marker.stat().st_mtime if marker.exists() else 0
+            files = [f for f in cache_dir.rglob('*')
+                     if f.is_file() and f.name != '.last_s3_sync'
+                     and f.stat().st_mtime > last_sync]
+            if not files:
+                return 0
+            client = _s3_client()
+            done = 0
+            for f in files:
+                rel    = f.relative_to(cache_dir)
+                s3_key = f'{s3_prefix}/{rel}.zip'
+                tmp_path = None
+                try:
+                    with tempfile.NamedTemporaryFile(suffix='.zip', delete=False) as tmp:
+                        tmp_path = pathlib.Path(tmp.name)
+                    with zipfile.ZipFile(tmp_path, 'w', zipfile.ZIP_DEFLATED, compresslevel=1) as zf:
+                        zf.write(str(f), f.name)
+                    client.upload_file(str(tmp_path), S3_BUCKET, f'{S3_PREFIX}/{s3_key}' if S3_PREFIX else s3_key)
+                    done += 1
+                except Exception as e:
+                    print(f'  [INDUCTOR] upload失敗 {f.name}: {e}')
+                finally:
+                    if tmp_path and tmp_path.exists():
+                        try: tmp_path.unlink()
+                        except Exception: pass
+            if done:
+                marker.touch()
+                print(f'  [INDUCTOR] S3 アップロード: {done}/{len(files)}件 (ZIP)')
+            return done
+
+        def _download_new():
+            """S3 にあってローカルにないファイルをダウンロード・解凍"""
+            cache_dir.mkdir(parents=True, exist_ok=True)
+            client = _s3_client()
+            prefix_key = (f'{S3_PREFIX}/{s3_prefix}/' if S3_PREFIX else f'{s3_prefix}/')
+            try:
+                paginator = client.get_paginator('list_objects_v2')
+                tasks = []
+                for page in paginator.paginate(Bucket=S3_BUCKET, Prefix=prefix_key):
+                    for obj in page.get('Contents', []):
+                        key = obj['Key']
+                        rel = key[len(prefix_key):]
+                        if not rel:
+                            continue
+                        is_zip    = rel.endswith('.zip')
+                        local_rel = rel[:-4] if is_zip else rel
+                        dst = cache_dir / local_rel
+                        if not dst.exists():
+                            tasks.append((key, dst, is_zip))
+                if not tasks:
+                    return 0
+                done = 0
+                for key, dst, is_zip in tasks:
+                    try:
+                        dst.parent.mkdir(parents=True, exist_ok=True)
+                        if is_zip:
+                            buf = io.BytesIO()
+                            client.download_fileobj(S3_BUCKET, key, buf)
+                            buf.seek(0)
+                            with zipfile.ZipFile(buf) as zf:
+                                names = zf.namelist()
+                                if names:
+                                    dst.write_bytes(zf.read(names[0]))
+                        else:
+                            client.download_file(S3_BUCKET, key, str(dst))
+                        done += 1
+                    except Exception as e:
+                        print(f'  [INDUCTOR] download失敗 {key}: {e}')
+                if done:
+                    print(f'  [INDUCTOR] S3 ダウンロード・解凍: {done}/{len(tasks)}件')
+                return done
+            except Exception as e:
+                print(f'  [INDUCTOR] S3 一覧取得失敗: {e}')
+                return 0
+
+        # 起動時に一度ダウンロード
+        try:
+            _download_new()
+        except Exception as e:
+            print(f'  [INDUCTOR] 初回DL失敗: {e}')
+
+        while not _inductor_sync_stop.wait(_INDUCTOR_SYNC_INTERVAL):
+            try:
+                _upload_new()
+            except Exception as e:
+                print(f'  [INDUCTOR] upload例外: {e}')
+            try:
+                _download_new()
+            except Exception as e:
+                print(f'  [INDUCTOR] download例外: {e}')
+
+    if not TPU_MODE and S3_ENABLED and os.environ.get('TORCHINDUCTOR_CACHE_DIR'):
+        _inductor_sync_thread = threading.Thread(
+            target=_inductor_cache_sync_loop, daemon=True, name='InductorSync')
+        _inductor_sync_thread.start()
+        print(f'  [INDUCTOR] S3 定期同期スレッド開始 ({_INDUCTOR_SYNC_INTERVAL}秒ごと, ZIP)')
+
     # 既存結果を引き継ぐ
     if ALL_RESULTS.exists():
         try:
