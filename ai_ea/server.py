@@ -435,7 +435,7 @@ def api_status():
     except Exception:
         pass
 
-    if _tpu_chip_map or _is_tpu_env:
+    if _is_tpu_env:
         # TPU環境では必ず全チップ分(0〜n-1)を表示。データなしはidle扱い
         chips_sorted = []
         for _ci in range(max(_n_tpu, max(_tpu_chip_map.keys(), default=-1) + 1)):
