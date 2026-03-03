@@ -2328,6 +2328,100 @@ def main():
         _inductor_sync_thread.start()
         print(f'  [INDUCTOR] S3 定期同期スレッド開始 ({_INDUCTOR_SYNC_INTERVAL}秒ごと, ZIP)')
 
+    # ── [一時] クラッシュ/フリーズ診断ログ (10秒ごとにS3へアップ) ─────────────────
+    # 問題解決後に削除すること
+    _DIAG_INTERVAL  = 10        # 秒
+    _DIAG_MAX_LINES = 360       # 最大保持行数 (360 * 10sec = 1時間分)
+    _diag_stop      = threading.Event()
+    _diag_lines: list = []
+    _diag_lock  = threading.Lock()
+
+    def _diag_loop():
+        import collections, io as _io, subprocess as _sp
+        _node_id = os.environ.get('NODE_ID', os.uname().nodename if hasattr(os, 'uname') else 'unknown')
+        _s3_key  = (f'{S3_PREFIX}/diag/{_node_id}_diag.jsonl').lstrip('/')
+
+        def _collect():
+            ts = time.time()
+            rec = {'ts': int(ts), 'dt': time.strftime('%H:%M:%S', time.localtime(ts))}
+            # CPU / RAM
+            try:
+                with open('/proc/loadavg') as f:
+                    la = f.read().split()
+                    rec['load1'], rec['load5'] = float(la[0]), float(la[1])
+            except Exception: pass
+            try:
+                with open('/proc/meminfo') as f:
+                    mi = {l.split(':')[0]: int(l.split()[1]) for l in f if ':' in l}
+                total = mi.get('MemTotal', 0); avail = mi.get('MemAvailable', 0)
+                rec['ram_gb_used'] = round((total - avail) / 1e6, 1)
+                rec['ram_gb_total'] = round(total / 1e6, 1)
+                rec['ram_pct'] = round(100 * (total - avail) / max(total, 1), 1)
+            except Exception: pass
+            # CPU%
+            try:
+                s1 = open('/proc/stat').readline().split()[1:]
+                time.sleep(0.1)
+                s2 = open('/proc/stat').readline().split()[1:]
+                idle1, idle2 = int(s1[3]), int(s2[3])
+                total1 = sum(int(x) for x in s1); total2 = sum(int(x) for x in s2)
+                rec['cpu_pct'] = round(100 * (1 - (idle2 - idle1) / max(total2 - total1, 1)), 1)
+            except Exception: pass
+            # FD count
+            try:
+                with open('/proc/sys/fs/file-nr') as f:
+                    parts = f.read().split()
+                    rec['fd_open'], rec['fd_max'] = int(parts[0]), int(parts[2])
+            except Exception: pass
+            # プロセス数
+            try:
+                rec['procs'] = len([d for d in os.listdir('/proc') if d.isdigit()])
+            except Exception: pass
+            # GPU (nvidia-smi)
+            try:
+                r = _sp.run(
+                    ['nvidia-smi', '--query-gpu=utilization.gpu,memory.used,memory.total,temperature.gpu,power.draw',
+                     '--format=csv,noheader,nounits'],
+                    capture_output=True, text=True, timeout=5)
+                if r.returncode == 0:
+                    parts = [p.strip() for p in r.stdout.strip().split(',')]
+                    if len(parts) >= 5:
+                        rec['gpu_util_pct']    = float(parts[0])
+                        rec['gpu_mem_used_mb'] = float(parts[1])
+                        rec['gpu_mem_total_mb'] = float(parts[2])
+                        rec['gpu_temp_c']      = float(parts[3])
+                        rec['gpu_power_w']     = float(parts[4])
+            except Exception: pass
+            return rec
+
+        def _upload(lines):
+            if not lines or not S3_ENABLED:
+                return
+            try:
+                body = '\n'.join(json.dumps(l, ensure_ascii=False) for l in lines) + '\n'
+                _s3_client().put_object(
+                    Bucket=S3_BUCKET, Key=_s3_key,
+                    Body=body.encode('utf-8'), ContentType='application/x-ndjson')
+            except Exception:
+                pass
+
+        while not _diag_stop.wait(_DIAG_INTERVAL):
+            try:
+                rec = _collect()
+                with _diag_lock:
+                    _diag_lines.append(rec)
+                    if len(_diag_lines) > _DIAG_MAX_LINES:
+                        del _diag_lines[:-_DIAG_MAX_LINES]
+                    lines_copy = list(_diag_lines)
+                _upload(lines_copy)
+            except Exception:
+                pass
+
+    if S3_ENABLED:
+        _diag_thread = threading.Thread(target=_diag_loop, daemon=True, name='DiagLog')
+        _diag_thread.start()
+        print(f'  [DIAG] クラッシュ診断ログ開始 ({_DIAG_INTERVAL}秒ごとS3アップ) ※一時機能')
+
     # 既存結果を引き継ぐ
     if ALL_RESULTS.exists():
         try:
