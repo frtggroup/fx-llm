@@ -124,21 +124,77 @@ def update_ssh_from_instance(inst: dict) -> bool:
 
 
 def wait_for_instance_ssh(max_tries: int = 40) -> bool:
-    """インスタンスのSSHポートが開くまで待機してSSH情報を更新"""
+    """インスタンスのSSHポートが開くまで待機してSSH情報を更新
+    loading が20回 (10分) 続いたら outbid とみなし bid 引き上げを試みる"""
+    loading_streak = 0
+    OUTBID_TRIES = 20   # 20回 × 30秒 = 10分
     for i in range(1, max_tries + 1):
         time.sleep(30)
         inst = get_current_instance()
         if inst is None:
-            log(f"  SSHポート待機中 [{i}/{max_tries}] (インスタンス未検出)")
-            continue
-        status    = inst.get("actual_status", "loading")
-        ssh_host  = inst.get("ssh_host", "")
-        ssh_port  = inst.get("ssh_port", 0)
-        log(f"  SSHポート待機中 [{i}/{max_tries}] status={status} {ssh_host}:{ssh_port}")
-        if ssh_host and ssh_port and status == "running":
+            loading_streak += 1
+            log(f"  SSHポート待機中 [{i}/{max_tries}] (インスタンス未検出) streak={loading_streak}")
+        else:
+            status    = inst.get("actual_status", "loading")
+            ssh_host  = inst.get("ssh_host", "")
+            ssh_port  = inst.get("ssh_port", 0)
+            log(f"  SSHポート待機中 [{i}/{max_tries}] status={status} {ssh_host}:{ssh_port}")
+            if ssh_host and ssh_port and status == "running":
+                update_ssh_from_instance(inst)
+                log(f"[VAST] SSH接続可能: {VAST_SSH_HOST}:{VAST_SSH_PORT}")
+                return True
+            if status == "loading":
+                loading_streak += 1
+            else:
+                loading_streak = 0
+
+        # 10分間 loading/なし → outbid 対処
+        if loading_streak >= OUTBID_TRIES:
+            log(f"[OUTBID] {loading_streak}回連続loading → 入札価格引き上げを試みる")
+            if inst and VAST_INSTANCE_ID:
+                recovered = try_raise_bid(VAST_INSTANCE_ID)
+                if recovered:
+                    loading_streak = 0
+                    continue
+            # bid 引き上げ失敗 → 新インスタンス作成
+            log("[OUTBID] bid引き上げ失敗 → 新インスタンスを作成")
+            return False  # restart_vast_instance が再呼び出しする
+    return False
+
+
+def try_raise_bid(instance_id: int) -> bool:
+    """現在のインスタンスの bid を最安値まで段階的に引き上げ"""
+    # 現在の最安値を取得
+    _, min_dph = find_cheapest_h200_offer()
+    if not min_dph:
+        return False
+
+    # 現在の bid を取得 (dph_total を近似として使用)
+    inst = get_current_instance()
+    if not inst:
+        return False
+    current_bid = inst.get("dph_total", 0.0)
+
+    # 最小単位 $0.02 ずつ引き上げ (最大5回)
+    for step in range(1, 6):
+        new_bid = round(current_bid + step * 0.02, 3)
+        if new_bid > min_dph + 0.20:
+            break
+        log(f"[BID] bid引き上げ試行: ${current_bid:.3f} → ${new_bid:.3f} (最安値=${min_dph:.3f})")
+        r = subprocess.run(
+            f"vastai change bid {instance_id} --price {new_bid}",
+            shell=True, capture_output=True, text=True
+        )
+        out = (r.stdout + r.stderr).strip()
+        log(f"[BID] change bid: {out[:80]}")
+        time.sleep(30)
+        inst = get_current_instance()
+        if inst and inst.get("actual_status") == "running":
             update_ssh_from_instance(inst)
-            log(f"[VAST] SSH接続可能: {VAST_SSH_HOST}:{VAST_SSH_PORT}")
+            log(f"[BID] bid引き上げ成功! ${new_bid:.3f}/hr で稼働")
             return True
+
+    log(f"[BID] bid引き上げ上限到達 → 新インスタンス作成へ")
     return False
 
 
@@ -340,32 +396,32 @@ def git_push_and_build(message: str) -> bool:
 
 
 def wait_for_build(timeout_min: int = 30) -> bool:
-    """GitHub Actions ビルド完了を待機。成功なら True"""
+    """GitHub Actions ビルド完了を待機。成功なら True (GitHub API使用)"""
+    import urllib.request
     log(f"[BUILD] GitHub Actions ビルド完了待機 (最大 {timeout_min}分)...")
     deadline = time.time() + timeout_min * 60
     time.sleep(30)
+    url = f"https://api.github.com/repos/{GH_REPO}/actions/runs?per_page=3"
     while time.time() < deadline:
-        r = subprocess.run(
-            f"gh run list --repo {GH_REPO} --workflow {GH_WORKFLOW} --limit 1 --json status,conclusion",
-            shell=True, capture_output=True, text=True
-        )
-        if r.returncode != 0:
-            log(f"[WARN] gh run list 失敗: {r.stderr.strip()}")
-            time.sleep(30)
-            continue
         try:
-            data = json.loads(r.stdout)
-            if not data:
-                time.sleep(30)
-                continue
-            run = data[0]
-            status     = run.get("status", "")
-            conclusion = run.get("conclusion", "")
-            log(f"[BUILD] status={status} conclusion={conclusion}")
-            if status == "completed":
-                return conclusion == "success"
+            req = urllib.request.Request(url)
+            req.add_header("Accept", "application/vnd.github.v3+json")
+            with urllib.request.urlopen(req, timeout=15) as resp:
+                data = json.loads(resp.read())
+            runs = data.get("workflow_runs", [])
+            # build-dok-ea5.yml のみフィルタ
+            ea5_runs = [r for r in runs if GH_WORKFLOW in r.get("path", "")]
+            if not ea5_runs:
+                ea5_runs = runs  # フィルタ不可なら全件
+            if ea5_runs:
+                run = ea5_runs[0]
+                status     = run.get("status", "")
+                conclusion = run.get("conclusion") or ""
+                log(f"[BUILD] status={status} conclusion={conclusion}")
+                if status == "completed":
+                    return conclusion == "success"
         except Exception as e:
-            log(f"[WARN] JSON parse 失敗: {e}")
+            log(f"[WARN] ビルド確認失敗: {e}")
         time.sleep(30)
     log("[ERROR] ビルドタイムアウト")
     return False
@@ -408,8 +464,12 @@ def restart_vast_instance() -> bool:
     else:
         log("[WARN] 新インスタンスIDが取得できませんでした")
 
-    # SSHポート待機
-    return wait_for_instance_ssh(max_tries=40)
+    # SSHポート待機 (outbid で失敗したら再帰的に新インスタンス作成)
+    result = wait_for_instance_ssh(max_tries=40)
+    if not result:
+        log("[VAST] SSH待機失敗 (outbid?) → 新インスタンスで再試行")
+        return restart_vast_instance()
+    return result
 
 
 def verify_training_resumed(retries: int = 8) -> bool:
