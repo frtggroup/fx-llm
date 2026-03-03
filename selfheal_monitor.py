@@ -34,6 +34,7 @@ IMAGE        = "frtgroup/fx-ea5:latest"
 
 POLL_INTERVAL   = 60   # 秒
 STALL_THRESHOLD = 180  # 秒 — この間ログ更新なし → 停止とみなす
+MAX_BID_PER_HOUR = 0.50  # $/hr — これを超える bid では新インスタンスを作成しない
 
 VAST_SSH_KEY = str(Path.home() / ".ssh/google_compute_engine")
 
@@ -465,6 +466,12 @@ def restart_vast_instance() -> bool:
 
     bid = round(dph + 0.10, 3)
     log(f"[VAST] 最安offer: {offer_id} (${dph:.3f}/hr) → bid=${bid:.3f}")
+
+    # 価格上限チェック
+    if bid > MAX_BID_PER_HOUR:
+        log(f"[SKIP] bid=${bid:.3f} > 上限${MAX_BID_PER_HOUR:.2f} → インスタンス作成をスキップ (60秒後に再確認)")
+        time.sleep(60)
+        return restart_vast_instance()
 
     # 新インスタンス作成
     new_id = create_new_instance(offer_id, bid)
