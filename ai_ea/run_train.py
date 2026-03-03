@@ -323,26 +323,36 @@ if not _CUDA_AVAILABLE and not _TPU_AVAILABLE:
     print("[WARN]   GPU の場合: --gpus all オプションを付けて docker run しているか確認してください。")
 
 
+_s3_client_instance     = None
+_s3_client_instance_lock = threading.Lock()
+
 def _s3_client():
-    import boto3, urllib3
-    from botocore.config import Config
-    urllib3.disable_warnings(urllib3.exceptions.InsecureRequestWarning)
-    return boto3.client(
-        's3',
-        endpoint_url          = S3_ENDPOINT,
-        aws_access_key_id     = S3_ACCESS_KEY,
-        aws_secret_access_key = S3_SECRET_KEY,
-        region_name           = os.environ.get('S3_REGION', 'us-east-1'),
-        config                = Config(
-            signature_version    = 's3v4',
-            s3                   = {'addressing_style': 'path'},
-            connect_timeout      = 10,
-            read_timeout         = 60,
-            retries              = {'max_attempts': 2},
-            max_pool_connections = 50,
-        ),
-        verify = False,   # 自己署名証明書を許可
-    )
+    """シングルトン S3 クライアント (毎回生成するとコネクションプールがリークする)"""
+    global _s3_client_instance
+    if _s3_client_instance is not None:
+        return _s3_client_instance
+    with _s3_client_instance_lock:
+        if _s3_client_instance is None:
+            import boto3, urllib3
+            from botocore.config import Config
+            urllib3.disable_warnings(urllib3.exceptions.InsecureRequestWarning)
+            _s3_client_instance = boto3.client(
+                's3',
+                endpoint_url          = S3_ENDPOINT,
+                aws_access_key_id     = S3_ACCESS_KEY,
+                aws_secret_access_key = S3_SECRET_KEY,
+                region_name           = os.environ.get('S3_REGION', 'us-east-1'),
+                config                = Config(
+                    signature_version    = 's3v4',
+                    s3                   = {'addressing_style': 'path'},
+                    connect_timeout      = 10,
+                    read_timeout         = 30,   # 60→30秒 (ハングアップ防止)
+                    retries              = {'max_attempts': 1},  # boto3内リトライ無効 (上位で制御)
+                    max_pool_connections = 20,
+                ),
+                verify = False,
+            )
+    return _s3_client_instance
 
 
 _s3_time_skewed = False   # True = RequestTimeTooSkewed が発生 → S3 を一時無効化
@@ -361,14 +371,14 @@ def s3_upload(local_path: Path, s3_key: str) -> bool:
         return False
         
     client = _s3_client()
-    max_retries = 5
+    max_retries = 3   # 5→3 (S3停止時の最大待機: 1+2+4=7秒)
     for attempt in range(max_retries):
         try:
             client.upload_file(str(local_path), S3_BUCKET, f'{S3_PREFIX}/{s3_key}')
             return True
         except Exception as e:
             if attempt < max_retries - 1:
-                sleep_sec = 2 ** attempt
+                sleep_sec = 2 ** attempt   # 1, 2 秒
                 print(f'  [S3] upload失敗 {s3_key}: {e} → {sleep_sec}秒後にリトライ ({attempt+1}/{max_retries})')
                 time.sleep(sleep_sec)
             else:
