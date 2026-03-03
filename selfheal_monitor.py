@@ -210,20 +210,23 @@ def try_raise_bid(instance_id: int) -> bool:
 
 
 def find_cheapest_h200_offer() -> tuple:
-    """最安値のH200 NVL interruptible offer を返す (offer_id, dph)"""
-    r = subprocess.run(
-        'vastai search offers "gpu_name=H200_NVL num_gpus=1 rentable=True" --interruptible --order dph_base --raw',
-        shell=True, capture_output=True, text=True
-    )
-    try:
-        offers = json.loads(r.stdout)
-        if not offers:
-            return None, 0.0
-        cheapest = min(offers, key=lambda o: o.get("dph_base", 999))
-        return cheapest["id"], cheapest.get("dph_base", 0.0)
-    except Exception as e:
-        log(f"[ERROR] offer 解析失敗: {e}")
+    """最安値のH200 NVL / H100 NVL interruptible offer を返す (offer_id, dph)"""
+    all_offers = []
+    for gpu in ("H200_NVL", "H100_NVL"):
+        r = subprocess.run(
+            f'vastai search offers "gpu_name={gpu} num_gpus=1 rentable=True" --interruptible --order dph_base --raw',
+            shell=True, capture_output=True, text=True
+        )
+        try:
+            offers = json.loads(r.stdout)
+            all_offers.extend(offers)
+        except Exception:
+            pass
+    if not all_offers:
         return None, 0.0
+    cheapest = min(all_offers, key=lambda o: o.get("dph_base", 999))
+    log(f"[OFFER] 最安値: {cheapest.get('gpu_name')} ${cheapest.get('dph_base', 0):.3f}/hr @ {cheapest.get('geolocation','?')}")
+    return cheapest["id"], cheapest.get("dph_base", 0.0)
 
 
 def create_new_instance(offer_id: int, bid: float) -> int | None:
