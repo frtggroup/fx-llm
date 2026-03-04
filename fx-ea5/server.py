@@ -467,6 +467,14 @@ def api_status():
                 rt['epoch_log'] = tp.get('epoch_log', [])
         except Exception:
             pass
+    # トップレベル epoch_log が空なら running_trials で最も進んだ試行から補完
+    # (LOSS/ACCURACY チャート用: run_train.py が古いプロセスの場合のフォールバック)
+    if not st.get('epoch_log'):
+        rts = st.get('running_trials', [])
+        if rts:
+            best_rt = max(rts, key=lambda r: len(r.get('epoch_log') or []))
+            if best_rt.get('epoch_log'):
+                st['epoch_log'] = best_rt['epoch_log']
 
     # best_links の S3直リンクをプロキシURLに変換 (自己署名証明書ブロック回避)
     if isinstance(st.get('best_links'), dict):
@@ -750,7 +758,7 @@ def api_s3_catalog(force: int = 0):
     if not force:
         with _catalog_lock:
             cached = _catalog_cache
-            if cached.get('_ts', 0) + 60 > time.time():
+            if cached.get('_ts', 0) + 30 > time.time():
                 return JSONResponse(cached)
 
     if not _S3_ENDPOINT or not _S3_BUCKET:
@@ -1246,6 +1254,11 @@ function updateRunningTrials(runningList) {
   const changed = runningList.some(r => !existingTrials.has(r.trial))
                || [...existingTrials].some(t => !newTrials.has(t));
   if (changed) {
+    // DOM再構築前に全チャートインスタンスを破棄 (古いcanvas参照をクリア)
+    for (const k of Object.keys(_miniCharts)) {
+      try { _miniCharts[k].destroy(); } catch(e) {}
+      delete _miniCharts[k];
+    }
     wrap.innerHTML = runningList.map(_trialCardHtml).join('');
   } else {
     // テキスト・プログレスバーのみ差分更新（canvasは触らない）
@@ -1769,8 +1782,8 @@ poll();
 updateTop100();
 loadS3Catalog();
 setInterval(poll, 1000);
-// S3 カタログは 60秒ごとに更新
-setInterval(() => loadS3Catalog(), 60000);
+// S3 カタログは 30秒ごとに強制更新
+setInterval(() => loadS3Catalog(true), 30000);
 </script>
 </body>
 </html>
