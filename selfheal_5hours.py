@@ -613,19 +613,32 @@ def main():
                 time.sleep(POLL_INTERVAL)
                 continue
 
-            stalled = (not alive) and log_age > STALL_THRESHOLD and log_age != float("inf")
-
+            stalled = False
+            
+            if alive and log_age > STALL_THRESHOLD and log_age != float("inf"):
+                log(f"[WARN] プロセス稼働中だがS3ログ遅延 ({log_age:.0f}s) → ローカルログ確認")
+                code_stat, out_stat = ssh("stat -c %Y /workspace/train_run.log 2>/dev/null")
+                if code_stat == 0 and out_stat.strip().isdigit():
+                    local_age = time.time() - int(out_stat.strip())
+                    if local_age > STALL_THRESHOLD:
+                        log(f"[ERROR] ローカルログも更新停止 ({local_age:.0f}s) → ハングと判定")
+                        alive = False
+                        stalled = True
+                    else:
+                        log(f"[INFO] ローカルログは更新中 (age: {local_age:.0f}s) → S3遅延のみ様子見")
+                else:
+                    log("[WARN] ローカルログ日時取得失敗 → ハングと判定")
+                    alive = False
+                    stalled = True
+            
             if alive:
-                if log_age > STALL_THRESHOLD and log_age != float("inf"):
-                    log(f"[WARN] プロセス稼働中だがS3ログ遅延 ({log_age:.0f}s) → 様子見")
                 consecutive_failures = 0
                 time.sleep(POLL_INTERVAL)
                 continue
 
-            if not stalled and alive:
-                consecutive_failures = 0
-                time.sleep(POLL_INTERVAL)
-                continue
+            if not alive and not stalled and log_age <= STALL_THRESHOLD:
+                # この条件は S3が早いがプロセスが死んだ場合など
+                pass
 
             reason = "プロセス停止" if not alive else f"ログ更新停滞 ({log_age:.0f}s)"
             log(f"[!] 学習異常検出: {reason}")
