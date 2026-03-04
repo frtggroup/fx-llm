@@ -281,7 +281,16 @@ def calc_importance_onnx(onnx_path: Path, norm_path: Path,
     rng = np.random.default_rng(42)
     importances = []
     n_feat = X_s.shape[2]
-    for i in range(n_feat):
+
+    # 特徴量数が多い場合はランダムサンプリングして計算時間を抑制 (上限200)
+    _MAX_FI_FEAT = 200
+    if n_feat > _MAX_FI_FEAT:
+        sampled = sorted(rng.choice(n_feat, _MAX_FI_FEAT, replace=False).tolist())
+        print(f'  [BF] 特徴量{n_feat}個 → ランダムサンプリング {_MAX_FI_FEAT}個で計算')
+    else:
+        sampled = list(range(n_feat))
+
+    for i in sampled:
         X_p = X_s.copy()
         X_p[:, :, i] = X_p[rng.permutation(n), :, i]
         perm_out = _infer(X_p)

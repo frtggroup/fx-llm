@@ -1374,11 +1374,20 @@ def calc_feature_importance(model, X_te: np.ndarray,
     n_feat = X_s.shape[2]
 
     rng = np.random.default_rng(42)
-    # 全特徴量分のシャッフル済みデータを一括生成 (n_feat, n, seq, feat)
-    X_all = np.stack([X_s.copy() for _ in range(n_feat)], axis=0)
-    for i in range(n_feat):
+
+    # 特徴量数が多い場合はランダムサンプリングして計算時間/メモリを抑制 (上限200)
+    _MAX_FI_FEAT = 200
+    if n_feat > _MAX_FI_FEAT:
+        sampled = sorted(rng.choice(n_feat, _MAX_FI_FEAT, replace=False).tolist())
+    else:
+        sampled = list(range(n_feat))
+    n_sampled = len(sampled)
+
+    # サンプリング済み特徴量分のシャッフル済みデータを一括生成 (n_sampled, n, seq, feat)
+    X_all = np.stack([X_s.copy() for _ in range(n_sampled)], axis=0)
+    for idx, i in enumerate(sampled):
         perm = rng.permutation(n)
-        X_all[i, :, :, i] = X_all[i, perm, :, i]
+        X_all[idx, :, :, i] = X_all[idx, perm, :, i]
 
     with torch.no_grad():
         # baseline
@@ -1386,18 +1395,18 @@ def calc_feature_importance(model, X_te: np.ndarray,
         base_probs = model(xb).float().cpu().numpy()
         base_ent = float(-np.mean(base_probs * np.log(base_probs + 1e-9)))
 
-        # 全特徴量を結合してまとめて推論 (n_feat*n, seq, feat)
-        X_flat = X_all.reshape(n_feat * n, X_s.shape[1], n_feat)
+        # 全サンプリング特徴量を結合してまとめて推論 (n_sampled*n, seq, feat)
+        X_flat = X_all.reshape(n_sampled * n, X_s.shape[1], n_feat)
         bs = 512
         perm_probs_list = []
         for start in range(0, len(X_flat), bs):
             xb = torch.from_numpy(np.ascontiguousarray(X_flat[start:start+bs])).to(device)
             perm_probs_list.append(model(xb).float().cpu().numpy())
-        perm_probs_all = np.concatenate(perm_probs_list, axis=0).reshape(n_feat, n, 3)
+        perm_probs_all = np.concatenate(perm_probs_list, axis=0).reshape(n_sampled, n, 3)
 
     importances = []
-    for i in range(n_feat):
-        pp = perm_probs_all[i]
+    for idx, i in enumerate(sampled):
+        pp = perm_probs_all[idx]
         perm_ent = float(-np.mean(pp * np.log(pp + 1e-9)))
         score = abs(perm_ent - base_ent)
         global_idx = feat_indices[i] if feat_indices else i
