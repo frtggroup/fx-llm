@@ -1228,7 +1228,7 @@ function _trialCardHtml(r) {
     </div>
     <div class="bar-wrap" style="margin-top:5px">
       <div class="tc-bar bar" style="background:#818cf8;width:${epPct}%"></div></div>
-    <div class="trial-mini-chart" style="display:none">
+    <div class="trial-mini-chart">
       <canvas id="mini-chart-${r.trial}"></canvas></div>
   </div>`;
 }
@@ -1281,7 +1281,6 @@ function updateRunningTrials(runningList) {
   runningList.forEach(r => {
     const el = document.getElementById(`mini-chart-${r.trial}`);
     if (!el || !r.epoch_log || r.epoch_log.length < 2) return;
-    el.closest('.trial-mini-chart').style.display = '';
     const cfg = _makeLossChartCfg(r.epoch_log, true);
     if (_miniCharts[r.trial]) {
       _miniCharts[r.trial].data = cfg.data;

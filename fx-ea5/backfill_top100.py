@@ -30,6 +30,7 @@ def _s3():
             aws_secret_access_key=S3_SECRET_KEY,
             region_name='jp-north-1',
             config=Config(connect_timeout=10, read_timeout=30),
+            verify=False,
         )
     return _S3_CLIENT
 
@@ -61,34 +62,87 @@ def _s3_download(s3_key: str, local_path: Path) -> bool:
         print(f'  [S3] download error {s3_key}: {e}')
         return False
 
+_S3_TRIAL_MAP: dict | None = None  # trial_no -> {'onnx': s3_key, 'norm': s3_key}
+
+def _build_s3_trial_map() -> dict:
+    """S3 の top100_* 以下の result.json を全件読んで trial_no → S3パス マップを構築"""
+    global _S3_TRIAL_MAP
+    if _S3_TRIAL_MAP is not None:
+        return _S3_TRIAL_MAP
+    _S3_TRIAL_MAP = {}
+    if not S3_ENABLED:
+        return _S3_TRIAL_MAP
+    cl = _s3()
+    if cl is None:
+        return _S3_TRIAL_MAP
+    node_prefixes = ['top100_gtx1080ti', 'top100_h200', 'top100_h100', 'top100_gtx', 'top100_cpu']
+    if S3_PREFIX:
+        node_prefixes = [f'{S3_PREFIX}/{p}' for p in node_prefixes] + node_prefixes
+    for prefix in node_prefixes:
+        try:
+            paginator = cl.get_paginator('list_objects_v2')
+            for page in paginator.paginate(Bucket=S3_BUCKET, Prefix=prefix + '/'):
+                for obj in page.get('Contents', []):
+                    key = obj['Key']
+                    if not key.endswith('/result.json'):
+                        continue
+                    try:
+                        resp = cl.get_object(Bucket=S3_BUCKET, Key=key)
+                        r = json.loads(resp['Body'].read())
+                        tno = r.get('trial')
+                        if tno is None:
+                            continue
+                        base = key.rsplit('/', 1)[0]
+                        onnx_key = base + '/fx_model.onnx'
+                        norm_key = base + '/norm_params.json'
+                        if tno not in _S3_TRIAL_MAP:
+                            _S3_TRIAL_MAP[tno] = {'onnx': onnx_key, 'norm': norm_key, 'result': r}
+                    except Exception:
+                        pass
+        except Exception as e:
+            print(f'  [S3] map build error ({prefix}): {e}')
+    print(f'  [S3] trial_map built: {len(_S3_TRIAL_MAP)} entries')
+    return _S3_TRIAL_MAP
+
+
 def _try_download_onnx(rank_dir: Path, trial_no: int) -> bool:
-    """S3 の複数プレフィクスから ONNX をダウンロード試行"""
+    """S3 から ONNX をダウンロード: まず trial_no マップで検索、次に rank_name で検索"""
     if not S3_ENABLED:
         return False
+
+    def _dl_onnx_norm(s3_onnx_key: str) -> bool:
+        onnx_dst = rank_dir / 'fx_model.onnx'
+        if not _s3_download(s3_onnx_key, onnx_dst):
+            return False
+        print(f'  [S3] ONNX ダウンロード成功: {s3_onnx_key}')
+        norm_key = s3_onnx_key.replace('fx_model.onnx', 'norm_params.json')
+        norm_dst = rank_dir / 'norm_params.json'
+        norm_bak = rank_dir / 'norm_params.json.bak'
+        if norm_dst.exists():
+            norm_dst.rename(norm_bak)
+        ok = _s3_download(norm_key, norm_dst)
+        if not ok and norm_bak.exists():
+            norm_bak.rename(norm_dst)
+        elif norm_bak.exists():
+            norm_bak.unlink(missing_ok=True)
+        return True
+
+    # 1) trial_no マップで検索 (最も確実)
+    tmap = _build_s3_trial_map()
+    if trial_no in tmap:
+        if _dl_onnx_norm(tmap[trial_no]['onnx']):
+            return True
+
+    # 2) rank_name パターンでフォールバック
     rank_name = rank_dir.name
-    # 候補となる S3 パス (rank-specific のみ。best_* は rank によらず同一ファイルなので除外)
     node_candidates = ['gtx1080ti', 'h200', 'h100', 'gtx', 'cpu']
     s3_patterns = []
     for node in node_candidates:
-        s3_patterns.append(f'{S3_PREFIX}/top100_{node}/{rank_name}/fx_model.onnx')
-    s3_patterns.append(f'checkpoint/top100/{rank_name}/fx_model.onnx')
-    s3_patterns.append(f'{S3_PREFIX}/top100/{rank_name}/fx_model.onnx')
-
+        s3_patterns.append(f'top100_{node}/{rank_name}/fx_model.onnx')
+        if S3_PREFIX:
+            s3_patterns.append(f'{S3_PREFIX}/top100_{node}/{rank_name}/fx_model.onnx')
     for s3_key in s3_patterns:
-        onnx_dst = rank_dir / 'fx_model.onnx'
-        if _s3_download(s3_key, onnx_dst):
-            print(f'  [S3] ONNX ダウンロード成功: {s3_key}')
-            # norm_params.json も同じ場所から取得 (常に上書き: ONNX と一致させる)
-            norm_key = s3_key.replace('fx_model.onnx', 'norm_params.json')
-            norm_dst = rank_dir / 'norm_params.json'
-            norm_bak = rank_dir / 'norm_params.json.bak'
-            if norm_dst.exists():
-                norm_dst.rename(norm_bak)
-            ok = _s3_download(norm_key, norm_dst)
-            if not ok and norm_bak.exists():
-                norm_bak.rename(norm_dst)  # 取得失敗ならバックアップを戻す
-            elif norm_bak.exists():
-                norm_bak.unlink(missing_ok=True)
+        if _dl_onnx_norm(s3_key):
             return True
     return False
 
@@ -134,13 +188,20 @@ def calc_importance_onnx(onnx_path: Path, norm_path: Path,
     if len(X_te) == 0:
         return []
 
-    # norm_params ロード
+    # norm_params ロード (shape ミスマッチ時はスキップ)
     if norm_path.exists():
-        np_data = json.loads(norm_path.read_text(encoding='utf-8'))
-        mean = np.array(np_data.get('mean', [0]*X_te.shape[2]), dtype=np.float32)
-        std  = np.array(np_data.get('std',  [1]*X_te.shape[2]), dtype=np.float32)
-        std  = np.where(std < 1e-8, 1.0, std)
-        X_te = ((X_te - mean) / std).astype(np.float32)
+        try:
+            np_data = json.loads(norm_path.read_text(encoding='utf-8'))
+            mean = np.array(np_data.get('mean', [0]*X_te.shape[2]), dtype=np.float32)
+            std  = np.array(np_data.get('std',  [1]*X_te.shape[2]), dtype=np.float32)
+            if len(mean) == X_te.shape[2]:
+                std  = np.where(std < 1e-8, 1.0, std)
+                X_te = ((X_te - mean) / std).astype(np.float32)
+            else:
+                print(f'  [BF] norm_params shape mismatch ({len(mean)} vs {X_te.shape[2]}), skip norm')
+                X_te = X_te.astype(np.float32)
+        except Exception:
+            X_te = X_te.astype(np.float32)
     else:
         X_te = X_te.astype(np.float32)
 
@@ -295,6 +356,48 @@ def main():
                 continue
         to_process.append((rank_dir, onnx, norm, result, r))
 
+    # ─ all_results.json の上位試行も補完 (top100 ディレクトリ外の試行) ─
+    if ALL_RESULTS.exists():
+        all_data = json.loads(ALL_RESULTS.read_text(encoding='utf-8'))
+        top_by_pf = sorted(all_data, key=lambda x: x.get('pf', 0), reverse=True)[:200]
+        already_tno = {r[4].get('trial') for r in to_process}
+        tmap = _build_s3_trial_map()
+        tmp_dir = AI_EA_DIR / '_tmp_backfill'
+        tmp_dir.mkdir(exist_ok=True)
+        for ar in top_by_pf:
+            tno = ar.get('trial')
+            if not tno or tno in already_tno:
+                continue
+            if ar.get('feature_importance'):
+                continue
+            if tno not in tmap:
+                continue
+            # 一時ディレクトリに ONNX/norm をダウンロードして処理
+            td = tmp_dir / f'trial_{tno:06d}'
+            td.mkdir(exist_ok=True)
+            onnx_tmp = td / 'fx_model.onnx'
+            norm_tmp = td / 'norm_params.json'
+            if not onnx_tmp.exists():
+                entry = tmap[tno]
+                _s3_download(entry['onnx'], onnx_tmp)
+                _s3_download(entry['norm'], norm_tmp)
+            if not onnx_tmp.exists():
+                continue
+            # result から feat_indices/seq_len を取得 (S3 result → all_results のどちらかから)
+            sr = tmap[tno].get('result', {})
+            feat_indices = ar.get('feat_indices') or sr.get('feat_indices')
+            seq_len = ar.get('seq_len') or sr.get('seq_len', 20)
+            if norm_tmp.exists() and feat_indices is None:
+                try:
+                    nd = json.loads(norm_tmp.read_text(encoding='utf-8'))
+                    feat_indices = nd.get('feat_indices')
+                    if seq_len == 20:
+                        seq_len = nd.get('seq_len', 20)
+                except Exception:
+                    pass
+            to_process.append((td, onnx_tmp, norm_tmp, None, ar))
+            already_tno.add(tno)
+
     print(f'[BF] 特徴量重要度バックフィル対象: {len(to_process)} モデル')
     if not to_process:
         print('[BF] 全モデル処理済み')
@@ -312,12 +415,14 @@ def main():
         feat_indices = r.get('feat_indices')   # list or None
         seq_len    = r.get('seq_len', 20)
 
-        # norm_params.json から補完
+        # norm_params.json から補完 (norm_params は ONNX と一致して保存されているのでより信頼性が高い)
         if norm.exists():
             try:
                 nd = json.loads(norm.read_text(encoding='utf-8'))
-                if feat_indices is None:
-                    feat_indices = nd.get('feat_indices')
+                norm_fi = nd.get('feat_indices')
+                # norm_params の feat_indices が all_results より多い場合はそちらを優先
+                if norm_fi and (feat_indices is None or len(norm_fi) > len(feat_indices)):
+                    feat_indices = norm_fi
                 if seq_len == 20:
                     seq_len = nd.get('seq_len', 20)
             except Exception:
@@ -336,10 +441,11 @@ def main():
             top5 = ', '.join(f'{n}({s:.4f})' for n, s in imp[:5])
             print(f'  → TOP5: {top5}  ({time.time()-t0:.1f}s)')
 
-            # result.json 更新
-            r['feature_importance'] = imp
-            result_f.write_text(json.dumps(r, indent=2, ensure_ascii=False),
-                                encoding='utf-8')
+            # result.json 更新 (top100 ディレクトリ経由の場合のみ)
+            if result_f is not None:
+                r['feature_importance'] = imp
+                result_f.write_text(json.dumps(r, indent=2, ensure_ascii=False),
+                                    encoding='utf-8')
 
             # all_results.json も更新
             _update_all_results(trial_no, imp)
@@ -347,6 +453,22 @@ def main():
         except Exception as e:
             print(f'  → エラー: {e}')
             continue
+
+    # バックフィル結果を S3 に保存
+    if S3_ENABLED and ALL_RESULTS.exists():
+        try:
+            cl = _s3()
+            if cl:
+                s3_key = (S3_PREFIX + '/' if S3_PREFIX else '') + 'all_results.json'
+                cl.put_object(
+                    Bucket=S3_BUCKET,
+                    Key=s3_key,
+                    Body=ALL_RESULTS.read_bytes(),
+                    ContentType='application/json',
+                )
+                print(f'[BF] all_results.json → S3 保存完了 ({s3_key})')
+        except Exception as e:
+            print(f'[BF] S3 保存失敗: {e}')
 
     print('[BF] バックフィル完了')
 

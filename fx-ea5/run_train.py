@@ -1354,7 +1354,7 @@ def _load_best_links() -> dict:
 
 
 # ── 集約 progress.json ────────────────────────────────────────────────────────
-def write_progress(running: dict, results: list, best_pf: float, start: float) -> None:
+def write_progress(running: dict, results: list, best_pf: float, start: float, stall_count: int = 0) -> None:
     running_info = []
     gi = _gpu_info()
     for tno, info in list(running.items()):
@@ -1471,7 +1471,7 @@ def write_progress(running: dict, results: list, best_pf: float, start: float) -
         'pf_loss_count':    _pf_loss,
         'pf_win_count':     _pf_win,
         'fail_rate':        _fail_rate,
-        'stall_count':      _stall_count,
+        'stall_count':      stall_count,
         'start_time':      start,
         'elapsed_sec':     time.time() - start,
         'gpu_pct':         gi['gpu_pct'],
@@ -2781,7 +2781,7 @@ def main():
     completed_since_ckpt   = 0   # チェックポイント後の完了件数カウンタ
     _stall_count           = 0   # STALL 強制終了カウンタ
 
-    write_progress(trainer.running, results, best_pf, start)
+    write_progress(trainer.running, results, best_pf, start, _stall_count)
 
     # ── メインループ ────────────────────────────────────────────────────────
     _loop_errors = 0
@@ -2851,7 +2851,20 @@ def main():
             results.sort(key=lambda x: x['trial'])
 
             # all_results.json アトミック書き込み
+            # バックフィルが書き込んだ feature_importance を上書きしないよう
+            # 既存ファイルから FI をマージしてから書き込む
             try:
+                if ALL_RESULTS.exists():
+                    try:
+                        _disk = json.loads(ALL_RESULTS.read_text(encoding='utf-8'))
+                        _fi_map = {(r.get('trial'), r.get('node_id', '')): r.get('feature_importance')
+                                   for r in _disk if r.get('feature_importance')}
+                        for _r in results:
+                            _key = (_r.get('trial'), _r.get('node_id', ''))
+                            if not _r.get('feature_importance') and _fi_map.get(_key):
+                                _r['feature_importance'] = _fi_map[_key]
+                    except Exception:
+                        pass
                 tmp = ALL_RESULTS.with_suffix('.tmp')
                 tmp.write_text(json.dumps(results, indent=2, ensure_ascii=False),
                                encoding='utf-8')
@@ -2983,7 +2996,7 @@ def main():
                 time.sleep(LAUNCH_INTERVAL)
 
         # ── 進捗 JSON 書き込み (5秒ごと) ───────────────────────────────────
-        write_progress(trainer.running, results, best_pf, start)
+        write_progress(trainer.running, results, best_pf, start, _stall_count)
 
         # ── チェックポイント保存: 10試行ごと or 10分ごと ────────────────────
         should_ckpt = (completed_since_ckpt >= CHECKPOINT_EVERY_N or
