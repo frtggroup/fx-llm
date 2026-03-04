@@ -723,6 +723,17 @@ def _read_trial_epoch(trial_dir) -> int:
     return 0
 
 
+def _read_trial_phase(trial_dir) -> str:
+    """trial_progress.json から現在フェーズを読む (失敗時は 'training')"""
+    tp = trial_dir / 'trial_progress.json'
+    if tp.exists():
+        try:
+            return json.loads(tp.read_text(encoding='utf-8')).get('phase', 'training')
+        except Exception:
+            pass
+    return 'training'
+
+
 # ── ハイパーパラメータサンプリング ───────────────────────────────────────────
 def sample_params(rng: random.Random) -> dict:
     arch    = rng.choice(ARCHS)
@@ -1479,17 +1490,23 @@ class ParallelTrainer:
                         info['last_gpu_time'] = now
 
                     # ── epoch 進捗ストール検出 ──────────────────────────
-                    cur_ep = _read_trial_epoch(info['trial_dir'])
+                    cur_ep    = _read_trial_epoch(info['trial_dir'])
+                    cur_phase = _read_trial_phase(info['trial_dir'])
                     if cur_ep != info.get('_last_ep', -1):
                         info['_last_ep']      = cur_ep
                         info['_last_ep_time'] = now
                     stall = now - info.get('_last_ep_time', info['start_time'])
-                    stall_limit = EP_STALL_INIT_SEC if cur_ep == 0 else EP_STALL_TRAIN_SEC
+                    if cur_phase in ('backtest', 'done'):
+                        stall_limit = 600   # バックテスト中は10分待つ (CPU処理中)
+                    elif cur_ep == 0:
+                        stall_limit = EP_STALL_INIT_SEC
+                    else:
+                        stall_limit = EP_STALL_TRAIN_SEC
 
                     _kill_proc = None
                     if elapsed > 30 and stall > stall_limit:
                         _kill_proc = ('STALL',
-                                      f"試行#{tno} ep={cur_ep} {stall/60:.1f}分進捗なし")
+                                      f"試行#{tno} ep={cur_ep} phase={cur_phase} {stall/60:.1f}分進捗なし")
                     elif elapsed > TRIAL_TIMEOUT:
                         _kill_proc = ('TIMEOUT',
                                       f"試行#{tno} ({elapsed/60:.0f}分超)")
@@ -1746,17 +1763,23 @@ class WorkerPool:
                     del self._meta[tno]
                 else:
                     # ── epoch 進捗ストール検出 ──────────────────────────
-                    cur_ep = _read_trial_epoch(meta['trial_dir'])
+                    cur_ep    = _read_trial_epoch(meta['trial_dir'])
+                    cur_phase = _read_trial_phase(meta['trial_dir'])
                     if cur_ep != meta.get('_last_ep', -1):
                         meta['_last_ep']      = cur_ep
                         meta['_last_ep_time'] = now
                     stall = now - meta.get('_last_ep_time', meta['start_time'])
-                    stall_limit = EP_STALL_INIT_SEC if cur_ep == 0 else EP_STALL_TRAIN_SEC
+                    if cur_phase in ('backtest', 'done'):
+                        stall_limit = 600   # バックテスト中は10分待つ (CPU処理中)
+                    elif cur_ep == 0:
+                        stall_limit = EP_STALL_INIT_SEC
+                    else:
+                        stall_limit = EP_STALL_TRAIN_SEC
 
                     if elapsed > 30 and stall > stall_limit:
                         # STALL: この試行だけスキップ (executor全体再起動はしない)
                         # executor再起動はCPU爆発→次STALL→無限ループの原因になるため
-                        print(f"  [STALL] 試行#{tno} ep={cur_ep} {stall/60:.1f}分進捗なし"
+                        print(f"  [STALL] 試行#{tno} ep={cur_ep} phase={cur_phase} {stall/60:.1f}分進捗なし"
                               f" → この試行のみスキップ (executor継続)")
                         future.cancel()
                         done.append((tno, meta))

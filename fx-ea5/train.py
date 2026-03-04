@@ -1842,6 +1842,14 @@ def run_trial_worker(trial_no: int, params: dict, trial_dir_str: str,
 
         wrapped = FXPredictorWithNorm(model, mean, std)
 
+        # ── バックテストフェーズ開始を通知 (STALL検出に長い猶予を与える) ──────────
+        _write_trial_progress(trial_dir, {
+            'trial': trial_no, 'arch': getattr(args, 'arch', '?'),
+            'hidden': getattr(args, 'hidden', 0),
+            'epoch': _tr_stats.get('best_ep', 0), 'total_epochs': args.epochs,
+            'phase': 'backtest',
+        })
+
         # ── PyTorch で直接バックテスト (ONNX エクスポート/ロード不要 → 2〜3秒節約) ──
         r = backtest_torch(wrapped, X_te, df_te, args.threshold, args.tp, args.sl,
                            seq_len=seq_len, hold_bars=args.forward,
