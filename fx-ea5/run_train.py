@@ -273,9 +273,10 @@ def _auto_gpu_config(node_id: str) -> tuple[str, float, float, int]:
     elif total_gb >=  14: tier = 'small'
     else:                 tier = 'micro'
 
-    vpt_map = {'xlarge': 10.0, 'large': 4.0, 'medium': 4.0, 'small': 4.0, 'micro': 3.5}
-    # xlarge(H200 140GB): 3.0→8.0 → 39ワーカー→15ワーカーへ削減
-    # 同時CUDA context初期化"busy"エラーと GPU競合を解消
+    vpt_map = {'xlarge': 30.0, 'large': 4.0, 'medium': 4.0, 'small': 4.0, 'micro': 3.5}
+    # xlarge(H200 150GB): 30.0 → 4ワーカー (150*0.85/30=4.25)
+    # H1データは小さい(~12k行)のでMPS過多並列はGPU飽和せずCPU過負荷の原因
+    # 4並列: 各1/4 H200 ≈ 2.5×GTX1080Ti → per-trial 高速化
     vpt = vpt_map[tier]
     par = max(1, int(total_gb * 0.85 / vpt))
 
