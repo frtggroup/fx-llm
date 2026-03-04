@@ -284,11 +284,34 @@ def prepare(args):
     # ===== TPU時の特殊処理：形状は固定しつつ、使わない列を0マスキングする =====
     # build_dataset の中ではサブセット抽出させず、後から 0 に書き換える
     build_feat_idx = None if _tpu_mode else feat_indices
-    
+
+    # ── 事前計算済みfeat配列を使って df[FEATURE_COLS].values の再確保を回避 ──
+    # worker_init で feat_tr_full / feat_te_full が計算済みの場合のみ使用
+    _feat_tr_full = _WORKER_STATE.get('feat_tr_full')
+    _feat_te_full = _WORKER_STATE.get('feat_te_full')
+    _orig_idx     = _WORKER_STATE.get('df_tr_index')
+
+    if _feat_tr_full is not None and _orig_idx is not None:
+        if len(df_tr) == len(_orig_idx):
+            # train_months フィルタなし → そのまま使用
+            feat_tr_pre = _feat_tr_full
+        else:
+            # train_months でdf_trが短縮 → searchsortedで行範囲を特定
+            start_pos = _orig_idx.searchsorted(df_tr.index[0])
+            end_pos   = start_pos + len(df_tr)
+            feat_tr_pre = _feat_tr_full[start_pos:end_pos]
+            # 行数が合わない場合は安全のためフォールバック
+            if len(feat_tr_pre) != len(df_tr):
+                feat_tr_pre = None
+    else:
+        feat_tr_pre = None
+
     X_tr, y_tr, _ = build_dataset(df_tr, seq_len, args.tp, args.sl, args.forward,
-                                   feat_indices=build_feat_idx)
+                                   feat_indices=build_feat_idx,
+                                   feat_precomputed=feat_tr_pre)
     X_te, y_te, _ = build_dataset(df_te, seq_len, args.tp, args.sl, args.forward,
-                                   feat_indices=build_feat_idx)
+                                   feat_indices=build_feat_idx,
+                                   feat_precomputed=_feat_te_full)
 
     if _tpu_mode and feat_indices is not None:
         n_masked = N_FEATURES - len(feat_indices)
@@ -1706,6 +1729,11 @@ def worker_init(cache_pkl_path: str) -> None:
         df_tr, df_te = pickle.load(f)
     _WORKER_STATE['df_tr'] = df_tr
     _WORKER_STATE['df_te'] = df_te
+    # 特徴量行列をfloat32 numpy配列として事前計算（毎試行の~910MB再確保を回避）
+    from features import FEATURE_COLS as _FC
+    _WORKER_STATE['feat_tr_full'] = df_tr[_FC].values.astype(np.float32)
+    _WORKER_STATE['feat_te_full'] = df_te[_FC].values.astype(np.float32)
+    _WORKER_STATE['df_tr_index']  = df_tr.index  # train_months フィルタ用インデックス
     # CUDA ウォームアップ (以後の試行でCUDA初期化コストが発生しないよう)
     if torch.cuda.is_available():
         _dummy = torch.zeros(1, device='cuda')
@@ -1713,7 +1741,8 @@ def worker_init(cache_pkl_path: str) -> None:
         torch.cuda.synchronize()
         torch.cuda.empty_cache()
     print(f"  [WORKER pid={os.getpid()}] 初期化完了 {time.time()-t0:.1f}秒  "
-          f"df_tr={len(df_tr):,}  df_te={len(df_te):,}", flush=True)
+          f"df_tr={len(df_tr):,}  df_te={len(df_te):,}  "
+          f"feat_cache={_WORKER_STATE['feat_tr_full'].nbytes//1024//1024}MB", flush=True)
 
 
 def run_trial_worker(trial_no: int, params: dict, trial_dir_str: str,

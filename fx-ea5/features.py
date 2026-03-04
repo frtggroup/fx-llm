@@ -218,10 +218,14 @@ def make_labels(df: pd.DataFrame, tp_atr=1.5, sl_atr=1.0, forward_bars=20) -> np
     labels[:valid] = lbl
     return labels
 
-def build_dataset(df, seq_len=20, tp_atr=1.5, sl_atr=1.0, forward_bars=20, label_fn=None, feat_indices=None) -> tuple:
+def build_dataset(df, seq_len=20, tp_atr=1.5, sl_atr=1.0, forward_bars=20, label_fn=None, feat_indices=None, feat_precomputed=None) -> tuple:
     labels = make_labels(df, tp_atr=tp_atr, sl_atr=sl_atr, forward_bars=forward_bars)
-    
-    feat = df[FEATURE_COLS].values.astype(np.float32)
+
+    # feat_precomputed: worker_init で事前計算済みのfloat32配列を使う（毎試行の910MB再確保を回避）
+    if feat_precomputed is not None:
+        feat = feat_precomputed
+    else:
+        feat = df[FEATURE_COLS].values.astype(np.float32)
     if feat_indices is not None:
         feat = feat[:, feat_indices]
     n_feat = feat.shape[1]
