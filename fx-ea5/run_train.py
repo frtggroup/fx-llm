@@ -2670,8 +2670,13 @@ def main():
                     seen_key.add(key_r)
                     results.append(r)
 
+            # trades=0 を除外
+            before_zero = len(results)
+            results = [r for r in results if r.get('trades', 0) > 0]
+            if len(results) != before_zero:
+                print(f"  [CLEAN] trades=0 除去: {before_zero} → {len(results)} 件")
             if len(raw) != len(results):
-                print(f"  [DEDUP] 重複除去: {len(raw)} → {len(results)} 件")
+                print(f"  [DEDUP] 重複除去+クリーン: {len(raw)} → {len(results)} 件")
                 tmp = ALL_RESULTS.with_suffix('.tmp')
                 tmp.write_text(json.dumps(results, indent=2, ensure_ascii=False),
                                encoding='utf-8')
