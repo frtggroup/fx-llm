@@ -456,6 +456,18 @@ def api_status():
         active = [c for c in _tpu_chips if c['hbm_used'] > 0.1]
         st['tpu_duty_cycle'] = round(
             sum(c['duty_cycle'] for c in active) / len(active), 1) if active else 0.0
+    # running_trials に epoch_log を注入 (run_train.py が古い場合のフォールバック)
+    for rt in st.get('running_trials', []):
+        if rt.get('epoch_log'):
+            continue  # 既にある場合はスキップ
+        try:
+            tp_path = TRIALS_DIR / f"trial_{int(rt['trial']):06d}" / 'trial_progress.json'
+            if tp_path.exists():
+                tp = json.loads(tp_path.read_text(encoding='utf-8'))
+                rt['epoch_log'] = tp.get('epoch_log', [])
+        except Exception:
+            pass
+
     # best_links の S3直リンクをプロキシURLに変換 (自己署名証明書ブロック回避)
     if isinstance(st.get('best_links'), dict):
         bl = st['best_links']
@@ -732,13 +744,14 @@ def _s3_proxy_url(key: str) -> str:
 
 
 @app.get('/api/s3_catalog')
-def api_s3_catalog():
-    """全ノードの S3 上モデル・レポート一覧を返す (60秒キャッシュ)"""
+def api_s3_catalog(force: int = 0):
+    """全ノードの S3 上モデル・レポート一覧を返す (60秒キャッシュ、force=1でバイパス)"""
     global _catalog_cache
-    with _catalog_lock:
-        cached = _catalog_cache
-        if cached.get('_ts', 0) + 60 > time.time():
-            return JSONResponse(cached)
+    if not force:
+        with _catalog_lock:
+            cached = _catalog_cache
+            if cached.get('_ts', 0) + 60 > time.time():
+                return JSONResponse(cached)
 
     if not _S3_ENDPOINT or not _S3_BUCKET:
         return JSONResponse({'error': 'S3未設定', 'nodes': {}, 'top_global': []})
@@ -1235,34 +1248,7 @@ function updateRunningTrials(runningList) {
   runningList.forEach(r => {
     const el = document.getElementById(`mini-chart-${r.trial}`);
     if (!el || !r.epoch_log || r.epoch_log.length < 2) return;
-    const log    = r.epoch_log;
-    const labels = log.map(e => e.epoch);
-    const trL    = log.map(e => e.train_loss ?? null);
-    const vaL    = log.map(e => e.val_loss   ?? null);
-    const acc    = log.map(e => e.acc != null ? e.acc * 100 : null);
-    const cfg = {
-      type: 'line',
-      data: { labels, datasets: [
-        {label:'TrL', data:trL, borderColor:'#f0883e', borderWidth:1.2, tension:.3,
-         pointRadius:0, yAxisID:'yL', spanGaps:true},
-        {label:'VaL', data:vaL, borderColor:'#79c0ff', borderWidth:1.5, tension:.3,
-         pointRadius:0, yAxisID:'yL', spanGaps:true},
-        {label:'Acc', data:acc, borderColor:'#3fb950', borderWidth:1.2, tension:.3,
-         pointRadius:0, yAxisID:'yA', spanGaps:true},
-      ]},
-      options:{
-        responsive:true, maintainAspectRatio:false, animation:false,
-        plugins:{ legend:{labels:{color:'#8b949e',font:{size:9},usePointStyle:true,boxWidth:6}} },
-        scales:{
-          x:{display:false},
-          yL:{type:'linear',position:'left',ticks:{color:'#8b949e',font:{size:8},maxTicksLimit:4},
-              grid:{color:'#21262d'}},
-          yA:{type:'linear',position:'right',min:0,max:100,
-              ticks:{color:'#3fb950',font:{size:8},maxTicksLimit:3,callback:v=>v+'%'},
-              grid:{drawOnChartArea:false}},
-        }
-      }
-    };
+    const cfg = _makeLossChartCfg(r.epoch_log, true);
     if (_miniCharts[r.trial]) {
       _miniCharts[r.trial].data = cfg.data;
       _miniCharts[r.trial].update('none');
@@ -1272,39 +1258,52 @@ function updateRunningTrials(runningList) {
   });
 }
 
+// ── 共通: Loss/Acc チャート設定を生成 ────────────────────────────────────────
+function _makeLossChartCfg(epochLog, mini=false) {
+  const labels = epochLog.map(e => e.epoch);
+  const trL    = epochLog.map(e => e.train_loss ?? null);
+  const vaL    = epochLog.map(e => e.val_loss   ?? null);
+  const acc    = epochLog.map(e => e.acc != null ? e.acc * 100 : null);
+  const sz     = mini ? 8 : 10;
+  return {
+    type: 'line',
+    data: { labels, datasets: [
+      {label: mini?'TrL':'Train Loss', data:trL, borderColor:'#f0883e',
+       backgroundColor: mini?'transparent':'transparent',
+       borderWidth:mini?1.2:1.5, tension:.3, pointRadius:mini?0:0, yAxisID:'yL', spanGaps:true},
+      {label: mini?'VaL':'Val Loss', data:vaL, borderColor:'#79c0ff',
+       backgroundColor: mini?'transparent':'#79c0ff18',
+       borderWidth:mini?1.5:2, tension:.3, pointRadius:mini?0:2, yAxisID:'yL', spanGaps:true},
+      {label:'Acc%', data:acc, borderColor:'#3fb950',
+       backgroundColor: mini?'transparent':'#3fb95018',
+       borderWidth:mini?1.2:2, tension:.3, pointRadius:mini?0:2, yAxisID:'yA', spanGaps:true},
+    ]},
+    options:{
+      responsive:true, maintainAspectRatio:false, animation:false,
+      interaction: mini?undefined:{mode:'index',intersect:false},
+      plugins:{
+        legend:{labels:{color:mini?'#8b949e':'#e6edf3',font:{size:sz},usePointStyle:true,boxWidth:mini?6:8}},
+        tooltip: mini?{enabled:false}:{backgroundColor:'#161b22',borderColor:'#30363d',borderWidth:1},
+      },
+      scales:{
+        x: mini?{display:false}:{ticks:{color:'#8b949e',maxTicksLimit:8},grid:{color:'#21262d'}},
+        yL:{type:'linear',position:'left',
+            ticks:{color:'#8b949e',font:{size:mini?8:undefined},maxTicksLimit:mini?4:undefined},
+            grid:{color:'#21262d'},
+            title: mini?undefined:{display:true,text:'Loss',color:'#8b949e'}},
+        yA:{type:'linear',position:'right',min:0,max:100,
+            ticks:{color:'#3fb950',font:{size:mini?8:undefined},maxTicksLimit:mini?3:undefined,callback:v=>v+'%'},
+            grid:{drawOnChartArea:false}},
+      }
+    }
+  };
+}
+
 function updateLossChart(epochLog) {
   if (!epochLog || !epochLog.length) return;
   document.getElementById('chart-ph').style.display   = 'none';
   document.getElementById('chart-wrap').style.display = 'block';
-  const cfg = {
-    type: 'line',
-    data: {
-      labels: epochLog.map(r=>r.epoch),
-      datasets: [
-        {label:'Train Loss', data:epochLog.map(r=>r.train_loss??null),
-         borderColor:'#f0883e',backgroundColor:'transparent',borderWidth:1.5,tension:.3,pointRadius:0,yAxisID:'yL',spanGaps:true},
-        {label:'Val Loss',   data:epochLog.map(r=>r.val_loss??null),
-         borderColor:'#79c0ff',backgroundColor:'#79c0ff18',borderWidth:2,tension:.3,pointRadius:2,yAxisID:'yL'},
-        {label:'Acc %',      data:epochLog.map(r=>(r.acc??null)*100),
-         borderColor:'#3fb950',backgroundColor:'#3fb95018',borderWidth:2,tension:.3,pointRadius:2,yAxisID:'yA'},
-      ]
-    },
-    options:{
-      responsive:true,maintainAspectRatio:false,animation:false,
-      interaction:{mode:'index',intersect:false},
-      plugins:{
-        legend:{labels:{color:'#e6edf3',font:{size:10},usePointStyle:true,boxWidth:8}},
-        tooltip:{backgroundColor:'#161b22',borderColor:'#30363d',borderWidth:1}
-      },
-      scales:{
-        x:{ticks:{color:'#8b949e',maxTicksLimit:8},grid:{color:'#21262d'}},
-        yL:{type:'linear',position:'left',ticks:{color:'#8b949e'},grid:{color:'#21262d'},
-            title:{display:true,text:'Loss',color:'#8b949e'}},
-        yA:{type:'linear',position:'right',min:0,max:100,
-            ticks:{color:'#3fb950',callback:v=>v+'%'},grid:{drawOnChartArea:false}},
-      }
-    }
-  };
+  const cfg = _makeLossChartCfg(epochLog, false);
   if (lossChart) { lossChart.data = cfg.data; lossChart.update('none'); }
   else { lossChart = new Chart(document.getElementById('mainChart').getContext('2d'), cfg); }
 }
@@ -1659,7 +1658,7 @@ let s3CatalogTimer = 0;
 
 async function loadS3Catalog(force=false) {
   try {
-    const r = await fetch('/api/s3_catalog');
+    const r = await fetch('/api/s3_catalog' + (force ? '?force=1' : ''));
     const d = await r.json();
     if (d.error) {
       document.getElementById('s3-nodes-wrap').innerHTML =
