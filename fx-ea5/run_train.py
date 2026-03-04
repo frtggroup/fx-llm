@@ -788,7 +788,7 @@ def _apply_one_mutation(p: dict, key: str, rng: random.Random) -> None:
     elif key == 'forward':
         p['forward'] = rng.choice([10, 15, 20, 25, 30, 40])
     elif key == 'threshold':
-        p['threshold'] = round(rng.uniform(0.27, 0.50), 2)
+        p['threshold'] = round(rng.uniform(0.20, 0.40), 2)
     elif key == 'seq_len':
         p['seq_len'] = rng.choice(SEQ_CHOICES)
     elif key == 'scheduler':
@@ -1335,6 +1335,13 @@ def write_progress(running: dict, results: list, best_pf: float, start: float) -
         ns['last_seen']  = ns['_last_ts'].strftime('%m/%d %H:%M') if ns['_last_ts'] else '-'
         del ns['recent_30min'], ns['_first_ts'], ns['_last_ts']
 
+    # 失敗統計
+    _zero_trade  = sum(1 for r in results if r.get('trades', 0) == 0)
+    _few_trade   = sum(1 for r in results if 0 < r.get('trades', 0) < 200 and r.get('pf', 0) == 0)
+    _pf_loss     = sum(1 for r in results if r.get('pf', 0) > 0 and r.get('pf', 0) < 1.0)
+    _pf_win      = sum(1 for r in results if r.get('pf', 0) >= 1.0)
+    _fail_rate   = round((_zero_trade + _few_trade) / max(n_done, 1) * 100, 1)
+
     progress = {
         'phase':           'training' if running else 'waiting',
         'search_phase':    search_phase,
@@ -1346,6 +1353,11 @@ def write_progress(running: dict, results: list, best_pf: float, start: float) -
         'target_pf':       0,
         'epoch_log':       epoch_log,
         'trial_results':   results[-500:],  # 全ノード合算で最新500件
+        'zero_trade_count': _zero_trade,
+        'few_trade_count':  _few_trade,
+        'pf_loss_count':    _pf_loss,
+        'pf_win_count':     _pf_win,
+        'fail_rate':        _fail_rate,
         'start_time':      start,
         'elapsed_sec':     time.time() - start,
         'gpu_pct':         gi['gpu_pct'],

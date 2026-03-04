@@ -1413,6 +1413,13 @@ def backtest_torch(model, X_te, df_te, threshold, tp_mult, sl_mult,
     low      = df_te['low'].values
     open_arr = df_te['open'].values
     dates    = df_te.index
+    # 確率分布のデバッグ情報
+    _mean_probs = probs.mean(axis=0)
+    _buy_above  = (probs[:, 1] > threshold).sum()
+    _sell_above = (probs[:, 2] > threshold).sum()
+    print(f"  [PROB] 平均確率: HOLD={_mean_probs[0]:.3f} BUY={_mean_probs[1]:.3f} SELL={_mean_probs[2]:.3f}"
+          f"  threshold={threshold:.2f}  BUY信号={_buy_above}  SELL信号={_sell_above}")
+
     trades = _simulate_trades(probs, close, high, low, open_arr, atr,
                               n, seq_len, hold_bars, threshold, tp_mult, sl_mult, dates)
     return _backtest_evaluate(trades, dates, report_dir, trial_no)
@@ -1520,7 +1527,7 @@ def _simulate_trades(probs, close, high, low, open_arr, atr,
 
 def _backtest_evaluate(trades, dates, report_dir, trial_no):
 
-    MIN_TRADES = 200
+    MIN_TRADES = 100
 
     if len(trades) < MIN_TRADES:
         print(f"  [SKIP] 取引数 {len(trades)} < {MIN_TRADES} → PF=0 (除外)")

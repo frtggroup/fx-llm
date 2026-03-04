@@ -948,6 +948,17 @@ tr:hover td{background:#1c2128}
     <div class="sub" id="m-elapsed-str">経過: --:--:--</div>
   </div>
 
+  <div class="card" id="fail-card">
+    <h2>取引0 失敗率</h2>
+    <div class="big" id="m-fail-rate" style="color:#f85149">--%</div>
+    <div class="bar-wrap"><div id="bar-fail" class="bar" style="background:#f85149;width:0%"></div></div>
+    <div class="lrow" style="margin-top:4px">
+      <span style="color:#8b949e">取引0: <span id="m-zero-trade" style="color:#f85149">0</span></span>
+      <span style="color:#8b949e">負け: <span id="m-pf-loss" style="color:#ffa657">0</span></span>
+      <span style="color:#8b949e">勝ち: <span id="m-pf-win" style="color:#3fb950">0</span></span>
+    </div>
+  </div>
+
   <div class="card">
     <h2>最良 PF</h2>
     <div class="big" id="m-pf" style="color:#f85149">0.0000</div>
@@ -1433,6 +1444,19 @@ async function poll() {
     document.getElementById('m-done').textContent    = d.completed_count??0;
     document.getElementById('m-running').textContent = d.running_count??0;
     document.getElementById('m-elapsed-str').textContent = '経過: '+fmtSec(d.elapsed_sec);
+
+    // 失敗率カード
+    const failRate = d.fail_rate??null;
+    if (failRate !== null) {
+      const failC = failRate>=70?'#f85149':failRate>=40?'#ffa657':'#3fb950';
+      document.getElementById('m-fail-rate').textContent = failRate.toFixed(1)+'%';
+      document.getElementById('m-fail-rate').style.color = failC;
+      document.getElementById('bar-fail').style.width = Math.min(100,failRate)+'%';
+      document.getElementById('bar-fail').style.background = failC;
+      document.getElementById('m-zero-trade').textContent = d.zero_trade_count??0;
+      document.getElementById('m-pf-loss').textContent    = d.pf_loss_count??0;
+      document.getElementById('m-pf-win').textContent     = d.pf_win_count??0;
+    }
 
     // 最良 PF
     const bpf   = d.best_pf??0;

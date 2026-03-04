@@ -65,10 +65,14 @@ def ssh(cmd: str, timeout: int = 30) -> tuple:
     """vast.ai インスタンスに SSH して cmd を実行。(exit_code, stdout+stderr)"""
     if not (VAST_SSH_HOST and VAST_SSH_PORT):
         return -1, "SSH設定未初期化 (インスタンスが未起動?)"
+    # 最大30秒に制限してハング防止
+    timeout = min(timeout, 30)
     full = [
         "ssh",
         "-o", "StrictHostKeyChecking=no",
         "-o", f"ConnectTimeout={timeout}",
+        "-o", "ServerAliveInterval=10",
+        "-o", "ServerAliveCountMax=2",
         "-o", "BatchMode=yes",
         "-i", VAST_SSH_KEY,
         "-p", str(VAST_SSH_PORT),
@@ -76,7 +80,7 @@ def ssh(cmd: str, timeout: int = 30) -> tuple:
         cmd,
     ]
     try:
-        r = subprocess.run(full, capture_output=True, text=True, timeout=timeout + 5)
+        r = subprocess.run(full, capture_output=True, text=True, timeout=timeout + 10)
         return r.returncode, (r.stdout + r.stderr).strip()
     except subprocess.TimeoutExpired:
         return -1, "SSH timeout"
@@ -86,6 +90,7 @@ def ssh(cmd: str, timeout: int = 30) -> tuple:
 
 def s3_client():
     import boto3, urllib3
+    from botocore.config import Config
     urllib3.disable_warnings()
     return boto3.client(
         "s3",
@@ -93,13 +98,23 @@ def s3_client():
         aws_access_key_id=S3_ACCESS_KEY,
         aws_secret_access_key=S3_SECRET_KEY,
         verify=False,
+        config=Config(connect_timeout=15, read_timeout=20, retries={"max_attempts": 1}),
     )
 
 
 # ── vastai インスタンス管理 ───────────────────────────────────────────────────
+# selfheal が操作対象とするGPU (H100/H200系のみ)
+_TARGET_GPU_KEYWORDS = ("H200", "H100")
+
+def _is_target_gpu(inst: dict) -> bool:
+    """H100/H200系のGPUかどうか判定"""
+    gpu_name = inst.get("gpu_name", "") or ""
+    return any(kw in gpu_name for kw in _TARGET_GPU_KEYWORDS)
+
 def get_current_instance() -> dict | None:
     """vastai show instances --raw から現在のインスタンス情報を取得
-    複数ある場合は一番安いものを残し、他は削除する"""
+    H100/H200系のみ対象。複数ある場合は一番安いものを残し、他は削除する。
+    H100/H200系以外のインスタンスは一切操作しない (ユーザーが別用途で使用中の可能性)"""
     r = subprocess.run(
         "vastai show instances --raw",
         shell=True, capture_output=True, text=True
@@ -112,10 +127,15 @@ def get_current_instance() -> dict | None:
             valid_instances = []
             for inst in instances:
                 to_delete = inst.get("id")
-                # is_bid が True (Interruptible) でない仮想マシンは削除
+                gpu = inst.get("gpu_name", "")
+                # H100/H200系以外は絶対に触らない
+                if not _is_target_gpu(inst):
+                    log(f"[SKIP] 非H100/H200インスタンスは操作しません: ID={to_delete} GPU={gpu}")
+                    continue
+                # H100/H200系かつ非Interruptible は削除対象
                 if not inst.get("is_bid", False):
                     if to_delete:
-                        log(f"[DESTROY] 非InterruptibleなVMを検出。削除します: ID={to_delete}")
+                        log(f"[DESTROY] 非InterruptibleなH100/H200 VMを削除: ID={to_delete}")
                         subprocess.run(f"vastai destroy instance {to_delete}", shell=True)
                 else:
                     valid_instances.append(inst)
@@ -125,23 +145,24 @@ def get_current_instance() -> dict | None:
 
             # dph_total で昇順にソート（一番安いのが先頭）
             valid_instances.sort(key=lambda x: x.get("dph_total", 999))
-            
-            # 2つ目以降のインスタンスがあれば削除
+
+            # 2つ目以降のH100/H200インスタンスがあれば削除
             for inst in valid_instances[1:]:
                 to_delete = inst.get("id")
                 price = inst.get("dph_total", 0)
+                gpu = inst.get("gpu_name", "")
                 if to_delete:
-                    log(f"[DESTROY] 複数インスタンス起動を検出。高い方を削除します: ID={to_delete} (${price:.3f}/hr)")
+                    log(f"[DESTROY] 複数H100/H200インスタンス検出。高い方を削除: ID={to_delete} GPU={gpu} (${price:.3f}/hr)")
                     subprocess.run(f"vastai destroy instance {to_delete}", shell=True)
-            
+
             return valid_instances[0]
     except Exception:
         pass
     return None
 
 def destroy_all_instances():
-    """すべての vastai インスタンスを削除する"""
-    log("[DESTROY] 終了処理: すべての vast.ai インスタンスを削除します")
+    """H100/H200系の vastai インスタンスのみを削除する (他GPUは操作しない)"""
+    log("[DESTROY] 終了処理: H100/H200系インスタンスを削除します (他GPUは保持)")
     r = subprocess.run(
         "vastai show instances --raw",
         shell=True, capture_output=True, text=True
@@ -151,9 +172,12 @@ def destroy_all_instances():
             instances = json.loads(r.stdout)
             for inst in instances:
                 inst_id = inst.get("id")
-                if inst_id:
-                    log(f"[DESTROY] インスタンス {inst_id} を削除中...")
+                gpu = inst.get("gpu_name", "")
+                if inst_id and _is_target_gpu(inst):
+                    log(f"[DESTROY] インスタンス {inst_id} (GPU={gpu}) を削除中...")
                     subprocess.run(f"vastai destroy instance {inst_id}", shell=True)
+                elif inst_id:
+                    log(f"[SKIP] 非H100/H200インスタンスは保持: ID={inst_id} GPU={gpu}")
         except Exception as e:
             log(f"[DESTROY] エラー: {e}")
 
@@ -290,13 +314,14 @@ def create_new_instance(offer_id: int, bid: float) -> int | None:
         f"--image {IMAGE} --disk 50 "
         f"--ssh --direct "
         f"--bid_price {bid:.3f} "
-        f"--env '{env_str}' "
+        f'--env "{env_str}" '
         f"--raw"
     )
     r = subprocess.run(cmd, shell=True, capture_output=True, text=True)
-    log(f"[VAST] create output: {r.stdout.strip()[:200]}")
+    out = r.stdout.strip() or r.stderr.strip()
+    log(f"[VAST] create output (rc={r.returncode}): {out[:200]}")
     try:
-        result = json.loads(r.stdout)
+        result = json.loads(r.stdout.strip() or r.stderr.strip())
         new_id = result.get("new_contract") or result.get("id")
         if new_id:
             return int(new_id)
@@ -352,7 +377,7 @@ def get_log_last_modified_age() -> float:
 
 # ── 学習状態確認 ──────────────────────────────────────────────────────────────
 def is_training_alive() -> tuple:
-    code, out = ssh("pgrep -af '[r]un_train' | head -5", timeout=20)
+    code, out = ssh("pgrep -af run_train | head -5", timeout=15)
     if code == 0 and "run_train" in out:
         return True, out
     return False, out
@@ -385,9 +410,14 @@ def fix_oom() -> bool:
     path = Path("f:/FX/fx-ea5/run_train.py")
     if not path.exists(): return False
     text = path.read_text(encoding="utf-8")
+    # vpt_map = {'xlarge': 3.0, ...} の xlarge vpt を増加させて並列数を削減
+    def _increase_vpt(m: re.Match) -> str:
+        old_val = float(m.group(2))
+        new_val = min(old_val + 2.0, 10.0)  # 最大 10.0 (par≈12)
+        return m.group(1) + f"{new_val:.1f}"
     new_text = re.sub(
-        r"(\"xlarge\":\s*\{[^}]*?\"par\":\s*)(\d+)",
-        lambda m: m.group(1) + str(max(20, int(m.group(2)) - 8)),
+        r"(vpt_map\s*=\s*\{[^}]*?'xlarge':\s*)(\d+\.?\d*)",
+        _increase_vpt,
         text,
         count=1,
     )
@@ -395,7 +425,7 @@ def fix_oom() -> bool:
         log("[WARN] fix_oom: パターン未検出 → スキップ")
         return False
     path.write_text(new_text, encoding="utf-8")
-    log("[FIX] fix_oom: H200 xlarge par を削減")
+    log("[FIX] fix_oom: vpt_map['xlarge'] を増加し並列数削減")
     return True
 
 
