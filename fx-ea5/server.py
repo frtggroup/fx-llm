@@ -1297,20 +1297,16 @@ function _makeLossChartCfg(epochLog, mini=false) {
   const labels = epochLog.map(e => e.epoch);
   const trL    = epochLog.map(e => e.train_loss ?? null);
   const vaL    = epochLog.map(e => e.val_loss   ?? null);
-  const acc    = epochLog.map(e => e.acc != null ? e.acc * 100 : null);
   const sz     = mini ? 8 : 10;
   return {
     type: 'line',
     data: { labels, datasets: [
       {label: mini?'TrL':'Train Loss', data:trL, borderColor:'#f0883e',
-       backgroundColor: mini?'transparent':'transparent',
+       backgroundColor:'transparent',
        borderWidth:mini?1.2:1.5, tension:.3, pointRadius:mini?0:0, yAxisID:'yL', spanGaps:true},
       {label: mini?'VaL':'Val Loss', data:vaL, borderColor:'#79c0ff',
        backgroundColor: mini?'transparent':'#79c0ff18',
        borderWidth:mini?1.5:2, tension:.3, pointRadius:mini?0:2, yAxisID:'yL', spanGaps:true},
-      {label:'Acc%', data:acc, borderColor:'#3fb950',
-       backgroundColor: mini?'transparent':'#3fb95018',
-       borderWidth:mini?1.2:2, tension:.3, pointRadius:mini?0:2, yAxisID:'yA', spanGaps:true},
     ]},
     options:{
       responsive:true, maintainAspectRatio:false, animation:false,
@@ -1325,9 +1321,6 @@ function _makeLossChartCfg(epochLog, mini=false) {
             ticks:{color:'#8b949e',font:{size:mini?8:undefined},maxTicksLimit:mini?4:undefined},
             grid:{color:'#21262d'},
             title: mini?undefined:{display:true,text:'Loss',color:'#8b949e'}},
-        yA:{type:'linear',position:'right',min:0,max:100,
-            ticks:{color:'#3fb950',font:{size:mini?8:undefined},maxTicksLimit:mini?3:undefined,callback:v=>v+'%'},
-            grid:{drawOnChartArea:false}},
       }
     }
   };
