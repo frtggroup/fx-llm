@@ -1748,11 +1748,21 @@ def worker_init(cache_pkl_path: str) -> None:
         print(f"  [WORKER pid={os.getpid()}] feat mmap ロード完了 {mb}MB (共有物理ページ)")
     _WORKER_STATE['df_tr_index']  = df_tr.index  # train_months フィルタ用インデックス
     # CUDA ウォームアップ (以後の試行でCUDA初期化コストが発生しないよう)
+    # 39ワーカーが同時init→ "CUDA busy" 競合を防ぐためPIDベースでずらす
     if torch.cuda.is_available():
-        _dummy = torch.zeros(1, device='cuda')
-        del _dummy
-        torch.cuda.synchronize()
-        torch.cuda.empty_cache()
+        import time as _t_init
+        _stagger = (os.getpid() % 40) * 0.15   # 最大6秒ずらし
+        _t_init.sleep(_stagger)
+        for _attempt in range(5):
+            try:
+                _dummy = torch.zeros(1, device='cuda')
+                del _dummy
+                torch.cuda.synchronize()
+                torch.cuda.empty_cache()
+                break
+            except RuntimeError as _e:
+                print(f"  [WARN] CUDA warmup retry {_attempt+1}/5 (pid={os.getpid()}): {_e}", flush=True)
+                _t_init.sleep(1.0 + _attempt * 0.5)
     print(f"  [WORKER pid={os.getpid()}] 初期化完了 {time.time()-t0:.1f}秒  "
           f"df_tr={len(df_tr):,}  df_te={len(df_te):,}  "
           f"feat_cache={_WORKER_STATE['feat_tr_full'].nbytes//1024//1024}MB", flush=True)
