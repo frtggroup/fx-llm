@@ -1847,6 +1847,26 @@ def run_trial_worker(trial_no: int, params: dict, trial_dir_str: str,
                            seq_len=seq_len, hold_bars=args.forward,
                            report_dir=trial_dir, trial_no=trial_no)
 
+        # ── 自動 threshold 下降: 取引数が MIN_TRADES 未満なら閾値を下げて再試行 ──
+        # モデル確率が低くても有効なシグナルを拾う (取引=0 の大量発生を防ぐ)
+        _used_thr = args.threshold
+        if r.get('trades', 0) < 100:
+            for _thr in [0.25, 0.20, 0.15, 0.10]:
+                if _thr >= args.threshold:
+                    continue
+                _r2 = backtest_torch(wrapped, X_te, df_te, _thr, args.tp, args.sl,
+                                     seq_len=seq_len, hold_bars=args.forward,
+                                     report_dir=None, trial_no=trial_no)
+                print(f"  [AUTO-THR] thr {_used_thr:.2f}→{_thr:.2f}  "
+                      f"取引: {r.get('trades',0)}→{_r2.get('trades',0)}", flush=True)
+                if _r2.get('trades', 0) > r.get('trades', 0):
+                    r = _r2
+                    _used_thr = _thr
+                if r.get('trades', 0) >= 100:
+                    break
+        # 実際に使用した threshold を記録
+        args.threshold = _used_thr
+
         # ── ONNX エクスポート (採用基準 trades >= 200 のモデルのみ) ─────────────
         if r['trades'] >= 200:
             try:

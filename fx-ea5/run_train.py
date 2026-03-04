@@ -1717,9 +1717,11 @@ class WorkerPool:
 
                 if future.done():
                     # future.exception() 自体が BrokenExecutor を raise する場合がある
+                    _has_exc = False
                     try:
                         exc = future.exception(timeout=0)
                         if exc is not None:
+                            _has_exc = True
                             ename = type(exc).__name__
                             if ('BrokenProcessPool' in ename
                                     or 'BrokenExecutor' in ename
@@ -1727,10 +1729,18 @@ class WorkerPool:
                                 broken = True
                             print(f"  [WARN] 試行#{tno} 例外終了: {ename}: {exc}")
                     except _cf.BrokenExecutor as _be:
+                        _has_exc = True
                         broken = True
                         print(f"  [WARN] 試行#{tno} executor破損検出: {_be}")
                     except Exception:
                         pass
+                    # 例外なしの場合は future の直接返り値を meta に保存
+                    # (last_result.json 未書き込みの場合でも best_acc 等が取得可能)
+                    if not _has_exc:
+                        try:
+                            meta['_result'] = future.result(timeout=0)
+                        except Exception:
+                            pass
                     done.append((tno, meta))
                     del self._futures[tno]
                     del self._meta[tno]
@@ -2666,13 +2676,15 @@ def main():
         newly_done = trainer.poll_completed()
         completed_since_ckpt += len(newly_done)
         for tno, info in newly_done:
-            result_path = info['trial_dir'] / 'last_result.json'
-            r = {}
-            if result_path.exists():
-                try:
-                    r = json.loads(result_path.read_text(encoding='utf-8'))
-                except Exception:
-                    pass
+            # WorkerPool: future の直接返り値を優先 (last_result.json 未書き込み対策)
+            r = info.get('_result') or {}
+            if not r:
+                result_path = info['trial_dir'] / 'last_result.json'
+                if result_path.exists():
+                    try:
+                        r = json.loads(result_path.read_text(encoding='utf-8'))
+                    except Exception:
+                        pass
 
             pf     = float(r.get('pf', 0.0))
             trades = int(r.get('trades', 0))
