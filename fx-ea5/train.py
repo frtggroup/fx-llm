@@ -1026,6 +1026,7 @@ def train(args, X_tr, y_tr, X_te, y_te, mean, std, n_feat=None, _spawn_rank=None
                 'ep_sec': round(_ep_sec_now, 2),
                 'tpu_chip': _tpu_chip,
                 'tpu_util_pct': _tpu_util_pct,
+                'epoch_log': _dash.get('epoch_log', []),
             })
             # シングルモード: HTML ダッシュボードも更新
             if not getattr(args, 'out_dir', ''):
