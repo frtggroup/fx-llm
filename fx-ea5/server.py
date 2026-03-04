@@ -463,12 +463,25 @@ def api_status():
                       'best_result.json', 'report.html'):
             if fname in bl:
                 bl[fname] = _rewrite_s3_url_to_proxy(bl[fname])
-    # trial_results を all_results.json から timestamp降順で再構築
-    # (progress.json の trial_results は trial番号順のため自ノード結果が末尾に来ない場合がある)
+    # all_results.json から各種指標を再計算してprogress.jsonの古いカウンターを上書き
+    # (trades=0削除後など、in-memoryカウンターと実データが乖離する場合に対応)
     try:
         if ALL_RESULTS.exists():
             _all = json.loads(ALL_RESULTS.read_text(encoding='utf-8'))
-            st['trial_results'] = sorted(_all, key=lambda x: x.get('timestamp', ''))[-500:]
+            _valid   = [r for r in _all if r.get('trades', 0) > 0]
+            _pf_win  = [r for r in _valid if r.get('pf', 0) >= 1.2]
+            _pf_loss = [r for r in _valid if 0 < r.get('pf', 0) < 1.2]
+            _total   = len(_all)
+            st['completed_count']   = _total
+            st['trial_results']     = sorted(_all, key=lambda x: x.get('timestamp', ''))[-500:]
+            st['zero_trade_count']  = 0  # 削除済みなので0
+            st['few_trade_count']   = len([r for r in _valid if r.get('trades', 0) < 200])
+            st['pf_win_count']      = len(_pf_win)
+            st['pf_loss_count']     = len(_pf_loss)
+            st['fail_rate']         = round((len(_pf_loss) / _total * 100), 1) if _total else 0.0
+            if _valid:
+                best = max(_valid, key=lambda x: x.get('pf', 0))
+                st['best_pf'] = best.get('pf', 0)
     except Exception:
         pass
     return JSONResponse(_sanitize_json(st))
