@@ -1377,6 +1377,7 @@ def write_progress(running: dict, results: list, best_pf: float, start: float) -
             'phase':       tp.get('phase', 'running'),
             'strategy':    info.get('strategy', 'random'),
             'elapsed_sec': round(time.time() - info['start_time'], 0),
+            'epoch_log':   tp.get('epoch_log', []),
         })
 
     # 最近の trial 結果 (epoch_log 用に最新 running trial の log を使う)

@@ -869,10 +869,11 @@ body{background:#0d1117;color:#e6edf3;font-family:'Segoe UI',sans-serif;padding:
 /* 並列試行カード */
 .running-grid{display:flex;gap:8px;flex-wrap:wrap;margin-bottom:12px}
 .trial-card{background:#161b22;border:1px solid #30363d;border-radius:6px;padding:10px 14px;
-  min-width:200px;flex:1}
+  min-width:240px;flex:1}
 .trial-card h3{font-size:.72em;color:#58a6ff;margin-bottom:6px}
 .trial-badge{display:inline-block;background:#1f3a5f;color:#79c0ff;border-radius:4px;
   padding:1px 6px;font-size:.7em;margin-right:4px}
+.trial-mini-chart{position:relative;height:90px;margin-top:6px}
 
 table{width:100%;border-collapse:collapse;font-size:.78em}
 th,td{padding:5px 8px;text-align:right;border-bottom:1px solid #21262d}
@@ -1189,16 +1190,29 @@ function applyPhase(phase) {
   dot.style.background = color;
 }
 
+const _miniCharts = {};   // trial → Chart instance
+
 function updateRunningTrials(runningList) {
   const wrap = document.getElementById('running-trials');
   if (!runningList || !runningList.length) {
     wrap.innerHTML = '<div style="color:#8b949e;font-size:.82em;padding:6px">試行なし</div>';
+    Object.values(_miniCharts).forEach(c => { try{c.destroy()}catch(e){} });
+    for (const k in _miniCharts) delete _miniCharts[k];
     return;
   }
+
+  // 現在表示中の trial セット
+  const newTrials = new Set(runningList.map(r => r.trial));
+  // 消えた試行のチャートを破棄
+  for (const k in _miniCharts) {
+    if (!newTrials.has(+k)) { try{_miniCharts[k].destroy()}catch(e){} delete _miniCharts[k]; }
+  }
+
   wrap.innerHTML = runningList.map(r => {
     const epPct = r.total_epochs > 0 ? Math.round(r.epoch/r.total_epochs*100) : 0;
     const vl    = r.val_loss ?? 0;
     const vlC   = vl<0.9?'#3fb950':vl<1.1?'#79c0ff':vl<1.3?'#ffa657':'#f0883e';
+    const hasLog = r.epoch_log && r.epoch_log.length > 1;
     return `<div class="trial-card">
       <h3>試行 #${r.trial}</h3>
       <span class="trial-badge">${r.arch}</span>
@@ -1212,8 +1226,50 @@ function updateRunningTrials(runningList) {
       </div>
       <div class="bar-wrap" style="margin-top:5px">
         <div class="bar" style="background:#818cf8;width:${epPct}%"></div></div>
+      <div class="trial-mini-chart"${hasLog?'':' style="display:none"'}>
+        <canvas id="mini-chart-${r.trial}"></canvas></div>
     </div>`;
   }).join('');
+
+  // 各カードにミニチャートを描画
+  runningList.forEach(r => {
+    const el = document.getElementById(`mini-chart-${r.trial}`);
+    if (!el || !r.epoch_log || r.epoch_log.length < 2) return;
+    const log    = r.epoch_log;
+    const labels = log.map(e => e.epoch);
+    const trL    = log.map(e => e.train_loss ?? null);
+    const vaL    = log.map(e => e.val_loss   ?? null);
+    const acc    = log.map(e => e.acc != null ? e.acc * 100 : null);
+    const cfg = {
+      type: 'line',
+      data: { labels, datasets: [
+        {label:'TrL', data:trL, borderColor:'#f0883e', borderWidth:1.2, tension:.3,
+         pointRadius:0, yAxisID:'yL', spanGaps:true},
+        {label:'VaL', data:vaL, borderColor:'#79c0ff', borderWidth:1.5, tension:.3,
+         pointRadius:0, yAxisID:'yL', spanGaps:true},
+        {label:'Acc', data:acc, borderColor:'#3fb950', borderWidth:1.2, tension:.3,
+         pointRadius:0, yAxisID:'yA', spanGaps:true},
+      ]},
+      options:{
+        responsive:true, maintainAspectRatio:false, animation:false,
+        plugins:{ legend:{labels:{color:'#8b949e',font:{size:9},usePointStyle:true,boxWidth:6}} },
+        scales:{
+          x:{display:false},
+          yL:{type:'linear',position:'left',ticks:{color:'#8b949e',font:{size:8},maxTicksLimit:4},
+              grid:{color:'#21262d'}},
+          yA:{type:'linear',position:'right',min:0,max:100,
+              ticks:{color:'#3fb950',font:{size:8},maxTicksLimit:3,callback:v=>v+'%'},
+              grid:{drawOnChartArea:false}},
+        }
+      }
+    };
+    if (_miniCharts[r.trial]) {
+      _miniCharts[r.trial].data = cfg.data;
+      _miniCharts[r.trial].update('none');
+    } else {
+      _miniCharts[r.trial] = new Chart(el.getContext('2d'), cfg);
+    }
+  });
 }
 
 function updateLossChart(epochLog) {
