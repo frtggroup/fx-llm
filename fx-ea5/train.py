@@ -801,7 +801,7 @@ def train(args, X_tr, y_tr, X_te, y_te, mean, std, n_feat=None, _spawn_rank=None
     else:
         val_every = max(1, args.epochs // 200)
     # 進捗JSON書き込み頻度 (非同期だが頻度を下げることで辞書更新コストも削減)
-    progress_every = max(5, args.epochs // 100)
+    progress_every = max(20, args.epochs // 50)   # ディスクI/O削減: 800ep→16ep毎 (旧:8ep毎)
     print(f"  early_stop: ep{min_epochs}～, patience={patience}, wd={wd}"
           f"  val_every={val_every}  progress_every={progress_every}")
 
@@ -1022,8 +1022,8 @@ def train(args, X_tr, y_tr, X_te, y_te, mean, std, n_feat=None, _spawn_rank=None
             best_loss    = v_loss
             best_tr_loss = t_loss
             best_ep      = epoch
-            # GPU上に保持 (cpu().clone()はI/Oボトルネック → detach().clone()に変更)
-            best_state = {k: v.detach().clone() for k, v in model.state_dict().items()}
+            # CPUに保持: VRAM上に15ワーカー分のコピーを溜めない (VRAM断片化防止)
+            best_state = {k: v.detach().clone().cpu() for k, v in model.state_dict().items()}
             no_imp     = 0
         else:
             no_imp += 1
@@ -1748,12 +1748,10 @@ def worker_init(cache_pkl_path: str) -> None:
         print(f"  [WORKER pid={os.getpid()}] feat mmap ロード完了 {mb}MB (共有物理ページ)")
     _WORKER_STATE['df_tr_index']  = df_tr.index  # train_months フィルタ用インデックス
     # CUDA ウォームアップ (以後の試行でCUDA初期化コストが発生しないよう)
-    # 39ワーカーが同時init→ "CUDA busy" 競合を防ぐためPIDベースでずらす
+    # pre-sleepなし: 競合時は指数バックオフで最大8回リトライ
     if torch.cuda.is_available():
         import time as _t_init
-        _stagger = (os.getpid() % 40) * 0.15   # 最大6秒ずらし
-        _t_init.sleep(_stagger)
-        for _attempt in range(5):
+        for _attempt in range(8):
             try:
                 _dummy = torch.zeros(1, device='cuda')
                 del _dummy
@@ -1761,8 +1759,9 @@ def worker_init(cache_pkl_path: str) -> None:
                 torch.cuda.empty_cache()
                 break
             except RuntimeError as _e:
-                print(f"  [WARN] CUDA warmup retry {_attempt+1}/5 (pid={os.getpid()}): {_e}", flush=True)
-                _t_init.sleep(1.0 + _attempt * 0.5)
+                _wait = 0.5 + _attempt * 1.0   # 0.5s, 1.5s, 2.5s … 7.5s
+                print(f"  [WARN] CUDA warmup retry {_attempt+1}/8 (pid={os.getpid()}): {_e}", flush=True)
+                _t_init.sleep(_wait)
     print(f"  [WORKER pid={os.getpid()}] 初期化完了 {time.time()-t0:.1f}秒  "
           f"df_tr={len(df_tr):,}  df_te={len(df_te):,}  "
           f"feat_cache={_WORKER_STATE['feat_tr_full'].nbytes//1024//1024}MB", flush=True)

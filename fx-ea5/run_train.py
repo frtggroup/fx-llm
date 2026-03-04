@@ -65,7 +65,7 @@ sys.stdout = _PipeSafeWriter(sys.stdout, _fallback_log)
 sys.stderr = _PipeSafeWriter(sys.stderr, _fallback_log)
 
 # リモートアップロードの同時実行を1に制限 (並列スレッドによるヒープ破壊防止)
-_remote_upload_sem = threading.Semaphore(1)
+_remote_upload_sem = threading.Semaphore(3)  # 同時3アップロードまで許可 (旧:1)
 
 sys.path.insert(0, str(Path(__file__).parent))
 from feature_sets import FEATURE_SETS
@@ -661,7 +661,7 @@ _is_tpu_env = (os.environ.get('DEVICE_TYPE', '').upper() == 'TPU'
 EP_STALL_INIT_SEC  = 2700 if _is_tpu_env else 3600  # TPU:45分 / GPU:60分 (Triton AUTOTUNE が初回ep0に最大30分以上かかるため)
 # TPU: gradient accumulation により ep2以降はキャッシュヒットで瞬時 → 短くして良い
 # GPU: ep間はサブ秒なので 2分で十分
-EP_STALL_TRAIN_SEC = 300 if _is_tpu_env else 300   # TPU:5分 / GPU:5分 (max-autotune compile が ep間に入ると2分超えるため)
+EP_STALL_TRAIN_SEC = 300 if _is_tpu_env else 120   # TPU:5分 / GPU:2分 (compile無効化済み→epochは<1sのためゾンビ早期検出)
 
 
 def _kill_with_group(pid_or_proc):
