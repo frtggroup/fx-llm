@@ -411,23 +411,27 @@ class GPULoader:
 
 
 def make_loaders(X_tr, y_tr, X_te, y_te, args, device, drop_last: bool = False):
-    counts = np.bincount(y_tr, minlength=3).astype(float)
-    counts = np.where(counts == 0, 1.0, counts)
-    n      = len(y_tr)
-    tw     = 1.0 + np.linspace(0, 1, n)          # 新データ重視
-    weights = (1.0 / counts)[y_tr] * tw
+    # ── クラス均等化: HOLD/BUY/SELL を最大クラス数に揃える (オーバーサンプリング) ──
+    # weighted sampling (1/count重み) より確実に1:1:1になる
+    _counts = np.bincount(y_tr, minlength=3)
+    _target = int(_counts.max())
+    _rng_bal = np.random.default_rng()
+    _bal_idx = np.concatenate([
+        _rng_bal.choice(np.where(y_tr == c)[0], _target,
+                        replace=(_counts[c] < _target))
+        for c in range(3)
+    ])
+    _rng_bal.shuffle(_bal_idx)
+    X_bal, y_bal = X_tr[_bal_idx], y_tr[_bal_idx]
+    print(f"  クラス均等化: 元={_counts} → 各{_target}件 (計{len(y_bal):,})")
 
     # ========= TPU再コンパイル対策（バッチ数＝グラフ形状の完全固定化） =========
-    # ラベル(triple_barrier)の条件でNaN落ちする件数が数件ブレるため、
-    # 常に一定件数（バッチ数の整数倍）に切り落としてXLAのグラフサイズが変わらないようにする。
     _is_tpu = (device.type == 'xla')
-    tr_dl = GPULoader(X_tr, y_tr, device, args.batch, weights=weights, drop_last=drop_last)
+    tr_dl = GPULoader(X_bal, y_bal, device, args.batch, shuffle=True, drop_last=drop_last)
     va_dl = GPULoader(X_te, y_te, device, args.batch, shuffle=False, drop_last=drop_last)
-    
+
     if _is_tpu and drop_last:
-        # 例えば理論値最大 13371 なら、安全に 13000 とするなどの固定（ここでは最低限 -100件の切り捨てを想定）
-        # ※ TPU以外ではそのまま
-        safe_tr_batches = (len(X_tr) - 200) // args.batch
+        safe_tr_batches = (len(X_bal) - 200) // args.batch
         safe_te_batches = (len(X_te) - 200) // args.batch
         safe_tr_batches = max(1, safe_tr_batches)
         safe_te_batches = max(1, safe_te_batches)
@@ -436,7 +440,7 @@ def make_loaders(X_tr, y_tr, X_te, y_te, args, device, drop_last: bool = False):
         tr_dl.n = tr_dl.target_n
         va_dl.n = va_dl.target_n
 
-    print(f"  GPU常駐データ: 訓練{len(X_tr):,} テスト{len(X_te):,} "
+    print(f"  GPU常駐データ: 訓練{len(X_bal):,} テスト{len(X_te):,} "
           f"batch={args.batch} batches/ep={len(tr_dl)}"
           + (f" [固定化: {tr_dl.n}]" if _is_tpu else "")
           + (" [drop_last=ON]" if drop_last else ""))
@@ -695,14 +699,7 @@ def train(args, X_tr, y_tr, X_te, y_te, mean, std, n_feat=None, _spawn_rank=None
     ratio    = len(X_tr) / max(n_params, 1)
     print(f"  arch={arch}  パラメータ数: {n_params:,}  サンプル/パラメータ比: {ratio:.1f}")
 
-    # クラス重み: HOLD多数決崩壊対策 (BUY/SELL誤分類を重点ペナルティ)
-    # weighted samplerで頻度は均等化済みだが、lossでも強調することで
-    # 低確信度モデルでもBUY/SELL方向に学習が進みやすくなる
-    _cls_counts = np.bincount(y_tr, minlength=3).astype(float)
-    _cls_counts = np.where(_cls_counts == 0, 1.0, _cls_counts)
-    _cls_w = (_cls_counts.sum() / (3.0 * _cls_counts)).astype(np.float32)
-    _cls_w_t = torch.tensor(_cls_w, device=device)
-    criterion = nn.CrossEntropyLoss(label_smoothing=0.1, weight=_cls_w_t)
+    criterion = nn.CrossEntropyLoss(label_smoothing=0.1)
     wd        = getattr(args, 'wd', 1e-2)
     if is_tpu:
         # TPU: syncfree.AdamW は AMP optimizer_step 内の余分な sync を排除する
