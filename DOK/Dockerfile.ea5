@@ -32,12 +32,9 @@ ENV DEBIAN_FRONTEND=noninteractive \
     DASHBOARD_PORT=8080 \
     GDRIVE_FOLDER_ID=1RhIqnpyzQrSuEgIAD7KroNWfELdElS6L \
     S3_ENDPOINT=https://frorit-2022.softether.net:18004 \
-    S3_REGION=us-east-1 \
-    S3_ACCESS_KEY=mioroot \
-    S3_BUCKET=mix3 \
     S3_PREFIX=
 
-ENV S3_SECRET_KEY="Yakrty1484!#"
+ENV S3_SECRET_KEY='Yakrty1484!\#'
 
 ARG GDRIVE_OAUTH_CLIENT_ID=""
 ARG GDRIVE_OAUTH_CLIENT_SECRET=""
