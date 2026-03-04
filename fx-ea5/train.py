@@ -695,7 +695,14 @@ def train(args, X_tr, y_tr, X_te, y_te, mean, std, n_feat=None, _spawn_rank=None
     ratio    = len(X_tr) / max(n_params, 1)
     print(f"  arch={arch}  パラメータ数: {n_params:,}  サンプル/パラメータ比: {ratio:.1f}")
 
-    criterion = nn.CrossEntropyLoss(label_smoothing=0.1)
+    # クラス重み: HOLD多数決崩壊対策 (BUY/SELL誤分類を重点ペナルティ)
+    # weighted samplerで頻度は均等化済みだが、lossでも強調することで
+    # 低確信度モデルでもBUY/SELL方向に学習が進みやすくなる
+    _cls_counts = np.bincount(y_tr, minlength=3).astype(float)
+    _cls_counts = np.where(_cls_counts == 0, 1.0, _cls_counts)
+    _cls_w = (_cls_counts.sum() / (3.0 * _cls_counts)).astype(np.float32)
+    _cls_w_t = torch.tensor(_cls_w, device=device)
+    criterion = nn.CrossEntropyLoss(label_smoothing=0.1, weight=_cls_w_t)
     wd        = getattr(args, 'wd', 1e-2)
     if is_tpu:
         # TPU: syncfree.AdamW は AMP optimizer_step 内の余分な sync を排除する
@@ -778,6 +785,8 @@ def train(args, X_tr, y_tr, X_te, y_te, mean, std, n_feat=None, _spawn_rank=None
         print(f"  torch.compile を完全無効化しました (eager 強制使用)")
     import math as _math  # ループ内 import を削除してここで一度だけ
     best_loss      = float('inf')
+    best_tr_loss   = float('inf')
+    best_ep        = 0
     best_state     = None
     warmup_end     = max(20, int(args.epochs * 0.05))  # 5% warmup
     patience       = max(30, int(args.epochs * 0.08))  # 8% → 800ep=64 (旧15%=120)
@@ -1013,7 +1022,9 @@ def train(args, X_tr, y_tr, X_te, y_te, mean, std, n_feat=None, _spawn_rank=None
 
         # ── val_loss 改善チェック ──────────────────────────────────────────
         if v_loss < best_loss - 1e-5:
-            best_loss  = v_loss
+            best_loss    = v_loss
+            best_tr_loss = t_loss
+            best_ep      = epoch
             # GPU上に保持 (cpu().clone()はI/Oボトルネック → detach().clone()に変更)
             best_state = {k: v.detach().clone() for k, v in model.state_dict().items()}
             no_imp     = 0
@@ -1090,7 +1101,7 @@ def train(args, X_tr, y_tr, X_te, y_te, mean, std, n_feat=None, _spawn_rank=None
         except Exception as _e:
             print(f"  [WARN] SPMD モデル保存失敗: {_e}", flush=True)
 
-    return model_for_export  # ONNX export には compile前モデルを返す
+    return model_for_export, {'best_val': best_loss, 'best_tr': best_tr_loss, 'best_ep': best_ep}  # ONNX export には compile前モデルを返す
 
 
 def _train_step(model, xb, yb, opt, crit, sched,
@@ -1649,7 +1660,7 @@ def main():
 
     X_tr, y_tr, X_te, y_te, mean, std, df_te, seq_len, feat_indices = prepare(args)
     n_feat = X_tr.shape[2]
-    model = train(args, X_tr, y_tr, X_te, y_te, mean, std, n_feat=n_feat)
+    model, _tr_stats = train(args, X_tr, y_tr, X_te, y_te, mean, std, n_feat=n_feat)
 
     wrapped = FXPredictorWithNorm(model, mean, std)
 
@@ -1798,7 +1809,7 @@ def run_trial_worker(trial_no: int, params: dict, trial_dir_str: str,
         X_tr, y_tr, X_te, y_te, mean, std, df_te, seq_len, feat_indices = prepare(args)
         n_feat = X_tr.shape[2]
 
-        model = train(args, X_tr, y_tr, X_te, y_te, mean, std, n_feat=n_feat)
+        model, _tr_stats = train(args, X_tr, y_tr, X_te, y_te, mean, std, n_feat=n_feat)
 
         wrapped = FXPredictorWithNorm(model, mean, std)
 
@@ -1845,12 +1856,17 @@ def run_trial_worker(trial_no: int, params: dict, trial_dir_str: str,
         _write_trial_progress(trial_dir, {
             'trial': trial_no, 'arch': getattr(args, 'arch', '?'),
             'hidden': getattr(args, 'hidden', 0),
-            'epoch': args.epochs, 'total_epochs': args.epochs,
-            'train_loss': 0.0, 'val_loss': 0.0, 'accuracy': 0.0,
+            'epoch': _tr_stats.get('best_ep', 0), 'total_epochs': args.epochs,
+            'train_loss': round(_tr_stats.get('best_tr', 0.0), 5),
+            'val_loss': round(_tr_stats.get('best_val', 0.0), 5),
+            'accuracy': 0.0,
             'phase': 'done', 'pf': r['pf'], 'sr': r.get('sr', 0),
             'max_dd': r.get('max_dd', 0),
         })
-        print(f"  [WORKER #{trial_no}] PF={r['pf']:.4f}  取引={r['trades']}", flush=True)
+        print(f"  [WORKER #{trial_no}] PF={r['pf']:.4f}  取引={r['trades']}"
+              f"  tr={_tr_stats.get('best_tr', 0):.4f}"
+              f"  val={_tr_stats.get('best_val', 0):.4f}"
+              f"  ep={_tr_stats.get('best_ep', 0)}", flush=True)
         return r
 
     except Exception as e:

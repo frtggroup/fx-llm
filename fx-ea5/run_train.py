@@ -786,7 +786,7 @@ def _apply_one_mutation(p: dict, key: str, rng: random.Random) -> None:
     elif key == 'forward':
         p['forward'] = rng.choice([10, 15, 20, 25, 30, 40])
     elif key == 'threshold':
-        p['threshold'] = round(rng.uniform(0.33, 0.55), 2)
+        p['threshold'] = round(rng.uniform(0.27, 0.50), 2)
     elif key == 'seq_len':
         p['seq_len'] = rng.choice(SEQ_CHOICES)
     elif key == 'scheduler':
