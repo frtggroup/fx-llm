@@ -1417,9 +1417,20 @@ def _simulate_trades(probs, close, high, low, open_arr, atr,
     """NumPy最適化版トレードシミュレーション。
     推論結果(probs)をもとにTP/SL/hold決済を処理し取引リストを返す。"""
     # シグナル検出をNumPyで一括計算
-    cls_arr   = np.argmax(probs, axis=1).astype(np.int8)       # (n,)
-    conf_arr  = probs[np.arange(n), cls_arr]                   # (n,)
-    signal    = (conf_arr > threshold) & (cls_arr != 0)        # (n,) bool
+    # np.argmaxではHOLD(0)の確率が高い場合に閾値を超えていてもトレードが発生しないため、
+    # クラス1(BUY)と2(SELL)の確率を直接閾値と比較して判定する
+    buy_sig   = probs[:, 1] > threshold
+    sell_sig  = probs[:, 2] > threshold
+    cls_arr   = np.zeros(n, dtype=np.int8)
+    cls_arr[buy_sig]  = 1
+    cls_arr[sell_sig] = 2
+    
+    # 両方が閾値を超えた場合は確率の高い方を採用
+    overlap = buy_sig & sell_sig
+    if np.any(overlap):
+        cls_arr[overlap] = np.where(probs[overlap, 1] > probs[overlap, 2], 1, 2)
+        
+    signal    = (cls_arr != 0)     # (n,) bool
 
     trades    = []
     in_pos    = False
