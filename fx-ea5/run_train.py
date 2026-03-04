@@ -488,7 +488,7 @@ GA_PARENT_POOL     = 20     # 親候補を上位何件から選ぶか
 # ── 20分交互モード ─────────────────────────────────────────────────────────
 # ランダムサーチ 20分 → GA 20分 → ランダム 20分 → ... を繰り返す
 # 20並列 × 5分/試行 × 20分 ≈ 100試行/フェーズ → GA が十分収束できる量
-MODE_SWITCH_SEC    = 1200   # 20分 = 1200秒
+MODE_SWITCH_SEC    = 3600   # 1時間 = 3600秒
 _mode_start_time   = 0.0    # main() で time.time() を設定
 
 # 重要特徴量 GA フェーチャ: 上位モデルから重視特徴量を収集して GA に使用
@@ -1389,6 +1389,7 @@ def write_progress(running: dict, results: list, best_pf: float, start: float) -
         'pf_loss_count':    _pf_loss,
         'pf_win_count':     _pf_win,
         'fail_rate':        _fail_rate,
+        'stall_count':      _stall_count,
         'start_time':      start,
         'elapsed_sec':     time.time() - start,
         'gpu_pct':         gi['gpu_pct'],
@@ -1523,17 +1524,10 @@ class ParallelTrainer:
                     else:
                         stall_limit = EP_STALL_TRAIN_SEC
 
-                    _kill_proc = None
+                    # epoch が進んでいる限り続行。STALL のみで強制終了
                     if elapsed > 30 and stall > stall_limit:
-                        _kill_proc = ('STALL',
-                                      f"試行#{tno} ep={cur_ep} phase={cur_phase} {stall/60:.1f}分進捗なし")
-                    elif elapsed > TRIAL_TIMEOUT:
-                        _kill_proc = ('TIMEOUT',
-                                      f"試行#{tno} ({elapsed/60:.0f}分超)")
-
-                    if _kill_proc:
-                        tag, msg = _kill_proc
-                        print(f"  [{tag}] {msg} → 強制終了 (プロセスグループ)")
+                        print(f"  [STALL] 試行#{tno} ep={cur_ep} phase={cur_phase} {stall/60:.1f}分進捗なし → 強制終了")
+                        info['_stalled'] = True
                         _kill_with_group(proc)
 
                 if proc.poll() is not None:
@@ -1797,17 +1791,11 @@ class WorkerPool:
                         stall_limit = EP_STALL_TRAIN_SEC
 
                     if elapsed > 30 and stall > stall_limit:
-                        # STALL: この試行だけスキップ (executor全体再起動はしない)
-                        # executor再起動はCPU爆発→次STALL→無限ループの原因になるため
+                        # STALL: epoch が進んでいない → この試行のみスキップ
                         print(f"  [STALL] 試行#{tno} ep={cur_ep} phase={cur_phase} {stall/60:.1f}分進捗なし"
                               f" → この試行のみスキップ (executor継続)")
+                        meta['_stalled'] = True
                         future.cancel()
-                        done.append((tno, meta))
-                        del self._futures[tno]
-                        del self._meta[tno]
-                    elif elapsed > TRIAL_TIMEOUT:
-                        future.cancel()
-                        print(f"  [TIMEOUT] 試行#{tno} ({elapsed/60:.0f}分超) → スキップ")
                         done.append((tno, meta))
                         del self._futures[tno]
                         del self._meta[tno]
@@ -2262,7 +2250,7 @@ def main():
     print(f'  GPU     : {GPU_NAME}  ({_GPU_VRAM_GB:.0f} GB)  tier={_GPU_TIER}  {dev_str}')
     print(f'  並列数  : {MAX_PARALLEL}  VRAM/試行={VRAM_PER_TRIAL} GB  H100_MODE={H100_MODE}')
     print(f'  モデル  : hidden={[v for v in HIDDEN_MAP.get("mlp",[])]}  batch={BATCH_CHOICES}')
-    print(f'  TOP {TOP_N} 保存  タイムアウト {TRIAL_TIMEOUT//60}分  stop.flag: {STOP_FLAG}')
+    print(f'  TOP {TOP_N} 保存  STALL検知のみ(タイムアウト廃止)  stop.flag: {STOP_FLAG}')
     print('=' * 60)
 
     # ── ストレージ接続確認 ─────────────────────────────────────────────────────
@@ -2702,6 +2690,7 @@ def main():
 
     last_checkpoint        = time.time()
     completed_since_ckpt   = 0   # チェックポイント後の完了件数カウンタ
+    _stall_count           = 0   # STALL 強制終了カウンタ
 
     write_progress(trainer.running, results, best_pf, start)
 
@@ -2719,6 +2708,8 @@ def main():
         newly_done = trainer.poll_completed()
         completed_since_ckpt += len(newly_done)
         for tno, info in newly_done:
+            if info.get('_stalled'):
+                _stall_count += 1
             # WorkerPool: future の直接返り値を優先 (last_result.json 未書き込み対策)
             r = info.get('_result') or {}
             if not r:

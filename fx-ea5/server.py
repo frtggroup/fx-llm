@@ -978,6 +978,7 @@ tr:hover td{background:#1c2128}
       <span style="color:#8b949e">取引0: <span id="m-zero-trade" style="color:#f85149">0</span></span>
       <span style="color:#8b949e">負け: <span id="m-pf-loss" style="color:#ffa657">0</span></span>
       <span style="color:#8b949e">勝ち: <span id="m-pf-win" style="color:#3fb950">0</span></span>
+      <span style="color:#8b949e">STALL: <span id="m-stall-count" style="color:#f85149">0</span></span>
     </div>
   </div>
 
@@ -1485,6 +1486,7 @@ async function poll() {
       document.getElementById('m-zero-trade').textContent = d.zero_trade_count??0;
       document.getElementById('m-pf-loss').textContent    = d.pf_loss_count??0;
       document.getElementById('m-pf-win').textContent     = d.pf_win_count??0;
+      document.getElementById('m-stall-count').textContent = d.stall_count??0;
     }
 
     // 最良 PF
