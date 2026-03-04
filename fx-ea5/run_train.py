@@ -1383,7 +1383,7 @@ def write_progress(running: dict, results: list, best_pf: float, start: float) -
         'best_pf':         best_pf,
         'target_pf':       0,
         'epoch_log':       epoch_log,
-        'trial_results':   results[-500:],  # 全ノード合算で最新500件
+        'trial_results':   sorted(results, key=lambda x: x.get('timestamp', ''))[-500:],  # timestamp降順で最新500件
         'zero_trade_count': _zero_trade,
         'few_trade_count':  _few_trade,
         'pf_loss_count':    _pf_loss,

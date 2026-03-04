@@ -463,6 +463,14 @@ def api_status():
                       'best_result.json', 'report.html'):
             if fname in bl:
                 bl[fname] = _rewrite_s3_url_to_proxy(bl[fname])
+    # trial_results を all_results.json から timestamp降順で再構築
+    # (progress.json の trial_results は trial番号順のため自ノード結果が末尾に来ない場合がある)
+    try:
+        if ALL_RESULTS.exists():
+            _all = json.loads(ALL_RESULTS.read_text(encoding='utf-8'))
+            st['trial_results'] = sorted(_all, key=lambda x: x.get('timestamp', ''))[-500:]
+    except Exception:
+        pass
     return JSONResponse(_sanitize_json(st))
 
 
