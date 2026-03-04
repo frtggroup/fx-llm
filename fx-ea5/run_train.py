@@ -2113,9 +2113,15 @@ def _precache_data() -> bool:
     import pickle
     DATA_PATH = Path(os.environ.get('DATA_PATH', '/workspace/data/USDJPY_M1.csv'))
     cache_path = TRIALS_DIR.parent / 'df_cache_H1.pkl'
-    if cache_path.exists():
-        print(f"  [PRE-CACHE] キャッシュ既存: {cache_path}")
+    feat_npy_tr = TRIALS_DIR.parent / 'feat_tr_mmap.npy'
+    feat_npy_te = TRIALS_DIR.parent / 'feat_te_mmap.npy'
+    pkl_exists = cache_path.exists()
+    feat_exists = feat_npy_tr.exists() and feat_npy_te.exists()
+
+    if pkl_exists and feat_exists:
+        print(f"  [PRE-CACHE] キャッシュ既存: pkl + feat npy")
         return True
+
     if not DATA_PATH.exists():
         print(f"  [PRE-CACHE] データファイルなし: {DATA_PATH}")
         return False
@@ -2123,23 +2129,40 @@ def _precache_data() -> bool:
     try:
         import sys as _sys
         _sys.path.insert(0, str(TRAIN_PY.parent))
-        from features import load_data, add_indicators
+        from features import load_data, add_indicators, FEATURE_COLS as _FC
         import numpy as np
-        from datetime import timedelta
+        import pandas as pd
         t0 = time.time()
         df = load_data(str(DATA_PATH), timeframe='H1')
         df = add_indicators(df)
         df.replace([np.inf, -np.inf], np.nan, inplace=True)
         df.dropna(inplace=True)
-        test_start = df.index[-1] - timedelta(days=365)
-        df_tr = df[df.index < test_start].copy()
-        df_te = df[df.index >= test_start].copy()
-        tmp = cache_path.with_suffix('.tmp')
-        with open(tmp, 'wb') as f:
-            pickle.dump((df_tr, df_te), f)
-        tmp.replace(cache_path)
-        print(f"  [PRE-CACHE] 完了 {time.time()-t0:.1f}秒  "
-              f"訓練:{len(df_tr):,}行  テスト:{len(df_te):,}行  → {cache_path}")
+        # テスト期間を 2025-01-01 以降に固定 (train.py と同じ)
+        _TEST_SPLIT = pd.Timestamp('2025-01-01', tz=df.index.tz)
+        df_tr = df[df.index < _TEST_SPLIT].copy()
+        df_te = df[df.index >= _TEST_SPLIT].copy()
+        if not pkl_exists:
+            tmp = cache_path.with_suffix('.tmp')
+            with open(tmp, 'wb') as f:
+                pickle.dump((df_tr, df_te), f)
+            tmp.replace(cache_path)
+            print(f"  [PRE-CACHE] pkl完了 {time.time()-t0:.1f}秒  "
+                  f"訓練:{len(df_tr):,}行  テスト:{len(df_te):,}行")
+        if not feat_exists:
+            # 特徴量行列をnpyとして保存 (ワーカーがmmap_mode='r'で共有読み込みする)
+            t1 = time.time()
+            feat_tr = df_tr[_FC].values.astype(np.float32)
+            feat_te = df_te[_FC].values.astype(np.float32)
+            tmp_tr = feat_npy_tr.with_suffix('.tmp.npy')
+            np.save(str(tmp_tr), feat_tr)
+            tmp_tr.replace(feat_npy_tr)
+            tmp_te = feat_npy_te.with_suffix('.tmp.npy')
+            np.save(str(tmp_te), feat_te)
+            tmp_te.replace(feat_npy_te)
+            mb_tr = feat_tr.nbytes // 1024 // 1024
+            mb_te = feat_te.nbytes // 1024 // 1024
+            print(f"  [FEAT-CACHE] npy保存完了 {time.time()-t1:.1f}秒  "
+                  f"feat_tr={feat_tr.shape}({mb_tr}MB)  feat_te={feat_te.shape}({mb_te}MB)")
         return True
     except Exception as e:
         print(f"  [PRE-CACHE] 失敗 (訓練は続行): {e}")

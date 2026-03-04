@@ -1729,10 +1729,15 @@ def worker_init(cache_pkl_path: str) -> None:
         df_tr, df_te = pickle.load(f)
     _WORKER_STATE['df_tr'] = df_tr
     _WORKER_STATE['df_te'] = df_te
-    # 特徴量行列をfloat32 numpy配列として事前計算（毎試行の~910MB再確保を回避）
-    from features import FEATURE_COLS as _FC
-    _WORKER_STATE['feat_tr_full'] = df_tr[_FC].values.astype(np.float32)
-    _WORKER_STATE['feat_te_full'] = df_te[_FC].values.astype(np.float32)
+    # 特徴量行列をmmap_mode='r'で共有ロード（全ワーカーで物理ページ共有 → 40×910MB→1×910MB）
+    # _precache_data() がメインプロセスで事前に npy を作成済みであること
+    feat_npy_tr = Path(cache_pkl_path).parent / 'feat_tr_mmap.npy'
+    feat_npy_te = Path(cache_pkl_path).parent / 'feat_te_mmap.npy'
+    if feat_npy_tr.exists() and feat_npy_te.exists():
+        _WORKER_STATE['feat_tr_full'] = np.load(str(feat_npy_tr), mmap_mode='r')
+        _WORKER_STATE['feat_te_full'] = np.load(str(feat_npy_te), mmap_mode='r')
+        mb = _WORKER_STATE['feat_tr_full'].nbytes // 1024 // 1024
+        print(f"  [WORKER pid={os.getpid()}] feat mmap ロード完了 {mb}MB (共有物理ページ)")
     _WORKER_STATE['df_tr_index']  = df_tr.index  # train_months フィルタ用インデックス
     # CUDA ウォームアップ (以後の試行でCUDA初期化コストが発生しないよう)
     if torch.cuda.is_available():
