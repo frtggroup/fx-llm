@@ -1176,11 +1176,30 @@ def get_gpu_compute_pids() -> set:
         return set()
 
 
-def get_max_parallel(n_running: int) -> int:
-    """VRAM/GPU 使用率から動的に最大並列数を返す (全 GPU ティア対応)"""
+def get_max_parallel(n_running: int, trainer=None) -> int:
+    """VRAM/GPU 使用率から動的に最大並列数を返す (全 GPU ティア対応)
+
+    backtestフェーズのワーカーはGPU/VRAMをほぼ使わない (~0.5GB)。
+    そのアイドルスロット分だけ追加学習を投入して GPU を遊ばせない。
+    """
     if TPU_MODE:
         # TPU: HBM は CUDA VRAM と独立 → MAX_PARALLEL を直接返す
         return MAX_PARALLEL
+
+    # backtest/done フェーズのワーカー数を検出 (GPU 遊び中スロット)
+    n_backtest = 0
+    if trainer is not None and isinstance(trainer, WorkerPool):
+        try:
+            for _tno, _meta in list(trainer._meta.items()):
+                _ph = _read_trial_phase(_meta['trial_dir'])
+                if _ph in ('backtest', 'done'):
+                    n_backtest += 1
+        except Exception:
+            pass
+
+    # backtest中スロット1つにつき追加1学習を許可 (VRAM安全: backtest≈0.5GB < training 3.5GB)
+    opportunistic_cap = _MAX_PAR_CAP + n_backtest
+
     gi = _gpu_info()
     total_gb = max(gi['total_gb'], 1)
     used_gb  = gi['used_gb']
@@ -1196,14 +1215,14 @@ def get_max_parallel(n_running: int) -> int:
         return n_running  # 現状維持、追加起動しない
     # VRAM使用率が85%超なら保守的に並列数制限
     if mem_pct > 85:
-        return max(1, min(n_running + 1, _MAX_PAR_CAP))
-    # VRAM 空きから枠を計算 (適応的VPTを使用、_MAX_PAR_CAP で上限)
+        return max(1, min(n_running + 1, opportunistic_cap))
+    # VRAM 空きから枠を計算 (適応的VPTを使用、opportunistic_cap で上限)
     vram_slots = max(1, int(gi['free_gb'] / eff_vpt))
     # GPU が高負荷なら維持
     if gi['gpu_pct'] > 92 and n_running > 0:
         return n_running
     # VRAM不足でも最低1並列は保証 (フリーズ防止)
-    return max(1, min(_MAX_PAR_CAP, vram_slots))
+    return max(1, min(opportunistic_cap, vram_slots))
 
 
 # ── TOP_N 管理 ────────────────────────────────────────────────────────────────
@@ -2856,7 +2875,7 @@ def main():
 
         # ── 新規試行を投入 ──────────────────────────────────────────────────
         n_active = trainer.n_active_workers if isinstance(trainer, WorkerPool) else len(trainer)
-        max_par = get_max_parallel(n_active)
+        max_par = get_max_parallel(n_active, trainer)
         # WorkerPool: アイドル時にワーカー数を動的調整 (VRAM余裕があれば増加)
         if isinstance(trainer, WorkerPool) and len(trainer) == 0 and max_par != trainer._max_workers:
             trainer.resize(max_par)
