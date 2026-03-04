@@ -1085,10 +1085,10 @@ tr:hover td{background:#1c2128}
     <table>
       <thead>
         <tr><th>#</th><th>PF</th><th>SR</th><th>MaxDD</th><th>純利益</th>
-            <th>取引</th><th>勝率</th><th>Arch</th><th>ノード</th><th>時刻</th></tr>
+            <th>取引</th><th>勝率</th><th>Arch</th><th>Thr</th><th>Acc</th><th>ノード</th><th>時刻</th></tr>
       </thead>
       <tbody id="recent-tbody">
-        <tr><td colspan="10" style="text-align:center;color:#8b949e">待機中</td></tr>
+        <tr><td colspan="12" style="text-align:center;color:#8b949e">待機中</td></tr>
       </tbody>
     </table>
   </div>
@@ -1271,15 +1271,24 @@ function updateRecentTable(trialResults) {
     const dd  = r.max_dd??0;
     const nid = (r.node_id||'').toUpperCase();
     const nidC = nid ? '#79c0ff' : '#8b949e';
-    return `<tr>
-      <td style="color:#8b949e">#${r.trial}</td>
+    const isFail = (r.trades??0) === 0;
+    const rowBg  = isFail ? 'background:rgba(248,81,73,0.07);' : '';
+    const thr    = r.threshold??r.thr??null;
+    const acc    = r.best_acc??r.accuracy??null;
+    const thrTxt = thr!==null ? thr.toFixed(2) : '-';
+    const accC   = acc===null?'#8b949e':acc>=0.5?'#3fb950':acc>=0.35?'#ffa657':'#f85149';
+    const accTxt = acc!==null ? acc.toFixed(3) : '-';
+    return `<tr style="${rowBg}">
+      <td style="color:${isFail?'#f85149':'#8b949e'}">#${r.trial}</td>
       <td style="color:${pfC};font-weight:${pf>=1.2?'700':'400'}">${pf.toFixed(4)}</td>
       <td style="color:${srC}">${(sr).toFixed(3)}</td>
       <td style="color:#f85149">${(dd).toFixed(4)}</td>
       <td style="color:${(r.net_pnl??0)>=0?'#3fb950':'#f85149'}">${fmtN(r.net_pnl,3)}</td>
-      <td>${r.trades??'-'}</td>
+      <td style="color:${isFail?'#f85149':'inherit'}">${r.trades??'-'}</td>
       <td style="color:#3fb950">${((r.win_rate??0)*100).toFixed(1)}%</td>
       <td style="color:#79c0ff">${r.arch??'-'}</td>
+      <td style="color:#8b949e;font-size:.85em">${thrTxt}</td>
+      <td style="color:${accC};font-size:.85em">${accTxt}</td>
       <td style="color:${nidC};font-size:.75em">${nid||'-'}</td>
       <td style="color:#8b949e;font-size:.7em">${(r.timestamp??'').slice(5,16)}</td>
     </tr>`;

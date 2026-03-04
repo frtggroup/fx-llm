@@ -2700,6 +2700,10 @@ def main():
                 'sr':        sr,
                 'max_dd':    max_dd,
                 'elapsed_sec': elapsed,
+                'best_acc':  float(r.get('best_acc', 0.0)),
+                'best_val':  float(r.get('best_val', 0.0)),
+                'best_tr':   float(r.get('best_tr',  0.0)),
+                'best_ep':   int(r.get('best_ep',    0)),
                 'feature_importance': r.get('feature_importance', []),
             }
             # 重複防止: 同じ (node_id, trial) がすでにあれば上書き、なければ追加

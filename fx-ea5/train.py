@@ -784,6 +784,7 @@ def train(args, X_tr, y_tr, X_te, y_te, mean, std, n_feat=None, _spawn_rank=None
     best_loss      = float('inf')
     best_tr_loss   = float('inf')
     best_ep        = 0
+    best_acc       = 0.0
     best_state     = None
     warmup_end     = max(20, int(args.epochs * 0.05))  # 5% warmup
     patience       = max(30, int(args.epochs * 0.08))  # 8% → 800ep=64 (旧15%=120)
@@ -1022,6 +1023,7 @@ def train(args, X_tr, y_tr, X_te, y_te, mean, std, n_feat=None, _spawn_rank=None
             best_loss    = v_loss
             best_tr_loss = t_loss
             best_ep      = epoch
+            best_acc     = acc
             # CPUに保持: VRAM上に15ワーカー分のコピーを溜めない (VRAM断片化防止)
             best_state = {k: v.detach().clone().cpu() for k, v in model.state_dict().items()}
             no_imp     = 0
@@ -1098,7 +1100,7 @@ def train(args, X_tr, y_tr, X_te, y_te, mean, std, n_feat=None, _spawn_rank=None
         except Exception as _e:
             print(f"  [WARN] SPMD モデル保存失敗: {_e}", flush=True)
 
-    return model_for_export, {'best_val': best_loss, 'best_tr': best_tr_loss, 'best_ep': best_ep}  # ONNX export には compile前モデルを返す
+    return model_for_export, {'best_val': best_loss, 'best_tr': best_tr_loss, 'best_ep': best_ep, 'best_acc': best_acc}  # ONNX export には compile前モデルを返す
 
 
 def _train_step(model, xb, yb, opt, crit, sched,
@@ -1860,25 +1862,34 @@ def run_trial_worker(trial_no: int, params: dict, trial_dir_str: str,
             pass
 
         # last_result.json 保存 (メインプロセスが読み取る)
+        _best_acc = _tr_stats.get('best_acc', 0.0)
+        r['best_acc']  = round(_best_acc, 4)
+        r['best_val']  = round(_tr_stats.get('best_val', 0.0), 5)
+        r['best_tr']   = round(_tr_stats.get('best_tr', 0.0), 5)
+        r['best_ep']   = _tr_stats.get('best_ep', 0)
         full = {**{k: v for k, v in vars(args).items()
                    if k not in ('out_dir', 'total_trials', 'best_pf', 'start_time')}, **r}
         full['feature_importance'] = feat_imp
         (trial_dir / 'last_result.json').write_text(
             json.dumps(full, indent=2, ensure_ascii=False), encoding='utf-8')
-
         _write_trial_progress(trial_dir, {
             'trial': trial_no, 'arch': getattr(args, 'arch', '?'),
             'hidden': getattr(args, 'hidden', 0),
             'epoch': _tr_stats.get('best_ep', 0), 'total_epochs': args.epochs,
             'train_loss': round(_tr_stats.get('best_tr', 0.0), 5),
             'val_loss': round(_tr_stats.get('best_val', 0.0), 5),
-            'accuracy': 0.0,
+            'accuracy': round(_best_acc, 4),
+            'threshold': getattr(args, 'threshold', 0),
             'phase': 'done', 'pf': r['pf'], 'sr': r.get('sr', 0),
             'max_dd': r.get('max_dd', 0),
         })
+        _arch = getattr(args, 'arch', '?')
+        _thr  = getattr(args, 'threshold', 0)
         print(f"  [WORKER #{trial_no}] PF={r['pf']:.4f}  取引={r['trades']}"
+              f"  arch={_arch}  thr={_thr:.2f}"
               f"  tr={_tr_stats.get('best_tr', 0):.4f}"
               f"  val={_tr_stats.get('best_val', 0):.4f}"
+              f"  acc={_best_acc:.3f}"
               f"  ep={_tr_stats.get('best_ep', 0)}", flush=True)
         return r
 
