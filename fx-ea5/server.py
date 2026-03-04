@@ -1205,49 +1205,70 @@ function applyPhase(phase) {
 
 const _miniCharts = {};   // trial → Chart instance
 
+function _trialCardHtml(r) {
+  const epPct = r.total_epochs > 0 ? Math.round(r.epoch/r.total_epochs*100) : 0;
+  return `<div class="trial-card" data-trial="${r.trial}">
+    <h3>試行 #${r.trial}</h3>
+    <span class="trial-badge">${r.arch}</span>
+    <span class="trial-badge">h=${r.hidden}</span>
+    <div style="font-size:.72em;margin-top:6px">
+      <span class="tc-ep">Ep: ${r.epoch}/${r.total_epochs} (${epPct}%)</span><br>
+      TrL: <span class="tc-trl" style="color:#f0883e">${fmtN(r.train_loss)}</span> &nbsp;
+      VaL: <span class="tc-val">${fmtN(r.val_loss)}</span><br>
+      Acc: <span class="tc-acc" style="color:#3fb950">${((r.accuracy??0)*100).toFixed(1)}%</span>
+      &nbsp; <span class="tc-el">${fmtSec(r.elapsed_sec)}</span> 経過
+    </div>
+    <div class="bar-wrap" style="margin-top:5px">
+      <div class="tc-bar bar" style="background:#818cf8;width:${epPct}%"></div></div>
+    <div class="trial-mini-chart" style="display:none">
+      <canvas id="mini-chart-${r.trial}"></canvas></div>
+  </div>`;
+}
+
 function updateRunningTrials(runningList) {
   const wrap = document.getElementById('running-trials');
-  if (!runningList || !runningList.length) {
-    wrap.innerHTML = '<div style="color:#8b949e;font-size:.82em;padding:6px">試行なし</div>';
-    Object.values(_miniCharts).forEach(c => { try{c.destroy()}catch(e){} });
-    for (const k in _miniCharts) delete _miniCharts[k];
-    return;
-  }
+  const newTrials = new Set((runningList||[]).map(r => r.trial));
 
-  // 現在表示中の trial セット
-  const newTrials = new Set(runningList.map(r => r.trial));
   // 消えた試行のチャートを破棄
   for (const k in _miniCharts) {
     if (!newTrials.has(+k)) { try{_miniCharts[k].destroy()}catch(e){} delete _miniCharts[k]; }
   }
 
-  wrap.innerHTML = runningList.map(r => {
-    const epPct = r.total_epochs > 0 ? Math.round(r.epoch/r.total_epochs*100) : 0;
-    const vl    = r.val_loss ?? 0;
-    const vlC   = vl<0.9?'#3fb950':vl<1.1?'#79c0ff':vl<1.3?'#ffa657':'#f0883e';
-    const hasLog = r.epoch_log && r.epoch_log.length > 1;
-    return `<div class="trial-card">
-      <h3>試行 #${r.trial}</h3>
-      <span class="trial-badge">${r.arch}</span>
-      <span class="trial-badge">h=${r.hidden}</span>
-      <div style="font-size:.72em;margin-top:6px">
-        Ep: ${r.epoch}/${r.total_epochs} (${epPct}%)<br>
-        TrL: <span style="color:#f0883e">${fmtN(r.train_loss)}</span> &nbsp;
-        VaL: <span style="color:${vlC}">${fmtN(r.val_loss)}</span><br>
-        Acc: <span style="color:#3fb950">${((r.accuracy??0)*100).toFixed(1)}%</span>
-        &nbsp; ${fmtSec(r.elapsed_sec)} 経過
-      </div>
-      <div class="bar-wrap" style="margin-top:5px">
-        <div class="bar" style="background:#818cf8;width:${epPct}%"></div></div>
-      <div class="trial-mini-chart"${hasLog?'':' style="display:none"'}>
-        <canvas id="mini-chart-${r.trial}"></canvas></div>
-    </div>`;
-  }).join('');
+  if (!runningList || !runningList.length) {
+    wrap.innerHTML = '<div style="color:#8b949e;font-size:.82em;padding:6px">試行なし</div>';
+    return;
+  }
 
-  // 各カードにミニチャートを描画
+  // 現在DOMにあるカードのtrial番号
+  const existingTrials = new Set([...wrap.querySelectorAll('[data-trial]')]
+                                  .map(el => +el.dataset.trial));
+  // 構成変化（追加/削除）があるときだけDOMを再構築
+  const changed = runningList.some(r => !existingTrials.has(r.trial))
+               || [...existingTrials].some(t => !newTrials.has(t));
+  if (changed) {
+    wrap.innerHTML = runningList.map(_trialCardHtml).join('');
+  } else {
+    // テキスト・プログレスバーのみ差分更新（canvasは触らない）
+    runningList.forEach(r => {
+      const card = wrap.querySelector(`[data-trial="${r.trial}"]`);
+      if (!card) return;
+      const epPct = r.total_epochs > 0 ? Math.round(r.epoch/r.total_epochs*100) : 0;
+      const vl = r.val_loss ?? 0;
+      const vlC = vl<0.9?'#3fb950':vl<1.1?'#79c0ff':vl<1.3?'#ffa657':'#f0883e';
+      card.querySelector('.tc-ep').textContent  = `Ep: ${r.epoch}/${r.total_epochs} (${epPct}%)`;
+      const trlEl = card.querySelector('.tc-trl'); trlEl.textContent = fmtN(r.train_loss);
+      const valEl = card.querySelector('.tc-val'); valEl.textContent = fmtN(r.val_loss); valEl.style.color = vlC;
+      card.querySelector('.tc-acc').textContent = ((r.accuracy??0)*100).toFixed(1)+'%';
+      card.querySelector('.tc-el').textContent  = fmtSec(r.elapsed_sec);
+      card.querySelector('.tc-bar').style.width = epPct+'%';
+    });
+  }
+
+  // チャートを更新（canvas要素はDOMに残っているので再利用）
   runningList.forEach(r => {
     const el = document.getElementById(`mini-chart-${r.trial}`);
     if (!el || !r.epoch_log || r.epoch_log.length < 2) return;
+    el.closest('.trial-mini-chart').style.display = '';
     const cfg = _makeLossChartCfg(r.epoch_log, true);
     if (_miniCharts[r.trial]) {
       _miniCharts[r.trial].data = cfg.data;
