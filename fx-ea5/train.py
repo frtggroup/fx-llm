@@ -1857,8 +1857,12 @@ def run_trial_worker(trial_no: int, params: dict, trial_dir_str: str,
 
         # ── 自動 threshold 下降: 取引数が MIN_TRADES 未満なら閾値を下げて再試行 ──
         # モデル確率が低くても有効なシグナルを拾う (取引=0 の大量発生を防ぐ)
+        # ただし accuracy < 0.35 (3クラスランダム=0.33) はモデルが機能していないのでスキップ
         _used_thr = args.threshold
-        if r.get('trades', 0) < 100:
+        _skip_auto_thr = _tr_stats.get('best_acc', 0.0) < 0.35
+        if _skip_auto_thr and r.get('trades', 0) < 100:
+            print(f"  [AUTO-THR] スキップ: acc={_tr_stats.get('best_acc',0):.3f} < 0.35 (ランダム予測)", flush=True)
+        if r.get('trades', 0) < 100 and not _skip_auto_thr:
             for _thr in [0.25, 0.20, 0.15, 0.10]:
                 if _thr >= args.threshold:
                     continue
