@@ -481,6 +481,80 @@ def s3_list_node_keys(glob_prefix: str) -> list[str]:
     strip_len   = len(S3_PREFIX) + 1 if S3_PREFIX else 0
     return [k[strip_len:] for k in all_keys if k.startswith(prefix_full)]
 
+def _upload_stall_log(tno: int, info: dict, stall_secs: float) -> None:
+    """STALL した試行のエラーログを S3 に非同期アップロードする。
+    内容: パラメータ、特徴量情報、生ログ。
+    S3 キー: stall_logs/{NODE_ID}/trial_{tno:06d}_{timestamp}.txt
+    """
+    if not S3_ENABLED:
+        return
+
+    def _do_upload():
+        try:
+            params   = info.get('params', {})
+            arch     = params.get('arch', '?')
+            hidden   = params.get('hidden', '?')
+            layers   = params.get('layers', '?')
+            feat_set = params.get('feat_set', -1)
+            n_feat   = params.get('n_features', '?')
+
+            # 特徴量名を取得 (feat_set >= 0 かつ FEATURE_SETS に存在する場合)
+            feat_names: list = []
+            if isinstance(feat_set, int) and 0 <= feat_set < len(FEATURE_SETS):
+                try:
+                    indices = FEATURE_SETS[feat_set]
+                    from features import BASE_FEATURE_COLS
+                    feat_names = [BASE_FEATURE_COLS[i] for i in indices
+                                  if i < len(BASE_FEATURE_COLS)]
+                except Exception:
+                    pass
+
+            # train.log の生ログ (末尾 200 行まで)
+            log_path = info.get('trial_dir', Path('/tmp')) / 'train.log'
+            raw_log  = ''
+            if isinstance(log_path, Path) and log_path.exists():
+                try:
+                    lines = log_path.read_text(encoding='utf-8', errors='replace').splitlines()
+                    raw_log = '\n'.join(lines[-200:])
+                except Exception as e:
+                    raw_log = f'(ログ読み取り失敗: {e})'
+
+            ts  = time.strftime('%Y%m%d_%H%M%S')
+            cur_ep    = info.get('_last_ep', '?')
+            cur_phase = _read_trial_phase(info['trial_dir']) if 'trial_dir' in info else '?'
+
+            report = (
+                f"=== STALL LOG  trial#{tno}  {time.strftime('%Y-%m-%d %H:%M:%S')} ===\n"
+                f"node_id   : {NODE_ID}\n"
+                f"arch      : {arch}\n"
+                f"hidden    : {hidden}\n"
+                f"layers    : {layers}\n"
+                f"feat_set  : {feat_set}\n"
+                f"n_features: {n_feat}\n"
+                f"stall_sec : {stall_secs:.1f}\n"
+                f"last_epoch: {cur_ep}\n"
+                f"last_phase: {cur_phase}\n"
+                f"params    : {json.dumps(params, ensure_ascii=False)}\n"
+                f"\n--- 使用特徴量 ({len(feat_names)}個) ---\n"
+                + (', '.join(feat_names) if feat_names else '(カスタム/不明)') + '\n'
+                f"\n--- 生ログ (末尾200行) ---\n"
+                f"{raw_log}\n"
+            )
+
+            s3_key = _s3_key(f'stall_logs/{NODE_ID}/trial_{tno:06d}_{ts}.txt')
+            _s3_client().put_object(
+                Bucket=S3_BUCKET,
+                Key=s3_key,
+                Body=report.encode('utf-8'),
+                ContentType='text/plain; charset=utf-8',
+            )
+            print(f'  [STALL] S3ログ保存: {s3_key}')
+        except Exception as e:
+            print(f'  [STALL] S3ログ保存失敗: {e}')
+
+    threading.Thread(target=_do_upload, daemon=True).start()
+
+
 TOP_N              = 100
 RANDOM_PHASE_LIMIT = 30     # この件数までは純ランダム、以降は 10分交互モード
 GA_PARENT_POOL     = 20     # 親候補を上位何件から選ぶか
@@ -535,7 +609,7 @@ _vpt_ema: float = VRAM_PER_TRIAL
 _vpt_ema_lock = threading.Lock()
 
 def _update_vpt_ema(used_gb: float, n_running: int) -> None:
-    """実測 VRAM使用量/試行 を EMA で更新 (1.5倍バッファを保持)"""
+    """実測 VRAM使用量/試行 を EMA で更新"""
     global _vpt_ema
     if n_running <= 0:
         return
@@ -1208,19 +1282,26 @@ def get_max_parallel(n_running: int, trainer=None) -> int:
     # 適応的VPT更新 (実測値でEMAを補正)
     _update_vpt_ema(used_gb, n_running)
     with _vpt_ema_lock:
-        eff_vpt = max(0.5, _vpt_ema * 1.5)  # 1.5倍バッファで保守的に
+        # large/xlarge (H100等) は安全係数を小さく → VRAM を積極活用
+        buf = 1.1 if _GPU_TIER in ('large', 'xlarge') else 1.5
+        eff_vpt = max(0.5, _vpt_ema * buf)
 
-    # VRAM使用率が90%超なら新規起動を抑制 (OOM防止)
-    if mem_pct > 90 and n_running > 0:
-        return n_running  # 現状維持、追加起動しない
-    # VRAM使用率が85%超なら保守的に並列数制限
-    if mem_pct > 85:
+    gpu_pct = gi['gpu_pct']
+
+    # VRAM使用率が92%超なら新規起動を抑制 (OOM防止)
+    if mem_pct > 92 and n_running > 0:
+        return n_running  # 現状維持
+    # VRAM使用率が88%超なら保守的
+    if mem_pct > 88:
         return max(1, min(n_running + 1, opportunistic_cap))
-    # VRAM 空きから枠を計算 (適応的VPTを使用、opportunistic_cap で上限)
+    # VRAM 空きから枠を計算
     vram_slots = max(1, int(gi['free_gb'] / eff_vpt))
     # GPU が高負荷なら維持
-    if gi['gpu_pct'] > 92 and n_running > 0:
+    if gpu_pct > 92 and n_running > 0:
         return n_running
+    # H100/large: GPU使用率が低い(< 65%)かつVRAM余裕あり → 積極的に追加
+    if _GPU_TIER in ('large', 'xlarge') and gpu_pct < 65 and mem_pct < 75:
+        vram_slots = max(vram_slots, n_running + 1)
     # VRAM不足でも最低1並列は保証 (フリーズ防止)
     return max(1, min(opportunistic_cap, vram_slots))
 
@@ -1528,6 +1609,7 @@ class ParallelTrainer:
                     if elapsed > 30 and stall > stall_limit:
                         print(f"  [STALL] 試行#{tno} ep={cur_ep} phase={cur_phase} {stall/60:.1f}分進捗なし → 強制終了")
                         info['_stalled'] = True
+                        _upload_stall_log(tno, info, stall)
                         _kill_with_group(proc)
 
                 if proc.poll() is not None:
@@ -1795,6 +1877,7 @@ class WorkerPool:
                         print(f"  [STALL] 試行#{tno} ep={cur_ep} phase={cur_phase} {stall/60:.1f}分進捗なし"
                               f" → この試行のみスキップ (executor継続)")
                         meta['_stalled'] = True
+                        _upload_stall_log(tno, meta, stall)
                         future.cancel()
                         done.append((tno, meta))
                         del self._futures[tno]
