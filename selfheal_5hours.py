@@ -36,7 +36,7 @@ IMAGE        = "frtgroup/fx-ea5:latest"
 POLL_INTERVAL   = 60   # 秒
 STALL_THRESHOLD = 180  # 秒 — この間ログ更新なし → 停止とみなす
 MAX_BID_PER_HOUR = 0.50  # $/hr — これを超える bid では新インスタンスを作成しない
-DURATION_SECONDS = 5 * 3600 # 5 hours
+DURATION_SECONDS = 3 * 3600 # 3 hours
 
 VAST_SSH_KEY = str(Path.home() / ".ssh/google_compute_engine")
 
@@ -159,18 +159,24 @@ def destroy_all_instances():
 
 def update_ssh_from_instance(inst: dict) -> bool:
     """インスタンス情報からグローバルSSH設定を更新
-    ssh_host が null の場合は public_ipaddr + ports["22/tcp"] を使う"""
+    ssh_host が null の場合は vastai ssh-url コマンドで取得する"""
     global VAST_INSTANCE_ID, VAST_SSH_HOST, VAST_SSH_PORT
     try:
         VAST_INSTANCE_ID = inst["id"]
         ssh_host = inst.get("ssh_host") or ""
         ssh_port = inst.get("ssh_port") or 0
-        if not ssh_host:
-            ssh_host = inst.get("public_ipaddr", "")
-            ports = inst.get("ports", {})
-            tcp22 = ports.get("22/tcp", [])
-            if tcp22:
-                ssh_port = int(tcp22[0].get("HostPort", 0))
+        # ssh_host が null の場合は vastai ssh-url で取得
+        if not ssh_host or not ssh_port:
+            r = subprocess.run(
+                f"vastai ssh-url {VAST_INSTANCE_ID}",
+                shell=True, capture_output=True, text=True, timeout=15
+            )
+            url = (r.stdout + r.stderr).strip()
+            # 例: ssh://root@93.91.156.87:58238
+            m = re.match(r"ssh://[^@]+@([^:]+):(\d+)", url)
+            if m:
+                ssh_host = m.group(1)
+                ssh_port = int(m.group(2))
         VAST_SSH_HOST = ssh_host
         VAST_SSH_PORT = ssh_port
         return bool(VAST_SSH_HOST and VAST_SSH_PORT)
@@ -190,13 +196,16 @@ def wait_for_instance_ssh(max_tries: int = 40) -> bool:
             log(f"  SSHポート待機中 [{i}/{max_tries}] (インスタンス未検出) streak={loading_streak}")
         else:
             status    = inst.get("actual_status", "loading")
-            ssh_host  = inst.get("ssh_host", "")
-            ssh_port  = inst.get("ssh_port", 0)
+            ssh_host  = inst.get("ssh_host", "") or ""
+            ssh_port  = inst.get("ssh_port", 0) or 0
             log(f"  SSHポート待機中 [{i}/{max_tries}] status={status} {ssh_host}:{ssh_port}")
-            if ssh_host and ssh_port and status == "running":
-                update_ssh_from_instance(inst)
-                log(f"[VAST] SSH接続可能: {VAST_SSH_HOST}:{VAST_SSH_PORT}")
-                return True
+            if status == "running":
+                # ssh_host/port が null でも vastai ssh-url で取得できる
+                ok = update_ssh_from_instance(inst)
+                if ok:
+                    log(f"[VAST] SSH接続可能: {VAST_SSH_HOST}:{VAST_SSH_PORT}")
+                    return True
+                log(f"[WAIT] running だが SSH URL 未取得 → 継続待機")
             if status == "loading":
                 loading_streak += 1
             else:
@@ -268,10 +277,21 @@ def find_cheapest_h200_offer() -> tuple:
 
 
 def create_new_instance(offer_id: int, bid: float) -> int | None:
+    env_str = (
+        "-e S3_BUCKET=mix3 "
+        "-e S3_PREFIX= "
+        f"-e S3_ENDPOINT={S3_ENDPOINT} "
+        f"-e S3_ACCESS_KEY={S3_ACCESS_KEY} "
+        f"-e S3_SECRET_KEY={S3_SECRET_KEY} "
+        "-e DEVICE_TYPE=GPU"
+    )
     cmd = (
         f"vastai create instance {offer_id} "
         f"--image {IMAGE} --disk 50 "
-        f"--bid_price {bid:.3f} --raw"
+        f"--ssh --direct "
+        f"--bid_price {bid:.3f} "
+        f"--env '{env_str}' "
+        f"--raw"
     )
     r = subprocess.run(cmd, shell=True, capture_output=True, text=True)
     log(f"[VAST] create output: {r.stdout.strip()[:200]}")
@@ -424,7 +444,7 @@ FIXERS = {
 # ── GitHub Actions ────────────────────────────────────────────────────────────
 def git_push_and_build(message: str) -> bool:
     cmds = [
-        "git -C f:/FX add fx-ea5/run_train.py DOK/entrypoint_ea5.sh selfheal_monitor.py",
+        "git -C f:/FX add fx-ea5/run_train.py fx-ea5/train.py DOK/entrypoint_ea5.sh DOK/Dockerfile.ea5",
         f'git -C f:/FX commit -m "{message}" --allow-empty',
         "git -C f:/FX push origin master",
     ]
@@ -442,11 +462,14 @@ def wait_for_build(timeout_min: int = 30) -> bool:
     log(f"[BUILD] GitHub Actions ビルド完了待機 (最大 {timeout_min}分)...")
     deadline = time.time() + timeout_min * 60
     time.sleep(30)
+    GH_TOKEN = os.environ.get("GH_TOKEN", "")
     url = f"https://api.github.com/repos/{GH_REPO}/actions/runs?per_page=3"
     while time.time() < deadline:
         try:
             req = urllib.request.Request(url)
             req.add_header("Accept", "application/vnd.github.v3+json")
+            if GH_TOKEN:
+                req.add_header("Authorization", f"token {GH_TOKEN}")
             with urllib.request.urlopen(req, timeout=15) as resp:
                 data = json.loads(resp.read())
             runs = data.get("workflow_runs", [])
