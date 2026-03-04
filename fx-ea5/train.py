@@ -431,9 +431,16 @@ def make_loaders(X_tr, y_tr, X_te, y_te, args, device, drop_last: bool = False):
 
     # ========= TPU再コンパイル対策（バッチ数＝グラフ形状の完全固定化） =========
     _is_tpu = (device.type == 'xla')
-    tr_dl = GPULoader(X_bal, y_bal, device, args.batch, shuffle=True, drop_last=drop_last)
-    # 検証データは CPU 保持 → VRAM 節約 (val_every=4でバッチ毎GPU転送, OOM防止)
     _is_gpu = (device.type == 'cuda')
+    # GPU VRAM 保護: 訓練データが 8GB を超える場合は CPU 保持 (バッチ毎 HtoD 転送)
+    # 例: 28371 × 30seq × 5750feat × float32 = 19.6GB → OOM防止
+    _tr_vram_gb = X_bal.nbytes / 1024**3
+    _tr_cpu = _is_gpu and (_tr_vram_gb > 8.0)
+    if _tr_cpu:
+        print(f"  [DATA] 訓練データ {_tr_vram_gb:.1f}GB → CPU保持 (VRAM節約, バッチ毎HtoD転送)")
+    tr_dl = GPULoader(X_bal, y_bal, device, args.batch, shuffle=True, drop_last=drop_last,
+                      cpu_storage=_tr_cpu)
+    # 検証データは常に CPU 保持 → VRAM 節約 (val_every=4でバッチ毎GPU転送)
     va_dl = GPULoader(X_te, y_te, device, args.batch, shuffle=False, drop_last=drop_last,
                       cpu_storage=_is_gpu)
 
