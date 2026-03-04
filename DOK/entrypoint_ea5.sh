@@ -283,25 +283,30 @@ from pathlib import Path
 
 dst = Path(os.environ.get('DATA_PATH', '/workspace/data/USDJPY_H1.csv'))
 
-# 方法1: S3 直接URL (最優先・高速)
+# 方法1: S3 (boto3使用)
 S3_ENDPOINT = os.environ.get('S3_ENDPOINT', 'https://frorit-2022.softether.net:18004')
 S3_BUCKET   = os.environ.get('S3_BUCKET',   'mix3')
 S3_PREFIX   = os.environ.get('S3_PREFIX',   '').rstrip('/')
+S3_ACCESS_KEY = os.environ.get('S3_ACCESS_KEY', 'mioroot')
+S3_SECRET_KEY = 'Yakrty1484!#'
+
 prefix_sep  = S3_PREFIX + '/' if S3_PREFIX else ''
-s3_url = f'{S3_ENDPOINT}/{S3_BUCKET}/{prefix_sep}data/USDJPY_H1.csv'
-print(f'[*] S3 から CSV 取得中: {s3_url}')
+s3_key = f'{prefix_sep}data/USDJPY_H1.csv'
+print(f'[*] S3 から CSV 取得中: {S3_BUCKET}/{s3_key}')
+
 try:
-    ctx = ssl.create_default_context()
-    ctx.check_hostname = False
-    ctx.verify_mode = ssl.CERT_NONE
-    with urllib.request.urlopen(s3_url, context=ctx, timeout=30) as resp:
-        data = resp.read()
-    if len(data) > 100000:
-        dst.parent.mkdir(parents=True, exist_ok=True)
-        dst.write_bytes(data)
-        print(f'[OK] S3 CSV 取得完了 ({len(data)/1e6:.1f} MB)')
-        sys.exit(0)
-    print(f'[WARN] S3 レスポンスが小さすぎる ({len(data)} bytes)')
+    import boto3, urllib3
+    from botocore.config import Config
+    urllib3.disable_warnings()
+    cfg = Config(signature_version='s3v4', s3={'addressing_style': 'path'})
+    c = boto3.client('s3', endpoint_url=S3_ENDPOINT,
+                     aws_access_key_id=S3_ACCESS_KEY, aws_secret_access_key=S3_SECRET_KEY,
+                     config=cfg, verify=False)
+    
+    dst.parent.mkdir(parents=True, exist_ok=True)
+    c.download_file(S3_BUCKET, s3_key, str(dst))
+    print(f'[OK] S3 CSV 取得完了 ({dst.stat().st_size/1e6:.1f} MB)')
+    sys.exit(0)
 except Exception as e:
     print(f'[WARN] S3 取得失敗: {e}')
 
