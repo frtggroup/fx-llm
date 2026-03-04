@@ -757,8 +757,9 @@ if [ -n "$S3_ENDPOINT" ]; then
     (while true; do
         sleep 60
         if [ -f /workspace/train_run.log ]; then
-            python3 - <<'PYEOF' 2>/dev/null || true
+            python3 - <<'PYEOF' >> /var/log/s3_upload.log 2>&1
 import os, boto3, urllib3
+from botocore.config import Config
 urllib3.disable_warnings()
 ep  = os.environ.get('S3_ENDPOINT','')
 bkt = os.environ.get('S3_BUCKET','mix3')
@@ -767,10 +768,14 @@ sk  = os.environ.get('S3_SECRET_KEY','')
 nid = os.environ.get('_LOG_NODE_ID','node')
 key = f"log/train_run_{nid}.log"
 if ep and ak and sk:
+    cfg = Config(signature_version='s3v4', s3={'addressing_style': 'path'})
     c = boto3.client('s3', endpoint_url=ep,
         aws_access_key_id=ak, aws_secret_access_key=sk,
-        verify=False)
+        config=cfg, verify=False)
     c.upload_file('/workspace/train_run.log', bkt, key)
+    print(f"[OK] Uploaded to {key}")
+else:
+    print("[WARN] S3 credentials missing")
 PYEOF
         fi
     done) &
