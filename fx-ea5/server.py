@@ -480,7 +480,7 @@ def _sanitize_json(obj):
 
 @app.get('/api/top100')
 def api_top100():
-    return _get_top_n(100)
+    return JSONResponse(_sanitize_json(_get_top_n(100)))
 
 
 @app.post('/api/backfill')
@@ -788,6 +788,7 @@ def api_s3_catalog():
             'nodes':      nodes,
             'top_global': top_global,
         }
+        result = _sanitize_json(result)
         with _catalog_lock:
             _catalog_cache = result
         return JSONResponse(result)
