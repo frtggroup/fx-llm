@@ -273,7 +273,7 @@ def _auto_gpu_config(node_id: str) -> tuple[str, float, float, int]:
     elif total_gb >=  14: tier = 'small'
     else:                 tier = 'micro'
 
-    vpt_map = {'xlarge': 8.0, 'large': 4.0, 'medium': 4.0, 'small': 4.0, 'micro': 3.5}
+    vpt_map = {'xlarge': 10.0, 'large': 4.0, 'medium': 4.0, 'small': 4.0, 'micro': 3.5}
     # xlarge(H200 140GB): 3.0→8.0 → 39ワーカー→15ワーカーへ削減
     # 同時CUDA context初期化"busy"エラーと GPU競合を解消
     vpt = vpt_map[tier]
