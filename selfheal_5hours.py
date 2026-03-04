@@ -618,8 +618,11 @@ def main():
             if alive and log_age > STALL_THRESHOLD and log_age != float("inf"):
                 log(f"[WARN] プロセス稼働中だがS3ログ遅延 ({log_age:.0f}s) → ローカルログ確認")
                 code_stat, out_stat = ssh("stat -c %Y /workspace/train_run.log 2>/dev/null")
-                if code_stat == 0 and out_stat.strip().isdigit():
-                    local_age = time.time() - int(out_stat.strip())
+                
+                # SSHのWelcomeメッセージ等が含まれる場合があるため、最後の行から数字を探すか、正規表現で数字だけ抜く
+                stat_match = re.search(r'^(\d+)$', out_stat.strip(), re.MULTILINE)
+                if code_stat == 0 and stat_match:
+                    local_age = time.time() - int(stat_match.group(1))
                     if local_age > STALL_THRESHOLD:
                         log(f"[ERROR] ローカルログも更新停止 ({local_age:.0f}s) → ハングと判定")
                         alive = False
