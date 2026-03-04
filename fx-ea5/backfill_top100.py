@@ -153,6 +153,8 @@ def calc_importance_onnx(onnx_path: Path, norm_path: Path,
     inp_shape = sess.get_inputs()[0].shape   # e.g. [batch, seq_len, n_feat]
 
     # ONNX モデルが期待する seq_len / n_feat で X_s を再構築
+    onnx_seq = seq_len
+    n_feat   = X_s.shape[2]
     if len(inp_shape) == 3:
         onnx_seq   = inp_shape[1] if isinstance(inp_shape[1], int) and inp_shape[1] > 0 else seq_len
         onnx_nfeat = inp_shape[2] if isinstance(inp_shape[2], int) and inp_shape[2] > 0 else X_s.shape[2]
@@ -192,9 +194,24 @@ def calc_importance_onnx(onnx_path: Path, norm_path: Path,
         print(f'  [BF] 次元ミスマッチ解消できず skipping (got {X_s.shape}, expected (N,{onnx_seq},{n_feat}))')
         return []
 
+    # 静的バッチサイズ (=1) 対応: バッチ推論できない場合はサンプル数を減らして1件ずつ実行
+    static_batch = isinstance(inp_shape[0], int) and inp_shape[0] == 1
+
+    def _infer(X):
+        if static_batch:
+            outs = np.array([sess.run(None, {inp_name: X[i:i+1]})[0][0] for i in range(len(X))])
+        else:
+            outs = sess.run(None, {inp_name: X})[0]
+        return outs
+
+    # 静的バッチモデルはサンプル数を減らして高速化
+    if static_batch and n > 30:
+        n = 30
+        X_s = X_s[:n]
+
     # ベースライン
     try:
-        base_out = sess.run(None, {inp_name: X_s})[0]   # (n, 3)
+        base_out = _infer(X_s)   # (n, 3)
     except Exception as e:
         print(f'  [BF] ONNX 推論エラー (skipping): {e}')
         return []
@@ -202,11 +219,11 @@ def calc_importance_onnx(onnx_path: Path, norm_path: Path,
 
     rng = np.random.default_rng(42)
     importances = []
-    n_feat = X_s.shape[2]  # noqa: F811 (possibly overwritten above)
+    n_feat = X_s.shape[2]
     for i in range(n_feat):
         X_p = X_s.copy()
         X_p[:, :, i] = X_p[rng.permutation(n), :, i]
-        perm_out = sess.run(None, {inp_name: X_p})[0]
+        perm_out = _infer(X_p)
         perm_ent = float(-np.mean(perm_out * np.log(perm_out + 1e-9)))
         score = abs(perm_ent - base_ent)
         gidx  = feat_indices[i] if feat_indices else i

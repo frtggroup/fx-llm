@@ -1317,7 +1317,7 @@ function _makeLossChartCfg(epochLog, mini=false) {
       },
       scales:{
         x: mini?{display:false}:{ticks:{color:'#8b949e',maxTicksLimit:8},grid:{color:'#21262d'}},
-        yL:{type:'linear',position:'left',
+        yL:{type:'linear',position:'left',beginAtZero:false,
             ticks:{color:'#8b949e',font:{size:mini?8:undefined},maxTicksLimit:mini?4:undefined},
             grid:{color:'#21262d'},
             title: mini?undefined:{display:true,text:'Loss',color:'#8b949e'}},
