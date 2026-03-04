@@ -357,7 +357,7 @@ try:
         return boto3.client('s3',
             endpoint_url=os.environ.get('S3_ENDPOINT', ''),
             aws_access_key_id=os.environ.get('S3_ACCESS_KEY', ''),
-            aws_secret_access_key=os.environ.get('S3_SECRET_KEY', ''),
+            aws_secret_access_key='Yakrty1484!#',
             verify=False)
 
     def upload(f):
@@ -415,7 +415,7 @@ try:
         return boto3.client('s3',
             endpoint_url=os.environ.get('S3_ENDPOINT', ''),
             aws_access_key_id=os.environ.get('S3_ACCESS_KEY', ''),
-            aws_secret_access_key=os.environ.get('S3_SECRET_KEY', ''),
+            aws_secret_access_key='Yakrty1484!#',
             verify=False)
 
     # ファイル一覧を取得 (.zip / 非zip 両対応)
@@ -504,7 +504,7 @@ try:
         return boto3.client('s3',
             endpoint_url=os.environ.get('S3_ENDPOINT', ''),
             aws_access_key_id=os.environ.get('S3_ACCESS_KEY', ''),
-            aws_secret_access_key=os.environ.get('S3_SECRET_KEY', ''),
+            aws_secret_access_key='Yakrty1484!#',
             verify=False)
 
     def upload(f):
@@ -562,7 +562,7 @@ try:
         return boto3.client('s3',
             endpoint_url=os.environ.get('S3_ENDPOINT', ''),
             aws_access_key_id=os.environ.get('S3_ACCESS_KEY', ''),
-            aws_secret_access_key=os.environ.get('S3_SECRET_KEY', ''),
+            aws_secret_access_key='Yakrty1484!#',
             verify=False)
 
     s3 = make_client()
@@ -764,7 +764,7 @@ urllib3.disable_warnings()
 ep  = os.environ.get('S3_ENDPOINT','')
 bkt = os.environ.get('S3_BUCKET','mix3')
 ak  = os.environ.get('S3_ACCESS_KEY','')
-sk  = os.environ.get('S3_SECRET_KEY','')
+sk  = 'Yakrty1484!#'
 nid = os.environ.get('_LOG_NODE_ID','node')
 key = f"log/train_run_{nid}.log"
 if ep and ak and sk:
