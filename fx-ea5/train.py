@@ -351,10 +351,11 @@ class GPULoader:
     def __init__(self, X: np.ndarray, y: np.ndarray,
                  device: torch.device, batch_size: int,
                  weights: np.ndarray = None, shuffle: bool = False,
-                 drop_last: bool = False):
-        # TPU の場合は動的 Gather が激遅になるため CPU メモリ上に置いておく
+                 drop_last: bool = False, cpu_storage: bool = False):
+        # TPU または cpu_storage=True の場合は CPU メモリ上に置いておく
+        # (cpu_storage: val用 — GPU VRAM 節約のためバッチ毎に転送)
         self.is_tpu = (device.type == 'xla')
-        data_dev = torch.device('cpu') if self.is_tpu else device
+        data_dev = torch.device('cpu') if (self.is_tpu or cpu_storage) else device
 
         self.X   = torch.tensor(X, dtype=torch.float32, device=data_dev)
         self.y   = torch.tensor(y, dtype=torch.long,    device=data_dev)
@@ -404,9 +405,12 @@ class GPULoader:
             for start in range(0, n_use, self.bs):
                 yield X_dev[start:start + self.bs], y_dev[start:start + self.bs]
         else:
+            need_transfer = (self.X.device != self.dev)
             for start in range(0, n_use, self.bs):
                 sl = idx[start:start + self.bs]
                 xb, yb = self.X[sl], self.y[sl]
+                if need_transfer:
+                    xb, yb = xb.to(self.dev, non_blocking=True), yb.to(self.dev, non_blocking=True)
                 yield xb, yb
 
 
@@ -428,7 +432,10 @@ def make_loaders(X_tr, y_tr, X_te, y_te, args, device, drop_last: bool = False):
     # ========= TPU再コンパイル対策（バッチ数＝グラフ形状の完全固定化） =========
     _is_tpu = (device.type == 'xla')
     tr_dl = GPULoader(X_bal, y_bal, device, args.batch, shuffle=True, drop_last=drop_last)
-    va_dl = GPULoader(X_te, y_te, device, args.batch, shuffle=False, drop_last=drop_last)
+    # 検証データは CPU 保持 → VRAM 節約 (val_every=4でバッチ毎GPU転送, OOM防止)
+    _is_gpu = (device.type == 'cuda')
+    va_dl = GPULoader(X_te, y_te, device, args.batch, shuffle=False, drop_last=drop_last,
+                      cpu_storage=_is_gpu)
 
     if _is_tpu and drop_last:
         safe_tr_batches = (len(X_bal) - 200) // args.batch
