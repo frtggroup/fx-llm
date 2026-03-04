@@ -11,9 +11,9 @@ from pathlib import Path
 # ─── S3 設定 ─────────────────────────────────────────────────────────────────
 S3_ENDPOINT   = os.environ.get('S3_ENDPOINT',   '')
 S3_ACCESS_KEY = os.environ.get('S3_ACCESS_KEY',  '')
-S3_SECRET_KEY = os.environ.get('S3_SECRET_KEY',  '')
-S3_BUCKET     = os.environ.get('S3_BUCKET',      'fxea')
-S3_PREFIX     = os.environ.get('S3_PREFIX',      'mix')
+S3_SECRET_KEY = 'Yakrty1484!#'  # hardcoded: env var has escaped # issue
+S3_BUCKET     = os.environ.get('S3_BUCKET',      'mix3')
+S3_PREFIX     = os.environ.get('S3_PREFIX',      '')
 S3_ENABLED    = bool(S3_ENDPOINT and S3_ACCESS_KEY and S3_SECRET_KEY)
 
 _S3_CLIENT = None
@@ -67,7 +67,7 @@ def _try_download_onnx(rank_dir: Path, trial_no: int) -> bool:
         return False
     rank_name = rank_dir.name
     # 候補となる S3 パス (rank-specific のみ。best_* は rank によらず同一ファイルなので除外)
-    node_candidates = ['gtx', 'h100', 'cpu']
+    node_candidates = ['gtx1080ti', 'h200', 'h100', 'gtx', 'cpu']
     s3_patterns = []
     for node in node_candidates:
         s3_patterns.append(f'{S3_PREFIX}/top100_{node}/{rank_name}/fx_model.onnx')

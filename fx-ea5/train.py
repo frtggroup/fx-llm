@@ -1916,6 +1916,7 @@ def run_trial_worker(trial_no: int, params: dict, trial_dir_str: str,
         full = {**{k: v for k, v in vars(args).items()
                    if k not in ('out_dir', 'total_trials', 'best_pf', 'start_time')}, **r}
         full['feature_importance'] = feat_imp
+        r['feature_importance'] = feat_imp   # run_train.py の _result 経由でも取得できるよう
         (trial_dir / 'last_result.json').write_text(
             json.dumps(full, indent=2, ensure_ascii=False), encoding='utf-8')
         _write_trial_progress(trial_dir, {

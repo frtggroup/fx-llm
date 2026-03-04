@@ -1362,9 +1362,7 @@ async function updateTop100() {
               +`title="${fname}: ${score.toFixed(5)} (${pct}%)">`
               +`<b>${idx+1}.</b>${fname}</span>`;
           }).join('')
-        : r.has_model
-          ? '<span style="color:#58a6ff;font-size:.75em">⏳ 解析中</span>'
-          : '<span style="color:#484f58;font-size:.75em">—</span>';
+        : '<span style="color:#484f58;font-size:.75em">—</span>';
       return `<tr>
         <td style="font-weight:${r.rank<=3?'700':'400'}">${rkMd}</td>
         <td style="color:#8b949e">#${r.trial??'-'}</td>
