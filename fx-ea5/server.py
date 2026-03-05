@@ -456,15 +456,22 @@ def api_status():
         active = [c for c in _tpu_chips if c['hbm_used'] > 0.1]
         st['tpu_duty_cycle'] = round(
             sum(c['duty_cycle'] for c in active) / len(active), 1) if active else 0.0
-    # running_trials に epoch_log を注入 (run_train.py が古い場合のフォールバック)
+    # running_trials に epoch_log / train_loss / val_loss を補完
+    # (run_train.py が非同期書き込みとのレースでゼロを返した場合のフォールバック)
     for rt in st.get('running_trials', []):
-        if rt.get('epoch_log'):
-            continue  # 既にある場合はスキップ
         try:
             tp_path = TRIALS_DIR / f"trial_{int(rt['trial']):06d}" / 'trial_progress.json'
             if tp_path.exists():
                 tp = json.loads(tp_path.read_text(encoding='utf-8'))
-                rt['epoch_log'] = tp.get('epoch_log', [])
+                if not rt.get('epoch_log'):
+                    rt['epoch_log'] = tp.get('epoch_log', [])
+                # train_loss / val_loss が 0.0 のとき (レースコンディション) はファイルの値で上書き
+                if rt.get('train_loss', 0.0) == 0.0 and tp.get('train_loss', 0.0) != 0.0:
+                    rt['train_loss'] = tp['train_loss']
+                if rt.get('val_loss', 0.0) == 0.0 and tp.get('val_loss', 0.0) != 0.0:
+                    rt['val_loss'] = tp['val_loss']
+                if rt.get('accuracy', 0.0) == 0.0 and tp.get('accuracy', 0.0) != 0.0:
+                    rt['accuracy'] = tp['accuracy']
         except Exception:
             pass
     # トップレベル epoch_log が空なら running_trials で最も進んだ試行から補完
