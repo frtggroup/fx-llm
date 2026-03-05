@@ -667,7 +667,7 @@ _HIDDEN_SMALL = {   # RTX 3090/4090: 中規模モデル
     'resnet':      [128, 256, 512, 1024],
     'inception':   [128, 256, 512],
 }
-_HIDDEN_LARGE = {   # medium/large/xlarge: 大規模モデル
+_HIDDEN_LARGE = {   # medium/large (H100 80GB): 大規模モデル
     'mlp':         [512, 1024, 2048],
     'gru_attn':    [256, 512, 1024],
     'bigru':       [256, 512, 1024],
@@ -679,13 +679,25 @@ _HIDDEN_LARGE = {   # medium/large/xlarge: 大規模モデル
     'resnet':      [256, 512, 1024, 2048],
     'inception':   [256, 512, 1024],
 }
+_HIDDEN_XLARGE = {  # xlarge (H200 140GB+): GPU飽和のため最小h=512
+    'mlp':         [512, 1024, 2048, 4096],
+    'gru_attn':    [512, 1024, 2048],
+    'bigru':       [512, 1024, 2048],
+    'lstm_attn':   [512, 1024, 2048],
+    'cnn':         [512, 1024, 2048],
+    'tcn':         [512, 1024, 2048],
+    'cnn_gru':     [512, 1024, 2048],
+    'transformer': [512, 1024, 2048],
+    'resnet':      [512, 1024, 2048, 4096],
+    'inception':   [512, 1024, 2048],
+}
 
 _TIER_HIDDEN_MAP = {
     'micro':  _HIDDEN_MICRO,
     'small':  _HIDDEN_SMALL,
     'medium': _HIDDEN_LARGE,
     'large':  _HIDDEN_LARGE,
-    'xlarge': _HIDDEN_LARGE,
+    'xlarge': _HIDDEN_XLARGE,
     'tpu':    _HIDDEN_LARGE,   # TPU = large相当の大モデル
 }
 HIDDEN_MAP_LOCAL = _HIDDEN_MICRO   # 後方互換エイリアス
